@@ -1,13 +1,12 @@
 #!/usr/bin/env node
-import { createAgentSession, DefaultPackageManager, ModelRuntime, SessionManager, SettingsManager, VERSION } from '@earendil-works/pi-coding-agent'
 import readline from 'node:readline'
 import os from 'node:os'
 import path from 'node:path'
-import { readdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { createRequire } from 'node:module'
-import { DefaultResourceLoader } from '@earendil-works/pi-coding-agent'
+import { pathToFileURL, fileURLToPath } from 'node:url'
 import { DEFAULT_MODE, effectiveToolsForMode, isAgentMode } from './policy.ts'
 import { createApprovalExtension } from './approval-extension.ts'
 import { createRetryExtension } from './retry-no-body.ts'
@@ -20,9 +19,44 @@ const sessions = new Map()
 let runtime
 let workspace = process.cwd()
 const agentDir = path.join(os.homedir(), '.pi', 'agent')
+const archivedSessionsFile = path.join(agentDir, 'pi-my-archived-sessions.json')
+const agentUpdateCacheFile = path.join(agentDir, 'pi-my-agent-update.json')
+const piSdkRoot = path.join(agentDir, 'pi-sdk')
+const piSdkSelectionFile = path.join(piSdkRoot, 'current.json')
 const execFileAsync = promisify(execFile)
-const require = createRequire(import.meta.url)
-const sdkVersion = VERSION
+const piAgentPackage = '@earendil-works/pi-coding-agent'
+const piAgentRepoUrl = 'https://github.com/earendil-works/pi'
+const runtimeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+
+// 修改：安装包里的 SDK 只作为兜底；用户更新的官方 SDK 放在用户目录，避免写入 Program Files。
+const bundledSdkEntry = path.join(runtimeRoot, 'node_modules', '@earendil-works', 'pi-coding-agent', 'dist', 'index.js')
+
+async function loadPiSdk() {
+  let entry = bundledSdkEntry
+  let source = 'bundled'
+  let selectedVersion = ''
+  try {
+    const selected = JSON.parse(await readFile(piSdkSelectionFile, 'utf8'))
+    const selectedDir = path.resolve(String(selected?.dir || ''))
+    const versionsRoot = path.resolve(path.join(piSdkRoot, 'versions'))
+    const relative = path.relative(versionsRoot, selectedDir)
+    const selectedEntry = path.join(selectedDir, 'node_modules', '@earendil-works', 'pi-coding-agent', 'dist', 'index.js')
+    if (/^\d+(?:\.\d+){2}(?:[-+][0-9A-Za-z.-]+)?$/.test(String(selected?.version || '')) && relative && !relative.startsWith('..') && !path.isAbsolute(relative) && existsSync(selectedEntry)) {
+      entry = selectedEntry
+      source = 'user'
+      selectedVersion = String(selected.version)
+    }
+  } catch {
+    // 没有用户覆盖版本时使用安装包内置 SDK。
+  }
+  const module = await import(pathToFileURL(entry).href)
+  return { module, source, selectedVersion, entry }
+}
+
+const loadedSdk = await loadPiSdk()
+let { createAgentSession, DefaultPackageManager, ModelRuntime, SessionManager, SettingsManager, DefaultResourceLoader } = loadedSdk.module
+let sdkVersion = String(loadedSdk.module.VERSION || loadedSdk.selectedVersion || 'unknown')
+let sdkSource = loadedSdk.source
 
 // ask 模式确认桥：扩展 await → UI 回答
 const DEFAULT_TOOLS = ['read', 'bash', 'edit', 'write']
@@ -81,6 +115,35 @@ function summarizeEvent(event) {
   return copy
 }
 
+function contentText(content) {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter((item) => item && item.type === 'text' && typeof item.text === 'string')
+    .map((item) => item.text)
+    .join('')
+}
+
+function sessionHistory(session) {
+  const history = []
+  let userIndex = -1
+  for (const entry of session.sessionManager.buildContextEntries()) {
+    if (entry.type !== 'message') continue
+    const message = entry.message
+    if (!message || (message.role !== 'user' && message.role !== 'assistant')) continue
+    const text = contentText(message.content).trim()
+    if (!text) continue
+    const timestamp = Date.parse(entry.timestamp) || (typeof message.timestamp === 'number' ? message.timestamp : Date.now())
+    if (message.role === 'user') {
+      userIndex += 1
+      history.push({ id: entry.id, role: 'user', text, timestamp, userIndex })
+    } else {
+      history.push({ id: entry.id, role: 'assistant', text, timestamp, userIndex: Math.max(0, userIndex) })
+    }
+  }
+  return history
+}
+
 async function ensureRuntime(refresh = false) {
   if (refresh) runtime = undefined
   if (!runtime) runtime = await ModelRuntime.create({ agentDir, refreshOnCreate: refresh })
@@ -120,6 +183,21 @@ async function createSession(id, cwd = workspace, thinking, mode = DEFAULT_MODE)
 }
 
 async function openSession(id, file) {
+  const existing = sessions.get(id)
+  if (existing && existing.file && file && path.resolve(existing.file) === path.resolve(file)) {
+    return {
+      id,
+      sessionId: existing.session.sessionId,
+      cwd: existing.cwd,
+      file: existing.file,
+      history: sessionHistory(existing.session),
+    }
+  }
+  if (existing) {
+    try { await existing.session?.abort() } catch { /* ignore */ }
+    try { existing.unsubscribe?.() } catch { /* ignore */ }
+    sessions.delete(id)
+  }
   const modelRuntime = await ensureRuntime()
   const sessionManager = SessionManager.open(file)
   const { session } = await createAgentSession({ cwd: sessionManager.getCwd() || workspace, agentDir, modelRuntime, sessionManager })
@@ -129,12 +207,255 @@ async function openSession(id, file) {
     send({ type: 'event', sessionId: id, event: summarized })
   })
   sessions.set(id, { session, unsubscribe, cwd: sessionManager.getCwd() || workspace, file })
-  return { id, sessionId: session.sessionId, cwd: sessionManager.getCwd() || workspace, file }
+  return {
+    id,
+    sessionId: session.sessionId,
+    cwd: sessionManager.getCwd() || workspace,
+    file,
+    history: sessionHistory(session),
+  }
+}
+
+function versionParts(value) {
+  return String(value || '').replace(/^v/, '').split('-')[0].split('.').map((part) => Number(part) || 0)
+}
+
+function isNewerVersion(latest, current) {
+  const left = versionParts(latest)
+  const right = versionParts(current)
+  for (let index = 0; index < Math.max(left.length, right.length); index++) {
+    const difference = (left[index] || 0) - (right[index] || 0)
+    if (difference !== 0) return difference > 0
+  }
+  return false
+}
+
+function npmCommand() {
+  const bundledNpm = path.join(runtimeRoot, process.platform === 'win32' ? 'npm.cmd' : 'npm')
+  if (existsSync(bundledNpm)) return bundledNpm
+  return process.platform === 'win32' ? 'npm.cmd' : 'npm'
+}
+
+function sdkEntryFor(versionDir) {
+  return path.join(versionDir, 'node_modules', '@earendil-works', 'pi-coding-agent', 'dist', 'index.js')
+}
+
+async function installPiSdkVersion(version) {
+  const safeVersion = String(version || '').trim()
+  if (!/^\d+(?:\.\d+){2}(?:[-+][0-9A-Za-z.-]+)?$/.test(safeVersion)) throw new Error('官方 Pi SDK 版本号格式不正确')
+  const versionDir = path.join(piSdkRoot, 'versions', safeVersion)
+  const entry = sdkEntryFor(versionDir)
+  await mkdir(versionDir, { recursive: true })
+  if (!existsSync(entry)) {
+    await execFileAsync(npmCommand(), [
+      'install',
+      '--prefix', versionDir,
+      '--omit=dev',
+      '--ignore-scripts',
+      `${piAgentPackage}@${safeVersion}`,
+      '--registry=https://registry.npmjs.org',
+    ], {
+      cwd: agentDir,
+      shell: true,
+      windowsHide: true,
+      timeout: 180000,
+      maxBuffer: 8 * 1024 * 1024,
+    })
+  }
+  if (!existsSync(entry)) throw new Error('Pi SDK 安装完成，但没有找到可加载的 dist/index.js')
+  await writeFile(piSdkSelectionFile, `${JSON.stringify({ version: safeVersion, dir: versionDir, updatedAt: Date.now() }, null, 2)}\n`, 'utf8')
+  return { version: safeVersion, dir: versionDir, entry }
+}
+
+async function checkAgentUpdate(force = false) {
+  try {
+    const cached = JSON.parse(await readFile(agentUpdateCacheFile, 'utf8'))
+    if (!force && cached?.current === sdkVersion && cached?.source === sdkSource && cached?.checkedAt && Date.now() - Number(cached.checkedAt) < 6 * 60 * 60 * 1000) return cached
+  } catch {
+    // No cache yet: check the registry below.
+  }
+  const response = await fetch(`https://registry.npmjs.org/${piAgentPackage}/latest`, {
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(10000),
+  })
+  if (!response.ok) throw new Error(`检查 Pi Agent 更新失败：HTTP ${response.status}`)
+  const latest = String((await response.json())?.version || '')
+  if (!latest) throw new Error('更新服务没有返回版本号')
+  const result = {
+    current: sdkVersion,
+    latest,
+    updateAvailable: isNewerVersion(latest, sdkVersion),
+    url: `https://www.npmjs.com/package/${piAgentPackage}/v/${latest}`,
+    repoUrl: piAgentRepoUrl,
+    source: sdkSource,
+    sourceLabel: sdkSource === 'user' ? '用户目录中的官方 SDK' : '安装包内置 SDK',
+    checkedAt: Date.now(),
+  }
+  await writeFile(agentUpdateCacheFile, `${JSON.stringify(result, null, 2)}\n`, 'utf8')
+  return result
+}
+
+async function updatePiSdk() {
+  const check = await checkAgentUpdate(true)
+  if (!check.updateAvailable) return { ...check, updated: false, restartRequired: false, message: '当前已经是最新的 Pi SDK' }
+  const installed = await installPiSdkVersion(check.latest)
+  // 新模块会在下次 sidecar 启动时加载；当前会话不能被半途替换，避免旧对象和新对象混用。
+  return {
+    ...check,
+    current: check.current,
+    latest: installed.version,
+    updateAvailable: false,
+    installedVersion: installed.version,
+    source: 'user',
+    sourceLabel: '用户目录中的官方 SDK',
+    updated: true,
+    restartRequired: true,
+    message: `Pi SDK ${installed.version} 已安装，重启 Pi-My 后生效`,
+  }
+}
+
+async function closeSession(id) {
+  const entry = sessions.get(id)
+  if (!entry) return { closed: false }
+  try { await entry.session?.abort() } catch { /* ignore */ }
+  try { entry.unsubscribe?.() } catch { /* ignore */ }
+  sessions.delete(id)
+  return { closed: true }
+}
+
+async function readArchivedSessions() {
+  try {
+    const parsed = JSON.parse(await readFile(archivedSessionsFile, 'utf8'))
+    return new Set(Array.isArray(parsed) ? parsed.filter((item) => typeof item === 'string') : [])
+  } catch {
+    return new Set()
+  }
+}
+
+async function writeArchivedSessions(ids) {
+  await writeFile(archivedSessionsFile, `${JSON.stringify([...ids].sort(), null, 2)}\n`, 'utf8')
+}
+
+async function setSessionArchived(id, archived) {
+  if (!id) throw new Error('缺少会话 ID')
+  const ids = await readArchivedSessions()
+  if (archived) ids.add(String(id))
+  else ids.delete(String(id))
+  await writeArchivedSessions(ids)
+  return { sessionId: String(id), archived: Boolean(archived) }
+}
+
+async function deleteSession(id, file) {
+  const entry = sessions.get(id)
+  const rawTarget = String(entry?.file || file || '')
+  if (!rawTarget) throw new Error('会话文件不存在')
+  const target = path.resolve(rawTarget)
+  const sessionRoot = path.resolve(agentDir, 'sessions')
+  const relative = path.relative(sessionRoot, target)
+  if (!target || relative.startsWith('..') || path.isAbsolute(relative) || !target.toLowerCase().endsWith('.jsonl')) {
+    throw new Error('会话文件路径无效，已拒绝删除')
+  }
+  if (entry) {
+    try { await entry.session?.abort() } catch { /* ignore */ }
+    try { entry.unsubscribe?.() } catch { /* ignore */ }
+    sessions.delete(id)
+  }
+  try {
+    await unlink(target)
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error
+  }
+  const archived = await readArchivedSessions()
+  if (archived.delete(String(id))) await writeArchivedSessions(archived)
+  return { deleted: true, sessionId: String(id), file: target }
+}
+
+async function forkSession(sourceId, id, userMessageIndex, position = 'before') {
+  const source = sessions.get(sourceId)
+  if (!source?.file) throw new Error('当前会话还没有可用的分支文件')
+  const sourceManager = SessionManager.open(source.file)
+  const forkPoints = source.session.getUserMessagesForForking()
+  const point = forkPoints[userMessageIndex]
+  if (!point) throw new Error('找不到要分叉的用户消息')
+
+  const selectedEntry = sourceManager.getEntry(point.entryId)
+  if (!selectedEntry) throw new Error('分支位置已失效，请刷新会话后重试')
+  const targetLeafId = position === 'at' ? selectedEntry.id : selectedEntry.parentId
+  let targetManager
+  if (targetLeafId) {
+    targetManager = sourceManager
+    targetManager.createBranchedSession(targetLeafId)
+  } else {
+    targetManager = SessionManager.create(sourceManager.getCwd(), sourceManager.getSessionDir())
+    targetManager.newSession({ parentSession: source.file })
+  }
+
+  const cwd = targetManager.getCwd() || source.cwd || workspace
+  const mode = source.mode || DEFAULT_MODE
+  const entry = { mode }
+  const loader = new DefaultResourceLoader({
+    cwd,
+    agentDir,
+    extensionFactories: [
+      createApprovalExtension({ getMode: () => entry.mode, sessionId: id, requestConfirm: confirmBridge.requestConfirm }),
+      createRetryExtension()
+    ],
+  })
+  await loader.reload()
+  const { session } = await createAgentSession({
+    cwd,
+    agentDir,
+    modelRuntime: await ensureRuntime(),
+    sessionManager: targetManager,
+    resourceLoader: loader,
+    tools: effectiveToolsForMode(mode, DEFAULT_TOOLS),
+  })
+  const unsubscribe = session.subscribe((event) => {
+    const summarized = summarizeEvent(event)
+    lan.note(id, summarized)
+    send({ type: 'event', sessionId: id, event: summarized })
+  })
+  const file = targetManager.getSessionFile()
+  sessions.set(id, { session, unsubscribe, cwd, file, mode })
+  return {
+    id,
+    sessionId: session.sessionId,
+    cwd,
+    file,
+    parentFile: source.file,
+    history: sessionHistory(session),
+    selectedText: position === 'before' ? point.text : '',
+  }
 }
 
 async function listSessions(cwd = workspace) {
   const infos = await SessionManager.list(cwd, path.join(agentDir, 'sessions'))
-  return infos.map((info) => ({ id: info.id, title: info.name || '未命名会话', cwd: info.cwd || cwd, file: info.path, modifiedAt: info.modified.getTime() }))
+  const archived = await readArchivedSessions()
+  return infos.map((info) => ({
+    id: info.id,
+    title: info.name || '未命名会话',
+    cwd: info.cwd || cwd,
+    file: info.path,
+    parentSessionPath: info.parentSessionPath,
+    createdAt: info.created.getTime(),
+    modifiedAt: info.modified.getTime(),
+    archived: archived.has(info.id),
+  }))
+}
+
+async function listAllSessions() {
+  const infos = await SessionManager.listAll(path.join(agentDir, 'sessions'))
+  const archived = await readArchivedSessions()
+  return infos.map((info) => ({
+    id: info.id,
+    title: info.name || '未命名会话',
+    cwd: info.cwd || '',
+    file: info.path,
+    parentSessionPath: info.parentSessionPath,
+    createdAt: info.created.getTime(),
+    modifiedAt: info.modified.getTime(),
+    archived: archived.has(info.id),
+  }))
 }
 async function listFiles(cwd = workspace) {
   const root = path.resolve(cwd)
@@ -163,18 +484,10 @@ async function readAuthProviders() {
   }
 }
 
-// 已配置 provider 集合：优先 agentDir/agent/auth.json，兼容 agentDir/auth.json；缺失按空对象处理。
+// 只把用户明确添加过的 provider 当作已配置；SDK 内置目录不能直接暴露给模型选择器。
 async function readConfiguredProviders() {
-  const candidates = [path.join(agentDir, 'agent', 'auth.json'), path.join(agentDir, 'auth.json')]
-  for (const file of candidates) {
-    try {
-      const parsed = JSON.parse(await readFile(file, 'utf8'))
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return new Set(Object.keys(parsed))
-    } catch {
-      // 文件不存在或不可解析时继续尝试下一个位置
-    }
-  }
-  return new Set()
+  const { providers, auth } = await piConfig.loadModelsAuth(agentDir)
+  return new Set([...Object.keys(providers || {}), ...Object.keys(auth || {})])
 }
 
 // 按 provider 分组统计模型数量，标注是否已配置；按 modelCount 降序。
@@ -190,6 +503,42 @@ async function providerSummary() {
     .sort((a, b) => b.modelCount - a.modelCount || a.provider.localeCompare(b.provider))
 }
 
+async function configuredModels() {
+  const [{ providers }, runtime] = await Promise.all([piConfig.loadModelsAuth(agentDir), ensureRuntime()])
+  const configured = new Set([...Object.keys(providers || {}), ...await readAuthProviders()])
+  return runtime.getModels()
+    .filter((model) => {
+      const config = providers?.[model.provider]
+      if (!configured.has(model.provider) || config?.disabled === true) return false
+      const configuredModels = Array.isArray(config?.models) ? config.models : []
+      return !configuredModels.some((item) => (item.id || item.name) === model.id && item.hidden === true)
+    })
+    .map((model) => ({
+      provider: model.provider,
+      id: model.id,
+      name: model.name,
+      reasoning: model.reasoning,
+      contextWindow: model.contextWindow,
+      maxTokens: model.maxTokens,
+    }))
+}
+
+function assertEcoTogglePath(rawPath) {
+  const target = path.resolve(String(rawPath || ''))
+  const roots = [
+    path.join(agentDir, 'skills'),
+    path.join(agentDir, 'extensions'),
+    path.join(workspace, '.pi', 'skills'),
+    path.join(workspace, '.pi', 'extensions')
+  ].map((item) => path.resolve(item))
+  const allowed = roots.some((root) => {
+    const relative = path.relative(root, target)
+    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
+  })
+  if (!allowed) throw new Error('只能切换技能或扩展目录内的文件')
+  return target
+}
+
 function openDirectory(target) {
   const dir = path.resolve(target)
   try {
@@ -203,13 +552,16 @@ function openDirectory(target) {
   }
 }
 
-// 仓库地址硬编码，忽略客户端传入的 url，防止注入任意命令。
+// 仓库地址作为默认值；外部链接只允许 http(s)，避免 shell / 文件协议注入。
 const REPO_URL = 'https://github.com/TANGZZee/pi-my'
 
-function openUrl(url) {
+function openUrl(rawUrl) {
+  const parsed = new URL(String(rawUrl || REPO_URL))
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('仅允许打开 http(s) 链接')
+  const url = parsed.toString()
   try {
     if (process.platform === 'win32') {
-      execFile('cmd', ['/c', 'start', '', url]).on('error', () => {})
+      execFile('rundll32.exe', ['url.dll,FileProtocolHandler', url]).on('error', () => {})
     } else {
       execFile(process.platform === 'darwin' ? 'open' : 'xdg-open', [url]).on('error', () => {})
     }
@@ -424,13 +776,21 @@ async function handle(request) {
       return
     }
     if (type === 'open_url') {
-      openUrl(REPO_URL)
+      openUrl(String(payload.url || REPO_URL))
       reply(id, { ok: true })
       return
     }
     if (type === 'list_models') {
-      const models = (await ensureRuntime()).getModels().map((model) => ({ provider: model.provider, id: model.id, name: model.name, reasoning: model.reasoning, contextWindow: model.contextWindow, maxTokens: model.maxTokens }))
+      const models = await configuredModels()
       reply(id, models)
+      return
+    }
+    if (type === 'check_agent_update') {
+      reply(id, await checkAgentUpdate(Boolean(payload.force)))
+      return
+    }
+    if (type === 'update_pi_sdk') {
+      reply(id, await updatePiSdk())
       return
     }
     if (type === 'set_workspace') {
@@ -507,6 +867,10 @@ async function handle(request) {
       reply(id, await listSessions(payload.cwd || workspace))
       return
     }
+    if (type === 'list_all_sessions') {
+      reply(id, await listAllSessions())
+      return
+    }
     if (type === 'usage_stats') {
       reply(id, await usageStats(payload.cwd || workspace))
       return
@@ -517,6 +881,23 @@ async function handle(request) {
     }
     if (type === 'open_session') {
       reply(id, await openSession(payload.sessionId || payload.file, payload.file))
+      return
+    }
+    if (type === 'close_session') {
+      reply(id, await closeSession(payload.sessionId))
+      return
+    }
+    if (type === 'set_session_archived') {
+      reply(id, await setSessionArchived(payload.sessionId, Boolean(payload.archived)))
+      return
+    }
+    if (type === 'delete_session') {
+      reply(id, await deleteSession(payload.sessionId, payload.file))
+      return
+    }
+    if (type === 'fork_session') {
+      const forkId = payload.sessionId || `session-${Date.now()}`
+      reply(id, await forkSession(payload.sourceSessionId, forkId, Number(payload.userMessageIndex), payload.position))
       return
     }
     if (type === 'rename_session') {
@@ -620,10 +1001,7 @@ async function handle(request) {
       return
     }
     if (type === 'refresh_models') {
-      const models = (await ensureRuntime(true)).getModels().map((model) => ({
-        provider: model.provider, id: model.id, name: model.name, reasoning: model.reasoning,
-        contextWindow: model.contextWindow, maxTokens: model.maxTokens
-      }))
+      const models = await configuredModels()
       reply(id, { models, providers: await providerSummary() })
       return
     }
@@ -678,7 +1056,8 @@ async function handle(request) {
       return
     }
     if (type === 'eco_toggle') {
-      reply(id, await eco.toggleEco(payload.path, payload.enable))
+      const target = assertEcoTogglePath(payload.path)
+      reply(id, await eco.toggleEco(target, payload.enable))
       return
     }
     if (type === 'eco_search_prompts') {

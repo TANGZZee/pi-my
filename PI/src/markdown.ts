@@ -8,7 +8,7 @@ function escapeHtml(text: string) {
 
 function safeUrl(raw: string) {
   const url = raw.trim()
-  if (/^https?:\/\//i.test(url) || /^data:image\//i.test(url) || /^blob:/i.test(url)) return url
+  if (/^https?:\/\//i.test(url) || /^data:image\/(?:png|jpe?g|gif|webp);base64,/i.test(url) || /^blob:/i.test(url)) return url
   if (/^(\.\/|\/|[A-Za-z]:[\\/]|[A-Za-z0-9._\-]+\/)/.test(url) && !url.includes('..') && !/[\s<>"]/.test(url)) return url
   return null
 }
@@ -22,7 +22,7 @@ function inline(text: string) {
   })
   out = out.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_m, label, src) => {
     const url = safeUrl(src.replace(/&amp;/g, '&'))
-    if (!url || url.startsWith('data:')) return label
+    if (!url || url.startsWith('data:') || url.startsWith('blob:')) return label
     return `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${label}</a>`
   })
   out = out.replace(/`([^`]+)`/g, '<code>$1</code>')

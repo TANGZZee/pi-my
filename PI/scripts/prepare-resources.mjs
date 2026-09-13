@@ -56,7 +56,17 @@ index = index
   .replaceAll('./retry-no-body.ts', './retry-no-body.js')
 await writeFile(indexPath, index)
 
-await cp(copyNode(), nodeDst)
+const nodeSource = copyNode()
+await cp(nodeSource, nodeDst)
+
+// 修改：把 npm 一起放进安装包，用户电脑没有单独安装 Node/npm 时也能直接更新 Pi SDK。
+const bundledNpmSource = path.join(path.dirname(nodeSource), 'node_modules', 'npm')
+if (existsSync(bundledNpmSource)) {
+  await rm(path.join(resources, 'node_modules', 'npm'), { recursive: true, force: true })
+  await cp(bundledNpmSource, path.join(resources, 'node_modules', 'npm'), { recursive: true })
+  const npmCommandSource = path.join(path.dirname(nodeSource), 'npm.cmd')
+  if (existsSync(npmCommandSource)) await cp(npmCommandSource, path.join(resources, 'npm.cmd'))
+}
 
 if (!existsSync(sdkDist)) {
   await writeFile(path.join(resources, 'package.json'), `${JSON.stringify({

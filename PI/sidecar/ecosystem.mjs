@@ -236,6 +236,8 @@ export async function searchExtensions(query) {
     description: entry.package?.description || '',
     version: entry.package?.version,
     url: entry.package?.links?.npm,
+    updatedAt: entry.package?.date || '',
+    score: Number(entry.score?.final || 0),
     downloads: 0
   })).filter((item) => item.name)
   await Promise.all(items.map(async (item) => {
@@ -244,7 +246,7 @@ export async function searchExtensions(query) {
       if (r.ok) { const d = await r.json(); item.downloads = Number(d.downloads || 0) }
     } catch { /* ignore */ }
   }))
-  items.sort((a, b) => b.downloads - a.downloads)
+  items.sort((a, b) => b.score - a.score || b.downloads - a.downloads)
   return { query: q, items }
 }
 
@@ -264,9 +266,10 @@ export async function downloadPet(agentDir, pet) {
 }
 
 async function downloadSpritePet(agentDir, pet) {
-  const id = String(pet?.id || 'pet')
+  const id = slug(pet?.id || 'pet')
   const spriteUrl = String(pet?.spriteUrl || '')
   if (!spriteUrl) throw new Error('精灵图 URL 缺失')
+  if (!/^https?:\/\//i.test(spriteUrl)) throw new Error('精灵图 URL 无效')
   const base = path.join(agentDir, 'pets', id)
   await mkdir(base, { recursive: true })
   const resp = await fetch(spriteUrl, { signal: AbortSignal.timeout(120000) })
@@ -280,9 +283,13 @@ async function downloadLive2DPet(agentDir, pet) {
   const repo = String(pet?.repo || '')
   const branch = String(pet?.branch || 'master')
   const dir = String(pet?.dir || '')
-  const petId = String(pet?.id || dir.split('/').pop() || 'pet')
+  const petId = slug(pet?.id || dir.split('/').pop() || 'pet')
   if (!repo || !dir) throw new Error('模型信息不完整')
-  const treeUrl = `https://api.github.com/repos/${repo}/git/trees/${branch}?recursive=1`
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) || repo.split('/').some((part) => part === '.' || part === '..')) throw new Error('模型仓库地址无效')
+  if (branch.includes('..') || branch.startsWith('/') || branch.includes('\\')) throw new Error('模型分支无效')
+  if (dir.split('/').some((part) => !part || part === '.' || part === '..')) throw new Error('模型目录无效')
+  const encodedBranch = encodeURIComponent(branch)
+  const treeUrl = `https://api.github.com/repos/${repo}/git/trees/${encodedBranch}?recursive=1`
   const treeResp = await fetch(treeUrl, { signal: AbortSignal.timeout(30000), headers: { 'User-Agent': 'pi-my', Accept: 'application/vnd.github+json' } })
   if (!treeResp.ok) throw new Error(`列目录失败 HTTP ${treeResp.status}`)
   const tree = await treeResp.json()
@@ -292,10 +299,11 @@ async function downloadLive2DPet(agentDir, pet) {
   await mkdir(base, { recursive: true })
   for (const f of files) {
     const rel = f.path.slice(dir.length + 1)
-    const url = `https://cdn.jsdelivr.net/gh/${repo}@${branch}/${f.path.split('/').map(encodeURIComponent).join('/')}`
+    const url = `https://cdn.jsdelivr.net/gh/${repo}@${encodedBranch}/${f.path.split('/').map(encodeURIComponent).join('/')}`
     const resp = await fetch(url, { signal: AbortSignal.timeout(120000) })
     if (!resp.ok) continue
-    const target = path.join(base, rel)
+    const target = path.resolve(base, rel)
+    if (target !== base && !target.startsWith(`${base}${path.sep}`)) continue
     await mkdir(path.dirname(target), { recursive: true })
     await writeFile(target, Buffer.from(await resp.arrayBuffer()))
   }

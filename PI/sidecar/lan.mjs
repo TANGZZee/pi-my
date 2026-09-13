@@ -52,10 +52,11 @@ h1{font-size:16px;margin:0 0 12px}
 <div id="root">加载中…</div>
 <script>
 const t=new URLSearchParams(location.search).get('t')||''
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))
 async function tick(){
   const res=await fetch('/api/view?t='+encodeURIComponent(t))
   const data=await res.json()
-  root.innerHTML='<p>工作区 '+ (data.workspace||'') +' · '+ (data.sessions||[]).length +' 个会话</p>'+(data.sessions||[]).map(s=>'<div class="card"><strong>'+(s.title||s.id)+'</strong> <span class="'+(s.running?'run':'')+'">'+(s.running?'运行中':'空闲')+'</span>'+(s.tool?'<div>工具 '+s.tool+'</div>':'')+(s.tail?'<div class="tail">'+s.tail.replace(/[<>]/g,'')+'</div>':'')+'</div>').join('')||'<p>暂无会话</p>'
+  root.innerHTML='<p>工作区 '+ esc(data.workspace||'') +' · '+ (data.sessions||[]).length +' 个会话</p>'+(data.sessions||[]).map(s=>'<div class="card"><strong>'+esc(s.title||s.id)+'</strong> <span class="'+(s.running?'run':'')+'">'+(s.running?'运行中':'空闲')+'</span>'+(s.tool?'<div>工具 '+esc(s.tool)+'</div>':'')+(s.tail?'<div class="tail">'+esc(s.tail)+'</div>':'')+'</div>').join('')||'<p>暂无会话</p>'
 }
 tick(); setInterval(tick,2000)
 </script>`
@@ -108,6 +109,11 @@ export function start(preferred = 18787) {
   server.on('connection', (socket) => {
     clients += 1
     socket.on('close', () => { clients = Math.max(0, clients - 1) })
+  })
+  server.on('error', () => {
+    try { server?.close() } catch { /* ignore */ }
+    server = null
+    clients = 0
   })
   server.listen(port, '0.0.0.0')
   return status()

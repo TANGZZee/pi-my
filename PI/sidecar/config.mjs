@@ -142,19 +142,20 @@ export async function testProvider(agentDir, provider, proxyUrl, overrides = {})
   const url = `${baseUrl}/models`
   const started = Date.now()
   try {
-    applyTempProxy(proxyUrl)
-    const response = await fetch(url, {
-      headers: { Authorization: `Bearer ${key}` },
-      signal: AbortSignal.timeout(20000)
+    return await withTempProxy(proxyUrl, async () => {
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${key}` },
+        signal: AbortSignal.timeout(20000)
+      })
+      const latency = Date.now() - started
+      const text = await response.text()
+      if (!response.ok) return { ok: false, message: `HTTP ${response.status}`, latency, detail: text.slice(0, 240) }
+      let json
+      try { json = JSON.parse(text) } catch { return { ok: false, message: '响应不是 JSON', latency } }
+      const list = Array.isArray(json.data) ? json.data : Array.isArray(json.models) ? json.models : Array.isArray(json) ? json : []
+      if (!list.length) return { ok: false, message: '响应里没有模型列表，未判定为成功', latency }
+      return { ok: true, message: `已连接 · ${list.length} 个模型`, latency }
     })
-    const latency = Date.now() - started
-    const text = await response.text()
-    if (!response.ok) return { ok: false, message: `HTTP ${response.status}`, latency, detail: text.slice(0, 240) }
-    let json
-    try { json = JSON.parse(text) } catch { return { ok: false, message: '响应不是 JSON', latency } }
-    const list = Array.isArray(json.data) ? json.data : Array.isArray(json.models) ? json.models : Array.isArray(json) ? json : []
-    if (!list.length) return { ok: false, message: '响应里没有模型列表，未判定为成功', latency }
-    return { ok: true, message: `已连接 · ${list.length} 个模型`, latency }
   } catch (error) {
     return { ok: false, message: error.message || '连接失败', latency: Date.now() - started }
   }
@@ -174,19 +175,38 @@ export async function writeProxy(agentDir, data) {
   return next
 }
 
-export function applyAgentProxy(proxy) {
-  if (proxy?.agent?.mode === 'on' && proxy.agent.url) {
-    process.env.HTTP_PROXY = proxy.agent.url
-    process.env.HTTPS_PROXY = proxy.agent.url
-    process.env.http_proxy = proxy.agent.url
-    process.env.https_proxy = proxy.agent.url
+const PROXY_ENV_KEYS = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']
+const INITIAL_PROXY_ENV = new Map(PROXY_ENV_KEYS.map((key) => [key, process.env[key]]))
+
+function setProxyEnv(url) {
+  for (const key of PROXY_ENV_KEYS) {
+    if (url) process.env[key] = url
+    else delete process.env[key]
   }
 }
 
-function applyTempProxy(url) {
-  if (!url) return
-  process.env.HTTPS_PROXY = url
-  process.env.HTTP_PROXY = url
+function restoreProxyEnv(values) {
+  for (const key of PROXY_ENV_KEYS) {
+    const value = values.get(key)
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+}
+
+export function applyAgentProxy(proxy) {
+  if (proxy?.agent?.mode === 'on' && proxy.agent.url) setProxyEnv(proxy.agent.url)
+  else restoreProxyEnv(INITIAL_PROXY_ENV)
+}
+
+async function withTempProxy(url, operation) {
+  if (!url) return operation()
+  const previous = new Map(PROXY_ENV_KEYS.map((key) => [key, process.env[key]]))
+  setProxyEnv(url)
+  try {
+    return await operation()
+  } finally {
+    restoreProxyEnv(previous)
+  }
 }
 
 export async function readProbes(agentDir) {
@@ -210,20 +230,21 @@ export async function runProbe(agentDir, provider, proxyUrl) {
   const baseUrl = String(config.baseUrl || '').replace(/\/+$/, '')
   const url = String(stored.url || template.url).replace('{baseUrl}', baseUrl)
   if (!url.startsWith('http')) return { ok: false, message: '用量地址无效' }
-  applyTempProxy(proxyUrl)
   try {
-    const response = await fetch(url, {
-      method: stored.method || template.method || 'GET',
-      headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' },
-      signal: AbortSignal.timeout(10000)
+    return await withTempProxy(proxyUrl, async () => {
+      const response = await fetch(url, {
+        method: stored.method || template.method || 'GET',
+        headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' },
+        signal: AbortSignal.timeout(10000)
+      })
+      const text = await response.text()
+      if (!response.ok) return { ok: false, message: `HTTP ${response.status}`, detail: text.slice(0, 240) }
+      let json
+      try { json = JSON.parse(text) } catch { return { ok: false, message: '用量接口不是 JSON' } }
+      const pathKey = stored.parse || template.parse
+      const value = pathKey ? pick(json, pathKey) : json
+      return { ok: true, message: value == null ? '已返回，但未解析到额度字段' : String(value), value, raw: json }
     })
-    const text = await response.text()
-    if (!response.ok) return { ok: false, message: `HTTP ${response.status}`, detail: text.slice(0, 240) }
-    let json
-    try { json = JSON.parse(text) } catch { return { ok: false, message: '用量接口不是 JSON' } }
-    const pathKey = stored.parse || template.parse
-    const value = pathKey ? pick(json, pathKey) : json
-    return { ok: true, message: value == null ? '已返回，但未解析到额度字段' : String(value), value, raw: json }
   } catch (error) {
     return { ok: false, message: error.message || '用量查询失败' }
   }
@@ -235,22 +256,23 @@ export async function fetchProviderModels(baseUrl, apiKey, proxyUrl) {
   const key = String(apiKey || '').trim()
   const started = Date.now()
   try {
-    const url = new URL(root)
-    url.pathname = `${url.pathname.replace(/\/$/, '')}/models`
-    url.search = ''
-    url.hash = ''
-    applyTempProxy(proxyUrl)
-    const headers = { Accept: 'application/json' }
-    if (key) headers.Authorization = `Bearer ${key}`
-    const response = await fetch(url, { headers, signal: AbortSignal.timeout(20000) })
-    const text = await response.text()
-    const latency = Date.now() - started
-    if (!response.ok) return { ok: false, message: `拉取模型失败：HTTP ${response.status}`, latency, detail: text.slice(0, 240), models: [] }
-    if (text.length > 1_000_000) return { ok: false, message: '模型列表响应过大', latency, models: [] }
-    let json
-    try { json = JSON.parse(text) } catch { return { ok: false, message: '模型列表不是有效 JSON', latency, models: [] } }
-    const models = parseFetchedModels(json)
-    return { ok: true, message: `获取到 ${models.length} 个模型`, latency, models }
+    return await withTempProxy(proxyUrl, async () => {
+      const url = new URL(root)
+      url.pathname = `${url.pathname.replace(/\/$/, '')}/models`
+      url.search = ''
+      url.hash = ''
+      const headers = { Accept: 'application/json' }
+      if (key) headers.Authorization = `Bearer ${key}`
+      const response = await fetch(url, { headers, signal: AbortSignal.timeout(20000) })
+      const text = await response.text()
+      const latency = Date.now() - started
+      if (!response.ok) return { ok: false, message: `拉取模型失败：HTTP ${response.status}`, latency, detail: text.slice(0, 240), models: [] }
+      if (text.length > 1_000_000) return { ok: false, message: '模型列表响应过大', latency, models: [] }
+      let json
+      try { json = JSON.parse(text) } catch { return { ok: false, message: '模型列表不是有效 JSON', latency, models: [] } }
+      const models = parseFetchedModels(json)
+      return { ok: true, message: `获取到 ${models.length} 个模型`, latency, models }
+    })
   } catch (error) {
     return { ok: false, message: error.message || '拉取模型失败', models: [], latency: Date.now() - started }
   }
@@ -269,19 +291,20 @@ export async function fetchProviderBalance(agentDir, payload, proxyUrl) {
   if (url.includes('/api/v1/auth/me')) url = defaultBalanceUrl(baseUrl) ?? url
   if (!url) url = defaultBalanceUrl(baseUrl) ?? ''
   if (!url) return { supported: false, ok: false, message: '未配置余额查询 URL，中转站需要填如 https://ai.apiclub.top/v1/usage' }
-  applyTempProxy(proxyUrl)
   try {
-    const headers = { Accept: 'application/json' }
-    if (key) headers.Authorization = `Bearer ${key}`
-    const response = await fetch(url, { headers, signal: AbortSignal.timeout(15000) })
-    const text = await response.text()
-    if (!response.ok) return { supported: true, ok: false, message: `查询余额失败：HTTP ${response.status}` }
-    if (text.length > 1_000_000) return { supported: true, ok: false, message: '余额响应过大' }
-    let json
-    try { json = JSON.parse(text) } catch { return { supported: true, ok: false, message: '余额响应不是有效 JSON' } }
-    const balance = parseProviderBalance(json)
-    if (balance == null) return { supported: true, ok: false, message: '余额响应没有 balance / quota' }
-    return { supported: true, ok: true, balance, message: `$${Number(balance).toFixed(2)}` }
+    return await withTempProxy(proxyUrl, async () => {
+      const headers = { Accept: 'application/json' }
+      if (key) headers.Authorization = `Bearer ${key}`
+      const response = await fetch(url, { headers, signal: AbortSignal.timeout(15000) })
+      const text = await response.text()
+      if (!response.ok) return { supported: true, ok: false, message: `查询余额失败：HTTP ${response.status}` }
+      if (text.length > 1_000_000) return { supported: true, ok: false, message: '余额响应过大' }
+      let json
+      try { json = JSON.parse(text) } catch { return { supported: true, ok: false, message: '余额响应不是有效 JSON' } }
+      const balance = parseProviderBalance(json)
+      if (balance == null) return { supported: true, ok: false, message: '余额响应没有 balance / quota' }
+      return { supported: true, ok: true, balance, message: `$${Number(balance).toFixed(2)}` }
+    })
   } catch (error) {
     return { supported: true, ok: false, message: error.message || '查询余额失败' }
   }
@@ -298,13 +321,14 @@ export async function lookupModelHints(agentDir, modelIds, proxyUrl) {
     if (age < 12 * 60 * 60 * 1000 && cached.catalog) payload = cached.catalog
   } catch { payload = undefined }
   if (!payload) {
-    applyTempProxy(proxyUrl)
-    const response = await fetch('https://models.dev/api.json', {
-      headers: { Accept: 'application/json' },
-      signal: AbortSignal.timeout(30000)
+    payload = await withTempProxy(proxyUrl, async () => {
+      const response = await fetch('https://models.dev/api.json', {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(30000)
+      })
+      if (!response.ok) throw new Error(`models.dev 拉取失败：HTTP ${response.status}`)
+      return JSON.parse(await response.text())
     })
-    if (!response.ok) throw new Error(`models.dev 拉取失败：HTTP ${response.status}`)
-    payload = JSON.parse(await response.text())
     await writeJson(cacheFile, { fetchedAt: Date.now(), catalog: payload })
   }
   const catalog = flattenModelsDev(payload)

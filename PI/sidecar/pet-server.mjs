@@ -39,6 +39,10 @@ export function startPetServer(agentDir, preferred = 18789) {
       res.end()
     }
   })
+  server.on('error', () => {
+    try { server?.close() } catch {}
+    server = null
+  })
   server.listen(port, '127.0.0.1')
   return port
 }

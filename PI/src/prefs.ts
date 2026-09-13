@@ -24,6 +24,7 @@ export type Prefs = {
   notifyConfirm: boolean
   gitTemplate: string
   showQuickChips: boolean
+  showThinking: boolean
 }
 
 const KEY = 'pdn.prefs'
@@ -45,7 +46,8 @@ export const DEFAULT_PREFS: Prefs = {
   notifyDone: false,
   notifyConfirm: true,
   gitTemplate: '',
-  showQuickChips: false
+  showQuickChips: false,
+  showThinking: true,
 }
 
 function readLegacy(): Partial<Prefs> {

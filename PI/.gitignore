@@ -2,6 +2,7 @@ node_modules
 dist
 src-tauri/target
 src-tauri/resources/node.exe
+src-tauri/resources/npm.cmd
 src-tauri/resources/node_modules
 src-tauri/resources/package.json
 src-tauri/resources/package-lock.json

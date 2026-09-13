@@ -11,6 +11,9 @@
   type UsageStats = { sessions: number; turns: number; activeDays: number; totals: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number }; costUsd: number; costKnown: boolean; byModel: Array<{ model: string; tokens: number; turns: number }>; byProject?: Array<{ project: string; tokens: number; turns: number }>; byDay?: Record<string, number> }
   type ImageGenConfig = { baseUrl: string; apiKey: string; model: string; size: string }
   type SettingsInfo = { node: string; sdk: string; agentDir: string; sessionDir: string; authProviders: string[]; providers?: ProviderInfo[] }
+  type ArchivedSession = { id: string; title: string; file?: string; cwd?: string; modifiedAt?: number; archived?: boolean }
+  type Tab = 'general' | 'appearance' | 'notify' | 'keys' | 'proxy' | 'agents' | 'imagegen' | 'git' | 'skills' | 'extensions' | 'store' | 'vision' | 'usage' | 'archived' | 'storage' | 'lan' | 'pet' | 'logs' | 'about'
+  type AgentUpdateInfo = { current: string; latest: string; installedVersion?: string; updateAvailable: boolean; url: string; repoUrl?: string; source?: string; sourceLabel?: string; updated?: boolean; restartRequired?: boolean; message?: string; checkedAt?: number }
 
   export let open = false
   export let connected = false
@@ -27,14 +30,22 @@
   export let onRefreshProviders: (() => void) | undefined = undefined
   export let onRefreshUsage: (() => void) | undefined = undefined
   export let onPrefsChange: () => void = () => {}
+  export let onRestoreArchived: ((session: ArchivedSession) => Promise<void> | void) | undefined = undefined
+  export let onDeleteArchived: ((session: ArchivedSession) => Promise<void> | void) | undefined = undefined
+  export let agentUpdate: AgentUpdateInfo | null = null
+  export let agentUpdateBusy = false
+  export let onCheckAgentUpdate: (() => void) | undefined = undefined
+  export let onUpdateAgent: (() => void) | undefined = undefined
+  export let onOpenAgentUpdate: (() => void) | undefined = undefined
+  export let onOpenAgentRepo: (() => void) | undefined = undefined
+  export let initialTab: Tab | undefined = undefined
   export let rpc: ((type: string, payload?: Record<string, unknown>) => Promise<unknown>) | undefined = undefined
 
-  type Tab = 'general' | 'appearance' | 'notify' | 'keys' | 'proxy' | 'agents' | 'imagegen' | 'git' | 'skills' | 'extensions' | 'store' | 'vision' | 'usage' | 'storage' | 'lan' | 'pet' | 'logs' | 'about'
   const NAV: Array<{ group: string; items: Array<[Tab, string]> }> = [
     { group: '基础', items: [['general', '通用'], ['appearance', '外观'], ['notify', '通知'], ['keys', '快捷键'], ['proxy', '代理']] },
     { group: '能力', items: [['agents', '子代理'], ['imagegen', '生图'], ['git', 'Git']] },
     { group: '生态', items: [['skills', '技能'], ['extensions', '扩展'], ['store', '商店'], ['vision', '视觉桥'], ['pet', '桌宠'], ['lan', '局域网']] },
-    { group: '维护', items: [['usage', '用量'], ['storage', '存储'], ['logs', '日志'], ['about', '关于']] }
+    { group: '维护', items: [['usage', '用量'], ['archived', '已归档的聊天'], ['storage', '存储'], ['logs', '日志'], ['about', '关于']] }
   ]
 
   const SHELLS: Array<[string, string, string]> = [
@@ -69,9 +80,12 @@
   const configSaveHandler = { current: async () => {} }
   let eco: { skills: Array<Record<string, unknown>>; extensions: Array<Record<string, unknown>>; locations?: Record<string, string> } = { skills: [], extensions: [] }
   let storeTab: 'prompts' | 'skills' | 'extensions' | 'xue' = 'prompts'
+  let storeSort: 'recommended' | 'popular' | 'name' | 'updated' = 'recommended'
   let storeQuery = ''
   let storeItems: Array<Record<string, unknown>> = []
   let storeBusy = ''
+  let extensionBusy: Record<string, boolean> = {}
+  let extensionNotice: Record<string, string> = {}
   let xue = { categories: [] as string[], items: [] as Array<Record<string, unknown>>, total: 0, page: 1, note: '' }
   let xueCategory = ''
   let vision = { enabled: false, provider: '', model: '', baseUrl: '', apiKey: '', promptTemplate: '' }
@@ -81,6 +95,10 @@
   let lanBusy = false
   let logLines: string[] = []
   let oauthNotice = ''
+  let archivedSessions: ArchivedSession[] = []
+  let archivedQuery = ''
+  let archivedBusy = false
+  let archivedNotice = ''
 
   onMount(() => {
     prefs = loadPrefs()
@@ -108,7 +126,16 @@
   $: if (open && tab === 'vision') void loadVision()
   $: if (open && tab === 'lan') void loadLan()
   $: if (open && tab === 'logs') void loadLogs()
+  $: if (open && tab === 'archived') void loadArchivedSessions()
   $: if (open && tab === 'store') void refreshStore()
+  // 修改：从侧栏更新提醒进入设置时，直接定位到“关于”页。
+  $: if (open && initialTab && tab !== initialTab) setTab(initialTab)
+  $: sortedStoreItems = sortStoreItems(storeItems)
+  $: sortedXueItems = sortStoreItems(xue.items as Array<Record<string, unknown>>)
+  $: archivedGroups = groupArchivedSessions(archivedSessions.filter((item) => {
+    const query = archivedQuery.trim().toLowerCase()
+    return !query || item.title.toLowerCase().includes(query) || String(item.cwd || '').toLowerCase().includes(query)
+  }))
 
   function commit(partial: Partial<Prefs>) {
     prefs = patchPrefs(partial)
@@ -127,6 +154,34 @@
     if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`
     if (n >= 1000) return `${(n / 1000).toFixed(1)}K`
     return String(n)
+  }
+
+  function storeMetric(item: Record<string, unknown>) {
+    if (storeTab === 'prompts') return Number(item.votes || item.views || 0)
+    if (storeTab === 'skills') return Number(item.installs || item.downloads || 0)
+    if (storeTab === 'extensions') return Number(item.downloads || item.score || 0)
+    return 0
+  }
+
+  function storeUpdated(item: Record<string, unknown>) {
+    const value = item.updatedAt || item.updated_at || item.publishedAt || item.published_at || item.date || item.version
+    const time = Date.parse(String(value || ''))
+    return Number.isFinite(time) ? time : 0
+  }
+
+  function sortStoreItems(items: Array<Record<string, unknown>>) {
+    if (storeSort === 'recommended') return items
+    const next = [...items]
+    if (storeSort === 'popular') next.sort((a, b) => storeMetric(b) - storeMetric(a))
+    else if (storeSort === 'name') next.sort((a, b) => String(a.title || a.name || '').localeCompare(String(b.title || b.name || ''), 'zh-CN'))
+    else next.sort((a, b) => storeUpdated(b) - storeUpdated(a))
+    return next
+  }
+
+  function setStoreTab(next: typeof storeTab) {
+    storeTab = next
+    storeSort = 'recommended'
+    void refreshStore()
   }
 
   function updateImageGen(key: keyof ImageGenConfig, value: string) {
@@ -193,7 +248,11 @@
 
   async function loadXue(page = 1) {
     if (!rpc) return
-    xue = await rpc('eco_xue', { query: storeQuery, category: xueCategory, page }) as typeof xue
+    try {
+      xue = await rpc('eco_xue', { query: storeQuery, category: xueCategory, page }) as typeof xue
+    } catch (error) {
+      xue = { categories: [], items: [], total: 0, page, note: error instanceof Error ? error.message : '加载失败' }
+    }
   }
 
   async function importStoreItem(item: Record<string, unknown>, kind: 'prompt' | 'skill') {
@@ -229,19 +288,35 @@
   }
 
   async function uninstallPackage(item: Record<string, unknown>) {
+    const key = extensionKey(item)
     ecoNotice = ''
+    extensionBusy = { ...extensionBusy, [key]: true }
+    extensionNotice = { ...extensionNotice, [key]: '正在卸载…' }
     try {
       const result = await rpc?.('eco_uninstall_package', { name: item.name }) as { ok: boolean; name: string; message: string }
       if (result?.ok) {
-        ecoNotice = `已移除 ${result.name}。`
+        ecoNotice = ''
+        extensionNotice = { ...extensionNotice, [key]: `已卸载 ${result.name}，正在刷新列表…` }
+        eco = { ...eco, extensions: eco.extensions.filter((row) => extensionKey(row) !== key) }
       } else {
-        ecoNotice = `移除失败：${result?.message || '未知错误'}`
+        extensionNotice = { ...extensionNotice, [key]: `卸载失败：${result?.message || '未知错误'}` }
       }
       await loadEco()
       void rpc?.('eco_refresh', {})
     } catch (error) {
-      ecoNotice = error instanceof Error ? error.message : '移除失败'
+      const message = error instanceof Error ? error.message : '移除失败'
+      extensionNotice = { ...extensionNotice, [key]: `卸载失败：${message}` }
+      ecoNotice = message
+    } finally {
+      extensionBusy = { ...extensionBusy, [key]: false }
+      window.setTimeout(() => {
+        if (extensionNotice[key]?.startsWith('已卸载')) extensionNotice = { ...extensionNotice, [key]: '已卸载' }
+      }, 2500)
     }
+  }
+
+  function extensionKey(item: Record<string, unknown>) {
+    return String(item.id || item.name || item.path || '')
   }
 
   async function downloadPet(pet: PetModel) {
@@ -275,6 +350,81 @@
   async function loadLogs() {
     if (!rpc || !connected) return
     try { logLines = ((await rpc('log_tail', { limit: 200 }) as { lines?: string[] }).lines) || [] } catch { logLines = [] }
+  }
+
+  function projectName(pathValue?: string) {
+    if (!pathValue) return '未知项目'
+    return pathValue.split(/[\\/]/).filter(Boolean).pop() || pathValue
+  }
+
+  function groupArchivedSessions(items: ArchivedSession[]) {
+    const groups: Array<{ project: string; path: string; items: ArchivedSession[] }> = []
+    for (const item of items) {
+      const projectPath = item.cwd || ''
+      let group = groups.find((row) => row.path === projectPath)
+      if (!group) {
+        group = { project: projectName(projectPath), path: projectPath, items: [] }
+        groups.push(group)
+      }
+      group.items.push(item)
+    }
+    return groups
+  }
+
+  function formatArchiveTime(timestamp?: number) {
+    if (!timestamp) return ''
+    return new Date(timestamp).toLocaleString([], { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+  }
+
+  async function loadArchivedSessions() {
+    if (!rpc || !connected || archivedBusy) return
+    archivedBusy = true
+    archivedNotice = ''
+    try {
+      const all = await rpc('list_all_sessions', {}) as ArchivedSession[]
+      archivedSessions = all.filter((item) => item.archived)
+    } catch (error) {
+      archivedNotice = error instanceof Error ? error.message : '读取归档聊天失败'
+      archivedSessions = []
+    } finally {
+      archivedBusy = false
+    }
+  }
+
+  async function restoreArchivedSession(session: ArchivedSession) {
+    archivedNotice = ''
+    try {
+      if (onRestoreArchived) await onRestoreArchived(session)
+      else await rpc?.('set_session_archived', { sessionId: session.id, archived: false })
+      archivedSessions = archivedSessions.filter((item) => item.id !== session.id)
+    } catch (error) {
+      archivedNotice = error instanceof Error ? error.message : '取消归档失败'
+    }
+  }
+
+  async function deleteArchivedSession(session: ArchivedSession) {
+    if (!window.confirm(`确定永久删除会话「${session.title}」吗？删除后无法恢复。`)) return
+    await deleteArchivedRow(session)
+  }
+
+  async function deleteArchivedRow(session: ArchivedSession) {
+    archivedNotice = ''
+    try {
+      if (onDeleteArchived) await onDeleteArchived(session)
+      else {
+        const response = await rpc?.('delete_session', { sessionId: session.id, file: session.file }) as { ok?: boolean } | undefined
+        if (response && response.ok === false) throw new Error('删除会话失败')
+      }
+      archivedSessions = archivedSessions.filter((item) => item.id !== session.id)
+    } catch (error) {
+      archivedNotice = error instanceof Error ? error.message : '删除会话失败'
+    }
+  }
+
+  async function deleteAllArchived() {
+    if (!archivedSessions.length || !window.confirm(`确定永久删除全部 ${archivedSessions.length} 个归档会话吗？删除后无法恢复。`)) return
+    archivedNotice = ''
+    for (const session of [...archivedSessions]) await deleteArchivedRow(session)
   }
 
   async function oauthLogin(provider: string) {
@@ -341,12 +491,9 @@
         <h2>设置</h2>
         <div class="panes" role="tablist" aria-label="设置分区">
           <button class:on={pane === 'settings'} on:click={() => setPane('settings')}>系统设置</button>
-          <button class:on={pane === 'config'} on:click={() => setPane('config')}>配置管理</button>
+          <button class:on={pane === 'config'} on:click={() => setPane('config')}>模型管理</button>
         </div>
         <div class="head-actions">
-          {#if pane === 'config' && configDirty}
-            <button class="save" on:click={() => void configSaveHandler.current()}>保存</button>
-          {/if}
           <button class="close" aria-label="关闭" on:click={onclose}>
             <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true"><line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/></svg>
           </button>
@@ -420,6 +567,11 @@
                 <span>自动命名会话</span>
               </label>
               <p class="desc">首次发送时用内容前 20 字作为标题。</p>
+              <label class="check-row">
+                <input type="checkbox" checked={prefs.showThinking} on:change={(event) => commit({ showThinking: (event.currentTarget as HTMLInputElement).checked })} />
+                <span>显示模型思考内容</span>
+              </label>
+              <p class="desc">关闭后仍会正常推理，只隐藏思考过程。</p>
             </section>
 
             <section class="group">
@@ -631,7 +783,8 @@
                       <span class="provider-count">已内置</span>
                     {:else if item.source === 'npm'}
                       <span class="provider-count">已安装</span>
-                      <button class="ghost" on:click={() => void uninstallPackage(item)}>卸载</button>
+                      <button class="ghost" disabled={extensionBusy[extensionKey(item)]} on:click={() => void uninstallPackage(item)}>{extensionBusy[extensionKey(item)] ? '卸载中…' : '卸载'}</button>
+                      {#if extensionNotice[extensionKey(item)]}<span class="inline-notice" class:error={extensionNotice[extensionKey(item)].startsWith('卸载失败')}>{extensionNotice[extensionKey(item)]}</span>{/if}
                     {:else}
                       <button class="ghost" on:click={() => void toggleItem(item, !item.enabled)}>{item.enabled ? '禁用' : '启用'}</button>
                     {/if}
@@ -643,14 +796,20 @@
           {:else if tab === 'store'}
             <section class="group">
               <div class="choice-row">
-                <button class="choice" class:on={storeTab === 'prompts'} on:click={() => (storeTab = 'prompts')}>prompts.chat</button>
-                <button class="choice" class:on={storeTab === 'skills'} on:click={() => (storeTab = 'skills')}>skills.sh</button>
-                <button class="choice" class:on={storeTab === 'extensions'} on:click={() => (storeTab = 'extensions')}>pi 官方插件</button>
-                <button class="choice" class:on={storeTab === 'xue'} on:click={() => (storeTab = 'xue')}>中文精选</button>
+                <button class="choice" class:on={storeTab === 'prompts'} on:click={() => setStoreTab('prompts')}>prompts.chat</button>
+                <button class="choice" class:on={storeTab === 'skills'} on:click={() => setStoreTab('skills')}>skills.sh</button>
+                <button class="choice" class:on={storeTab === 'extensions'} on:click={() => setStoreTab('extensions')}>pi 官方插件</button>
+                <button class="choice" class:on={storeTab === 'xue'} on:click={() => setStoreTab('xue')}>中文精选</button>
               </div>
               <p class="desc">默认显示各源热门内容，按投票 / 下载排序。pi 官方插件来自 pi.dev/packages（npm 的 pi-package 标签）。</p>
-              <div class="todo-add" style="padding:12px 0 0">
+              <div class="todo-add store-search-row" style="padding:12px 0 0">
                 <input bind:value={storeQuery} placeholder={storeTab === 'xue' ? '搜索中文提示词' : '搜索…'} on:keydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); storeTab === 'xue' ? void loadXue(1) : void runStoreSearch() } }} />
+                <select bind:value={storeSort} aria-label="商店排序">
+                  <option value="recommended">推荐顺序</option>
+                  <option value="popular">下载 / 票数</option>
+                  <option value="name">名称 A-Z</option>
+                  <option value="updated">更新时间</option>
+                </select>
                 <button class="ghost" on:click={() => storeTab === 'xue' ? void loadXue(1) : void runStoreSearch()}>搜索</button>
               </div>
               {#if storeBusy}<p class="desc">{storeBusy}</p>{/if}
@@ -663,7 +822,7 @@
                   {#each xue.categories as cat}<button class="choice" class:on={xueCategory === cat} on:click={() => { xueCategory = cat; void loadXue(1) }}>{cat}</button>{/each}
                 </div>
                 <p class="desc">{xue.note}</p>
-                {#each xue.items as item (item.id)}
+                {#each sortedXueItems as item (item.id)}
                   <div class="p-card">
                     <strong>{String(item.title)}</strong>
                     <p class="desc">{String(item.content)}</p>
@@ -673,9 +832,9 @@
               </section>
             {:else}
               <section class="group">
-                {#each storeItems as item, index (item.id || item.slug || item.name || index)}
+                {#each sortedStoreItems as item, index (item.id || item.slug || item.name || index)}
                   <div class="p-card">
-                    <div class="p-head">
+                  <div class="p-head">
                       <span class="p-name">{String(item.title || item.name)}</span>
                       {#if storeTab === 'prompts' && item.featured}<span class="badge on">精选</span>{/if}
                       {#if storeTab === 'prompts' && item.votes}<span class="badge">{formatCount(item.votes)} 票</span>{/if}
@@ -756,6 +915,44 @@
                 {/if}
               {/if}
             </section>
+          {:else if tab === 'archived'}
+            <section class="group archived-group">
+              <div class="section-head">
+                <div>
+                  <h3>已归档的聊天</h3>
+                  <p class="desc">归档只负责收起会话，不会删除内容。</p>
+                </div>
+                <button class="danger-ghost" disabled={!archivedSessions.length || archivedBusy} on:click={() => void deleteAllArchived()}>全部删除</button>
+              </div>
+              <input class="archive-search" bind:value={archivedQuery} placeholder="搜索已归档聊天" aria-label="搜索已归档聊天" />
+              {#if archivedNotice}<p class="inline-notice error">{archivedNotice}</p>{/if}
+              {#if archivedBusy}
+                <p class="desc">正在读取归档聊天…</p>
+              {:else}
+                <div class="archive-list">
+                  {#each archivedGroups as group (group.path || group.project)}
+                    <div class="archive-project">
+                      <div class="archive-project-head">
+                        <strong>{group.project}</strong>
+                        <span>{group.items.length} 个聊天</span>
+                      </div>
+                      {#each group.items as session (session.id)}
+                        <div class="archive-row">
+                          <div class="archive-copy">
+                            <strong>{session.title}</strong>
+                            <small>{formatArchiveTime(session.modifiedAt)}{session.cwd ? ` · ${session.cwd}` : ''}</small>
+                          </div>
+                          <button class="ghost" on:click={() => void restoreArchivedSession(session)}>取消归档</button>
+                          <button class="archive-delete" on:click={() => void deleteArchivedSession(session)}>删除</button>
+                        </div>
+                      {/each}
+                    </div>
+                  {:else}
+                    <div class="archive-empty">还没有归档的聊天</div>
+                  {/each}
+                </div>
+              {/if}
+            </section>
           {:else if tab === 'logs'}
             <section class="group">
               <div class="section-head"><h3>Sidecar 日志</h3><button class="ghost" on:click={() => void loadLogs()}>刷新</button></div>
@@ -785,20 +982,53 @@
             <section class="group">
               <h3>关于</h3>
               <div class="row"><span class="k">版本</span><span class="v">v{version}</span></div>
-              <div class="row"><span class="k">技术栈</span><span class="v">Tauri 2 · Svelte 5 · Pi SDK 0.85</span></div>
+              <div class="row"><span class="k">技术栈</span><span class="v">Tauri 2 · Svelte 5 · 官方 Pi SDK</span></div>
               <div class="row"><span class="k">Node</span><span class="v">{info?.node ?? '—'}</span></div>
-              <div class="row"><span class="k">Pi SDK</span><span class="v">{info?.sdk ?? '—'}</span></div>
+              <div class="row"><span class="k">运行中的 SDK</span><span class="v">{info?.sdk ?? '—'}</span></div>
+              <div class="row">
+                <span class="k">官方 Pi SDK</span>
+                <span class="v">当前 {agentUpdate?.current ?? info?.sdk ?? '—'}{#if agentUpdate?.sourceLabel}<small class="source-note"> · {agentUpdate.sourceLabel}</small>{/if}</span>
+              </div>
+              <div class="row">
+                <span class="k">最新版本</span>
+                <span class:latest-update={agentUpdate?.updateAvailable} class="v">
+                  {agentUpdate?.latest ?? '—'}
+                  {#if agentUpdate?.updated}
+                    <span class="badge on">已安装，重启生效</span>
+                  {:else if agentUpdate?.updateAvailable}
+                    <span class="badge on">有新版本</span>
+                  {:else if agentUpdate}
+                    <span class="badge">已是最新</span>
+                  {/if}
+                </span>
+                <button disabled={agentUpdateBusy || !connected || !onCheckAgentUpdate} on:click={() => onCheckAgentUpdate?.()}>
+                  {agentUpdateBusy ? '检查中…' : '检查更新'}
+                </button>
+              </div>
+              {#if agentUpdate?.updateAvailable && onUpdateAgent}
+                <div class="row">
+                  <span class="k">更新 Pi SDK</span>
+                  <button disabled={agentUpdateBusy || !connected} on:click={onUpdateAgent}>{agentUpdateBusy ? '安装中…' : '直接更新'}</button>
+                  {#if onOpenAgentUpdate}<button on:click={onOpenAgentUpdate}>打开 npm</button>{/if}
+                </div>
+              {/if}
+              {#if agentUpdate?.message}<p class="desc">{agentUpdate.message}</p>{/if}
               <div class="row">
                 <span class="k">仓库</span>
                 <span class="v">github.com/TANGZZee/pi-my</span>
                 {#if onOpenRepo}<button on:click={onOpenRepo}>打开</button>{/if}
+              </div>
+              <div class="row">
+                <span class="k">Pi 官方仓库</span>
+                <span class="v">github.com/earendil-works/pi</span>
+                {#if onOpenAgentRepo}<button on:click={onOpenAgentRepo}>打开</button>{/if}
               </div>
             </section>
           {/if}
         </div>
         </div>
         <div class="pane-host" class:off={pane !== 'config'}>
-          <ConfigPane open={open} connected={connected} rpc={rpc} bind:dirty={configDirty} saveHandler={configSaveHandler} onRefreshProviders={onRefreshProviders} onPrefsChange={onPrefsChange} />
+          <ConfigPane open={open} connected={connected} rpc={rpc} bind:dirty={configDirty} saveHandler={configSaveHandler} onRefreshProviders={onRefreshProviders} />
         </div>
       </div>
     </div>
@@ -814,8 +1044,6 @@
   .panes button { height: 30px; padding: 0 12px; border-radius: 6px; background: transparent; color: var(--text-3); font-size: 13px; }
   .panes button.on { background: var(--raised); color: var(--text); font-weight: 650; box-shadow: 0 1px 2px rgb(0 0 0 / 8%); }
   .head-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
-  .save { height: 30px; padding: 0 12px; border-radius: 6px; background: var(--accent); color: var(--accent-fg); font-size: 12px; }
-  .save:disabled { opacity: .5; }
   .close { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 6px; background: transparent; color: var(--muted); }
   .close:hover { background: var(--hover); color: var(--text); }
   .main { flex: 1; display: flex; min-height: 0; background: var(--surface); }
@@ -831,6 +1059,24 @@
   .group + .group { margin-top: 18px; }
   .group:last-child { padding-bottom: 0; border-bottom: 0; }
   .group h3 { margin: 0 0 12px; color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .08em; }
+  .archived-group { max-width: 820px; }
+  .archive-search { width: 100%; height: 34px; margin: 4px 0 12px; padding: 0 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--raised); color: var(--text-2); font-size: 12px; }
+  .archive-project { margin-top: 12px; overflow: hidden; border: 1px solid var(--border-2); border-radius: 8px; background: var(--raised); }
+  .archive-project-head { display: flex; align-items: center; justify-content: space-between; padding: 9px 12px; border-bottom: 1px solid var(--border-2); background: var(--surface-3); }
+  .archive-project-head strong { color: var(--text-2); font-size: 12px; }
+  .archive-project-head span { color: var(--muted); font-size: 10px; }
+  .archive-row { display: flex; align-items: center; gap: 8px; min-height: 54px; padding: 8px 10px 8px 12px; border-top: 1px solid var(--hover); }
+  .archive-project-head + .archive-row { border-top: 0; }
+  .archive-copy { min-width: 0; flex: 1; }
+  .archive-copy strong, .archive-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .archive-copy strong { color: var(--text); font-size: 12px; font-weight: 600; }
+  .archive-copy small { margin-top: 3px; color: var(--muted); font-size: 10px; }
+  .archive-delete { flex: none; padding: 5px 10px; border-radius: 4px; background: #fbf1ef; color: #a03a32; font-size: 11px; }
+  .archive-delete:hover { background: #f6e3df; }
+  .danger-ghost { flex: none; margin-left: auto; padding: 5px 10px; border-radius: 4px; background: #fbf1ef; color: #a03a32; font-size: 11px; }
+  .danger-ghost:hover:not(:disabled) { background: #f6e3df; }
+  .danger-ghost:disabled { opacity: .45; }
+  .archive-empty { padding: 36px 0; color: var(--muted); font-size: 12px; text-align: center; }
   .row { display: flex; align-items: center; gap: 10px; min-height: 28px; color: var(--text-2); font-size: 12px; }
   .row + .row { margin-top: 6px; }
   .k { flex: none; width: 92px; color: var(--muted); font-size: 11px; }
@@ -912,6 +1158,10 @@
   .usage-table-row span:not(:first-child), .usage-table-head span:not(:first-child) { font-variant-numeric: tabular-nums; text-align: right; }
   .badge { flex: none; display: inline-flex; align-items: center; gap: 5px; padding: 2px 7px; border: 1px solid var(--active); border-radius: 999px; background: var(--raised); color: var(--muted); font-size: 10px; }
   .badge.on { color: var(--text-2); }
+  .inline-notice { color: var(--muted); font-size: 11px; }
+  .inline-notice.error { color: #a03a32; }
+  .source-note { color: var(--muted-2); font-size: 10px; }
+  .store-search-row select { min-width: 132px; height: 30px; padding: 0 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--raised); color: var(--text-2); font-size: 12px; }
   .log-box { min-height: 360px; padding: 10px; overflow: auto; border: 1px solid var(--border); border-radius: 6px; background: var(--raised); color: var(--text-2); font: 11px/1.45 ui-monospace, "Cascadia Mono", monospace; white-space: pre-wrap; }
   @media (max-width: 620px) { .usage-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 </style>
