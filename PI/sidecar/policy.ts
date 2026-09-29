@@ -12,7 +12,19 @@ export const PLAN_TOOLS: readonly string[] = ['read', 'grep', 'find', 'ls']
 // ask/full 模式的核心工具集
 export const CORE_TOOLS: readonly string[] = ['read', 'bash', 'edit', 'write']
 /**
- * 会话注册表应包含的工具 = 核心集 ∪ 只读集。
+ * Pi-My 自带的自定义工具（通过 createAgentSession 的 customTools 注入）。
+ *
+ * ⚠️ 必须同时出现在传给 SDK 的 `tools` 白名单里（即并入 BASE_TOOLS），否则
+ * **注册表会连 customTools 一起裁掉** —— 实测（2026-09-29 装机冒烟）：
+ * 只传 `customTools: [showImageTool]` 而 `tools: BASE_TOOLS`（不含 show_image）时，
+ * `getAllTools()` 返回的 7 个工具里没有 show_image，模型永远看不到这个工具。
+ * 表现为"功能静默不可用"——比崩溃更难发现（本地单测只测工具函数，测不到注册）。
+ *
+ * 这些工具都是只读/展示性质，所以在 plan 模式下也保留。
+ */
+export const CUSTOM_TOOLS: readonly string[] = ['show_image']
+/**
+ * 会话注册表应包含的工具 = 核心集 ∪ 只读集 ∪ 自定义工具。
  *
  * 为什么需要并集：SDK 的注册表在 createAgentSession 时就被 `tools` 参数**永久裁剪**，
  * 且 getAllTools() 之后只反映裁剪结果。若按初始模式分别传入（plan 传 PLAN_TOOLS、
@@ -24,6 +36,7 @@ export const CORE_TOOLS: readonly string[] = ['read', 'bash', 'edit', 'write']
 export const BASE_TOOLS: readonly string[] = [
   ...CORE_TOOLS,
   ...PLAN_TOOLS.filter((tool) => !CORE_TOOLS.includes(tool)),
+  ...CUSTOM_TOOLS.filter((tool) => !CORE_TOOLS.includes(tool) && !PLAN_TOOLS.includes(tool)),
 ]
 // ask 模式下需要用户确认的工具
 export const CONFIRM_TOOLS: readonly string[] = ['bash', 'powershell', 'edit', 'write']
@@ -62,8 +75,9 @@ export function isAgentMode(value: unknown): value is AgentMode {
 export function toolsForModeSwitch(mode: AgentMode | string, allToolNames: readonly string[] | null | undefined): string[] {
   const available = Array.isArray(allToolNames) && allToolNames.length ? allToolNames : BASE_TOOLS
   if (mode === 'plan') {
-    // 只保留**确实存在**的只读工具（避免请求未注册的名字）
-    return available.filter((name) => PLAN_TOOLS.includes(name))
+    // 只保留**确实存在**的只读工具（避免请求未注册的名字）。
+    // 自定义工具（show_image）也是只读/展示性质，plan 模式下保留。
+    return available.filter((name) => PLAN_TOOLS.includes(name) || CUSTOM_TOOLS.includes(name))
   }
   // ask / full：全部可用工具（ask 的危险工具由确认桥逐次拦截，不靠裁剪工具集）
   return [...available]

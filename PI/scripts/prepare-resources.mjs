@@ -107,12 +107,22 @@ const indexPath = path.join(sidecarDst, 'index.mjs')
 // 背景：sidecar 从单文件演进为多文件后，"漏复制一个模块"不再有任何症状——
 // 脚本会静默成功，直到用户装完打开才发现 sidecar 起不来（ERR_MODULE_NOT_FOUND）。
 // 这里直接扫描 import，把故障提前到构建期。两种模式都要跑。
-// 产物自检：sidecar 里的相对 import 必须都能解析，且**编译产物不得再引用 .ts**。
+// 产物自检：sidecar 的 import 必须在**安装环境**下都能解析。
+// 三类检查：
+//   1) 相对 import 不得指向 .ts（编译产物只该引 .js）
+//   2) 相对 import 目标文件必须存在
+//   3) **裸包名 import 必须在 resources/ 为根时能解析**（装机事故根因，2026-09-29）
 //
-// 背景：esbuild 不会重写 import 路径。若某个 .js 产物仍指向 `./x.ts`，
-// Node 24 的原生 type-stripping 会"恰好"加载 .ts 源文件 —— 本地能跑，
-// 但产物里 .ts 与 .js 可能不同步（审查 P1-5：4 个 .js 落后于 .ts，自检却通过）。
-// 因此这里把"命中 .ts"视为错误，而不是当作可解析。
+// 第 3 条为什么必须有：show-image.ts 曾写 `import { Type } from 'typebox'`。
+// 开发时能解析（PI/node_modules/typebox 是提升依赖），但安装后 sidecar 跑在
+// `<安装目录>/resources/sidecar/`，向上只能找到 `resources/node_modules`（仅 SDK）
+// —— sidecar 启动即 ERR_MODULE_NOT_FOUND，表现为"反复退出（3 次/60 秒内）"。
+// 本地测试与产物的旧冒烟测试都从仓库根跑，会向上找到 PI/node_modules 而漏判。
+//
+// 判定方式：把裸包名按 Node 的 ESM 解析规则在 resources/ 下查找
+// （resources/node_modules/<name> 是否存在），不实际 import（避免副作用）。
+const NODE_BUILTIN = (specifier) => specifier.startsWith('node:') || specifier.startsWith('bun:')
+
 async function assertSidecarImportsResolve() {
   const problems = []
   const seen = new Set()
@@ -120,8 +130,26 @@ async function assertSidecarImportsResolve() {
     if (seen.has(file) || !existsSync(file)) return
     seen.add(file)
     const source = await readFile(file, 'utf8')
-    for (const match of source.matchAll(/from\s+['"](\.[^'"]+)['"]/g)) {
-      const specifier = match[1]
+    // 三种 import 形态都要扫（漏一种就是一条装机崩溃路径）：
+    //   1) import ... from 'x' / export ... from 'x'
+    //   2) import 'x'（副作用导入）
+    //   3) import('x')（动态导入 —— 裸包名同样必须在包里存在）
+    const specifiers = new Set()
+    for (const match of source.matchAll(/(?:from|(?<![\w.])import)\s+['"]([^'"]+)['"]/g)) specifiers.add(match[1])
+    for (const match of source.matchAll(/import\s*\(\s*['"]([^'"]+)['"]\s*\)/g)) specifiers.add(match[1])
+    for (const specifier of specifiers) {
+      const isRelative = specifier.startsWith('.')
+      if (!isRelative) {
+        if (NODE_BUILTIN(specifier)) continue
+        // 裸包名：必须在 resources/node_modules 下可解析
+        if (!resolveBarePackage(specifier)) {
+          problems.push(
+            `${path.relative(root, file)} → ${specifier}（裸包名在安装包里不存在；` +
+            `开发期靠 PI/node_modules 提升依赖才解析成功，装机必崩）`,
+          )
+        }
+        continue
+      }
       const target = path.resolve(path.dirname(file), specifier)
       if (specifier.endsWith('.ts') || existsSync(`${target}.ts`)) {
         // 编译产物或入口引用了 .ts —— 说明重写步骤漏了它
@@ -137,6 +165,22 @@ async function assertSidecarImportsResolve() {
   if (problems.length) {
     throw new Error(`sidecar 产物有问题，应用会无法启动:\n${problems.map((item) => `  - ${item}`).join('\n')}`)
   }
+}
+
+/** 按 Node ESM 规则，在 resources/node_modules 下查找裸包名。支持 @scope/name 与子路径。
+ *  环境不完整（resources/node_modules 尚未安装 SDK）时跳过 —— --sidecar-only 模式即此情形，
+ *  此时无法判定，宁可放过也不能误报阻断 dev。 */
+function resolveBarePackage(specifier) {
+  const sdkRoot = path.join(resources, 'node_modules', '@earendil-works', 'pi-coding-agent')
+  if (!existsSync(sdkRoot)) return true // 环境不完整：跳过裸包名判定
+  const parts = specifier.split('/')
+  const name = specifier.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0]
+  const base = path.join(resources, 'node_modules', name)
+  if (!existsSync(base)) return false
+  // 子路径（如 @scope/pkg/dist/x.js）：确认目标存在
+  const rest = specifier.slice(name.length).replace(/^\//, '')
+  if (!rest) return true
+  return existsSync(path.join(base, rest)) || existsSync(path.join(base, rest, 'index.js'))
 }
 
 await assertSidecarImportsResolve()

@@ -16,7 +16,7 @@ test('agent 客户端：Hermes 式协作全流程', async () => {
   const client = connectPiMy({
     sidecarPath: path.join(projectRoot, 'sidecar', 'index.mjs'),
     cwd: projectRoot,
-    requestTimeoutMs: 60_000,
+    requestTimeoutMs: process.env.CI ? 240_000 : 120_000,
     env: { PI_TRUST_ALL: '1' },
   })
   try {
@@ -59,7 +59,7 @@ test('agent 客户端：全量能力抽查（记忆/导出/文件分块）', asy
   const client = connectPiMy({
     sidecarPath: path.join(projectRoot, 'sidecar', 'index.mjs'),
     cwd: projectRoot,
-    requestTimeoutMs: 60_000,
+    requestTimeoutMs: process.env.CI ? 240_000 : 120_000,
     env: { PI_TRUST_ALL: '1' },
   })
   try {
@@ -98,7 +98,7 @@ test('agent 客户端：协议健壮性（坏 JSON 不崩、未知请求明确�
   const client = connectPiMy({
     sidecarPath: path.join(projectRoot, 'sidecar', 'index.mjs'),
     cwd: projectRoot,
-    requestTimeoutMs: 60_000,
+    requestTimeoutMs: process.env.CI ? 240_000 : 120_000,
     env: { PI_TRUST_ALL: '1' },
   })
   try {

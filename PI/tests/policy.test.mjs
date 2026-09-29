@@ -9,6 +9,7 @@ import {
   BASE_TOOLS,
   CONFIRM_TOOLS,
   CORE_TOOLS,
+  CUSTOM_TOOLS,
   DEFAULT_MODE,
   PLAN_TOOLS,
   isAgentMode,
@@ -117,7 +118,45 @@ test('plan 模式在空基准下退化为只读子集（不落到空工具集）
   // 现改为退化到 BASE_TOOLS 后再过滤，保证只读工具始终可用。
   const planTools = toolsForModeSwitch('plan', [])
   assert.ok(planTools.length > 0, 'plan 不该清空工具')
-  for (const tool of planTools) assert.ok(PLAN_TOOLS.includes(tool))
+  // plan = 只读内置工具 ∪ 自定义只读/展示工具（show_image 等）
+  for (const tool of planTools) {
+    assert.ok(
+      PLAN_TOOLS.includes(tool) || CUSTOM_TOOLS.includes(tool),
+      `plan 出现了既非只读也非自定义只读的工具: ${tool}`,
+    )
+  }
+  for (const tool of PLAN_TOOLS) assert.ok(planTools.includes(tool), `plan 缺少只读工具 ${tool}`)
+})
+
+// ---------------------------------------------------------------------------
+// 装机冒烟回归（2026-09-29）：自定义工具必须并入传给 SDK 的 tools 白名单
+//
+// 事故/缺陷：只传 `customTools: [showImageTool]` 而 `tools: BASE_TOOLS`（不含
+// show_image）时，SDK 的注册表**连 customTools 一起裁掉** —— 实测 getActiveToolNames()
+// 返回 7 个内置工具，没有 show_image，模型永远看不到它。功能静默不可用，
+// 本地单测（只测工具函数本身）完全测不到。
+// 现场是装机冒烟发现的：get_state 的 tools 列表里没有 show_image。
+// ---------------------------------------------------------------------------
+test('BASE_TOOLS 必须包含全部自定义工具（否则 SDK 注册表会裁掉它们）', () => {
+  for (const tool of CUSTOM_TOOLS) {
+    assert.ok(
+      BASE_TOOLS.includes(tool),
+      `BASE_TOOLS 缺少自定义工具 ${tool} —— SDK 会连 customTools 一起裁掉，该工具静默不可用`,
+    )
+  }
+})
+
+test('自定义只读工具在 plan/ask/full 三种模式下都保持可用', () => {
+  for (const mode of ['plan', 'ask', 'full']) {
+    const tools = toolsForModeSwitch(mode, BASE_TOOLS)
+    for (const tool of CUSTOM_TOOLS) {
+      assert.ok(tools.includes(tool), `${mode} 模式丢失自定义工具 ${tool}`)
+    }
+  }
+})
+
+test('BASE_TOOLS 无重复项（重复会让 SDK 工具集计算出现歧义）', () => {
+  assert.equal(new Set(BASE_TOOLS).size, BASE_TOOLS.length, `BASE_TOOLS 有重复: ${BASE_TOOLS.join(',')}`)
 })
 
 test('PLAN_TOOLS 只含只读工具（不得混入写/命令工具）', () => {

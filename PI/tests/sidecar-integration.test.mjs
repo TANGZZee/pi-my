@@ -12,6 +12,8 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
+import fs from 'node:fs'
+import os from 'node:os'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const projectRoot = path.resolve(here, '..')
@@ -85,16 +87,49 @@ async function withSidecar(body) {
 
 /** 打包产物沙箱：真实启动 prepare:dev 的产物（行为验证，替代源码 grep）。
  *  审查发现源码 grep 断言可被"注释保留字面量/等价重构"绕过（6/11），
- *  而产物起不来/引用 .ts 会在这里直接爆出来。 */
+ *  而产物起不来/引用 .ts 会在这里直接爆出来。
+ *
+ *  ⚠️ 关键：**必须在隔离目录里跑**（装机事故根因，2026-09-29）。
+ *  旧版从 projectRoot 启动，Node 解析裸包名时会向上找到 `PI/node_modules`
+ *  （提升依赖 typebox 就在那儿），于是 `import 'typebox'` 这类**装机必崩**的
+ *  依赖被静默放过 —— 用户装到 D:\Pi\Pi-My 后 sidecar 启动即
+ *  ERR_MODULE_NOT_FOUND，表现为"反复退出（3 次/60 秒内）"。
+ *  现在把 sidecar 拷到 %TEMP% 下的模拟安装目录（其祖先链上没有 node_modules），
+ *  并把 resources/node_modules 以 junction 挂进来 —— 与真实安装布局一致，
+ *  任何缺失的裸包名都会在这里当场炸出来。 */
 async function withPackagedSidecar(body) {
-  const entry = path.join(projectRoot, 'src-tauri', 'resources', 'sidecar', 'index.mjs')
+  const realResources = path.join(projectRoot, 'src-tauri', 'resources')
+  const simRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-my-pkgsim-'))
+  const simResources = path.join(simRoot, 'resources')
+  fs.mkdirSync(simResources, { recursive: true })
+  // sidecar 是纯文本（小），直接拷贝
+  fs.cpSync(path.join(realResources, 'sidecar'), path.join(simResources, 'sidecar'), { recursive: true })
+  // node_modules 体积大（含 SDK），用 junction 避免拷贝；Node 的解析语义与真实安装一致
+  const realModules = path.join(realResources, 'node_modules')
+  if (fs.existsSync(realModules)) {
+    fs.symlinkSync(realModules, path.join(simResources, 'node_modules'), 'junction')
+  }
+  const entry = path.join(simResources, 'sidecar', 'index.mjs')
+  if (!fs.existsSync(entry)) {
+    fs.rmSync(simRoot, { recursive: true, force: true })
+    throw new Error('打包产物缺失：请先运行 npm run prepare:dev')
+  }
   const child = spawn(process.execPath, [entry], {
-    cwd: projectRoot,
+    cwd: simRoot,
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, PI_TRUST_ALL: '1' },
   })
   let buffer = ''
   const pending = new Map()
+  // 捕获启动期 stderr：模块解析失败会在这里出现，比"请求超时"更早、更可诊断
+  let stderrText = ''
+  child.stderr.on('data', (chunk) => { stderrText += chunk.toString().slice(0, 4000) })
+  child.on('exit', (code, signal) => {
+    if (code !== 0 && code !== null) {
+      for (const [, resolve] of pending) resolve({ ok: false, error: `sidecar 提前退出(${code}) ${stderrText.slice(0, 400)}` })
+      pending.clear()
+    }
+  })
   child.stdout.on('data', (chunk) => {
     buffer += chunk.toString()
     let index
@@ -115,17 +150,19 @@ async function withPackagedSidecar(body) {
     const id = ++sequence
     const timer = setTimeout(() => {
       pending.delete(id)
-      reject(new Error(`打包产物请求超时: ${type}`))
+      // 把 stderr 带进错误信息：缺包/语法错误时用户能看到真正原因
+      reject(new Error(`打包产物请求超时: ${type}${stderrText ? ` | stderr: ${stderrText.slice(0, 400)}` : ''}`))
     }, process.env.CI ? 120_000 : 45_000)
     pending.set(id, (message) => { clearTimeout(timer); resolve(message) })
     child.stdin.write(`${JSON.stringify({ id, type, payload })}\n`)
   })
   try {
-    const init = await req('init', { cwd: projectRoot })
+    const init = await req('init', { cwd: simRoot })
     assert.equal(init.ok, true, `打包产物 sidecar init 失败: ${init.error}`)
     return await body(req)
   } finally {
     try { child.kill() } catch { /* ignore */ }
+    try { fs.rmSync(simRoot, { recursive: true, force: true }) } catch { /* ignore */ }
   }
 }
 

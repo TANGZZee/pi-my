@@ -51,6 +51,14 @@ jobs:
       - name: 打包产物自检（先于构建：sidecar import 全解析，不得引用 .ts）
         run: npm run prepare:dev
 
+      # 装机冒烟：把产物拷到临时目录模拟真实安装布局（祖先链上没有 node_modules），
+      # 跑一串真实请求。2026-09-29 事故（typebox 裸包名 → sidecar 启动即崩）就是
+      # 这一层抓出来的；它比"从仓库根跑"更严格，能拦住所有"只有装机才暴露"的问题。
+      - name: 装机冒烟（模拟安装目录跑真实 sidecar）
+        run: npm run smoke:install
+        env:
+          CI: 'true'
+
       - name: 构建
         run: npm run build
 

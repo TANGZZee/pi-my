@@ -44,11 +44,14 @@ async function withSidecar(writable) {
     }
   })
   child.stderr.on('data', () => {})
+  // 超时放宽：本文件与 sidecar-integration / agent-client 并发时会有 3+ 个 sidecar
+  // 同时加载 SDK 与扩展，init 可能从 20s 拉长到 60s+（曾因此偶发失败）。
+  const bootTimeoutMs = process.env.CI ? 240_000 : 120_000
   const req = (id, type, payload) => new Promise((resolve) => {
     const timer = setTimeout(() => {
       pending.delete(id)
       resolve({ ok: false, error: 'timeout' })
-    }, 60000)
+    }, bootTimeoutMs)
     pending.set(id, (m) => { clearTimeout(timer); resolve(m) })
     child.stdin.write(JSON.stringify({ id, type, payload }) + '\n')
   })

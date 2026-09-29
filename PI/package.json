@@ -1,7 +1,7 @@
 {
   "name": "pi-my",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -13,6 +13,8 @@
     "verify": "npm run check && npm run test && npm run build",
     "prepare:runtime": "node scripts/prepare-resources.mjs",
     "prepare:dev": "node scripts/prepare-resources.mjs --sidecar-only",
+    "smoke:install": "node scripts/smoke-install.mjs",
+    "verify:install": "npm run prepare:dev && npm run smoke:install",
     "preview": "vite preview",
     "tauri": "tauri"
   },

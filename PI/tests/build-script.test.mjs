@@ -13,6 +13,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 
@@ -56,9 +57,90 @@ test('dev 与 build 都不能跳过 sidecar 同步（否则改了 sidecar 在 de
   assert.match(pkg.scripts['prepare:runtime'] || '', /prepare-resources/, 'prepare:runtime 指向主脚本')
 })
 
+test('装机冒烟脚本仍在且已接入管线（2026-09-29 事故的验收防线）', () => {
+  // 该脚本在临时目录模拟真实安装布局跑真实请求 —— 没有它，
+  // "只有装机才暴露"的缺陷（缺裸包名、工具未注册）会直接送到用户手里。
+  assert.ok(fs.existsSync(path.join(root, 'scripts', 'smoke-install.mjs')), 'smoke-install.mjs 被删除')
+  assert.match(pkg.scripts['smoke:install'] || '', /smoke-install/, 'smoke:install 脚本未注册')
+  assert.match(pkg.scripts['verify:install'] || '', /smoke/, 'verify:install 未把冒烟纳入')
+  // CI 必须跑它（漏了这一步等于防线只在本地）。
+  // 注意：CI 工作流在**仓库根**（PI 的上一级），不在 PI/ 内。
+  const ciPath = path.join(root, '..', '.github', 'workflows', 'ci.yml')
+  assert.ok(fs.existsSync(ciPath), `CI 工作流不存在: ${ciPath}`)
+  assert.match(readFileSync(ciPath, 'utf8'), /smoke:install|smoke-install/, 'CI 未运行装机冒烟')
+})
+
 test('sidecar 入口仍引入瘦身/权限/审批扩展（承重 import 防误删）', () => {
   const sidecar = read('sidecar/index.mjs')
   for (const module of ['event-slim.mjs', 'policy.ts', 'approval-extension.ts', 'ui-context.ts']) {
     assert.ok(sidecar.includes(module), `sidecar/index.mjs 缺少对 ${module} 的引用`)
   }
+})
+
+// ---------------------------------------------------------------------------
+// 装机事故回归（2026-09-29）：sidecar 不得依赖开发期的"提升依赖"
+//
+// 事故：show-image.ts 写了 `import { Type } from 'typebox'`。开发目录能解析
+// （PI/node_modules/typebox 来自依赖提升），但安装后 sidecar 跑在
+// `<安装目录>/resources/sidecar/`，向上只有 resources/node_modules（仅含 SDK）
+// → ERR_MODULE_NOT_FOUND → sidecar 启动即崩 → 前端显示"反复退出（3 次/60 秒内）"。
+//
+// 这里**独立实现**一遍解析检查（不依赖 prepare-resources.mjs 的实现），
+// 双重保险：构建期由脚本自检拦，CI 由本测试拦。
+// 只扫源码即可 —— 产物由源码编译而来，源码干净则产物干净（脚本自检兜底产物）。
+// ---------------------------------------------------------------------------
+test('sidecar 源码的全部裸包名都能在安装包 resources/node_modules 中解析（装机事故回归）', () => {
+  const resourcesModules = path.join(root, 'src-tauri', 'resources', 'node_modules')
+  const sdkRoot = path.join(resourcesModules, '@earendil-works', 'pi-coding-agent')
+  if (!fs.existsSync(sdkRoot)) {
+    // 环境未准备 SDK（如纯前端环境）：无法判定，跳过而非误报
+    return
+  }
+  const sdkAvailable = new Set(fs.readdirSync(resourcesModules))
+  const scopedAvailable = new Map()
+  for (const entry of sdkAvailable) {
+    if (!entry.startsWith('@')) continue
+    scopedAvailable.set(entry, new Set(fs.readdirSync(path.join(resourcesModules, entry))))
+  }
+  const canResolve = (specifier) => {
+    const parts = specifier.split('/')
+    const name = specifier.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0]
+    if (name.startsWith('@')) {
+      const [scope, pkg] = name.split('/')
+      return Boolean(scopedAvailable.get(scope)?.has(pkg))
+    }
+    return sdkAvailable.has(name)
+  }
+
+  const builtins = (s) => s.startsWith('node:') || s.startsWith('bun:')
+  const files = []
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) {
+        if (entry.name === 'node_modules') continue
+        walk(full)
+      } else if (/\.(mjs|ts)$/.test(entry.name)) {
+        files.push(full)
+      }
+    }
+  }
+  walk(path.join(root, 'sidecar'))
+
+  const offenders = []
+  for (const file of files) {
+    const source = readFileSync(file, 'utf8')
+    const specs = new Set()
+    for (const m of source.matchAll(/(?:from|(?<![\w.])import)\s+['"]([^'"]+)['"]/g)) specs.add(m[1])
+    for (const m of source.matchAll(/import\s*\(\s*['"]([^'"]+)['"]\s*\)/g)) specs.add(m[1])
+    for (const spec of specs) {
+      if (spec.startsWith('.') || builtins(spec)) continue
+      if (!canResolve(spec)) offenders.push(`${path.relative(root, file)} → ${spec}`)
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `以下裸包名在安装包里不存在（开发期靠提升依赖才解析成功，装机必崩）:\n  ${offenders.join('\n  ')}`,
+  )
 })

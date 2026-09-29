@@ -8,7 +8,6 @@
 import { readFile, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { extname, isAbsolute, join, resolve } from 'node:path'
-import { Type } from 'typebox'
 
 /** 单图上限：过大的文件拖慢 IPC/渲染 */
 const MAX_BYTES = 10 * 1024 * 1024
@@ -42,13 +41,35 @@ export interface ShowImageDetails {
   images: Array<{ data: string; mimeType: string }>
 }
 
-const showImageParams = Type.Object({
-  paths: Type.Array(Type.String({ description: '图片文件路径：绝对路径、相对工作目录、或以 ~ 开头' }), {
-    minItems: 1,
-    maxItems: MAX_IMAGES,
-    description: `要展示的图片路径（1-${MAX_IMAGES} 张）。多张相关图片应在一次调用里全部传入，而不是反复调用`,
-  }),
-})
+/**
+ * 工具参数 schema —— **手写标准 JSON Schema，不依赖 typebox**。
+ *
+ * 为什么（装机事故根因，2026-09-29）：原先写的是 `Type.Object({...})`（typebox）。
+ * 开发目录能解析（PI/node_modules/typebox 是提升依赖），但打包后的 sidecar 跑在
+ * `<安装目录>/resources/sidecar/`，那里只有 SDK 一个包 —— 于是
+ * `ERR_MODULE_NOT_FOUND: Cannot find package 'typebox'`，sidecar 启动即崩，
+ * 表现为"反复退出（3 次/60 秒内）"。
+ *
+ * 实测已确认 typebox 的 Type.Object 产出就是**纯标准 JSON Schema**
+ * （自有键仅 type/required/properties，无 Symbol、无私有字段），
+ * 所以手写与之逐字段等价、且零依赖。
+ *
+ * ⚠️ 顶层必须是 `type: 'object'` —— percho issue #21：schema 缺顶层 type 会让
+ * OpenAI 兼容协议（DeepSeek 等）的请求全部 400。
+ */
+const showImageParams = {
+  type: 'object',
+  required: ['paths'],
+  properties: {
+    paths: {
+      type: 'array',
+      items: { type: 'string', description: '图片文件路径：绝对路径、相对工作目录、或以 ~ 开头' },
+      minItems: 1,
+      maxItems: MAX_IMAGES,
+      description: `要展示的图片路径（1-${MAX_IMAGES} 张）。多张相关图片应在一次调用里全部传入，而不是反复调用`,
+    },
+  },
+} as const
 
 /**
  * 内置 show_image 工具：把一组图片显示到桌面端对话区。
