@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 同一分支的新提交取代旧运行（省资源）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 最小权限（GitHub 默认给写 token，安全最佳实践是只读）
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: 前端（类型检查 + 测试 + 构建 + 产物自检）
+    runs-on: windows-latest
+    # 本地 sidecar-integration init 实测 24.7s，CI runner 慢 2-3 倍 → 上限放宽
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: PI
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: PI/package-lock.json
+
+      - name: 安装依赖
+        run: npm ci
+
+      # 合入前最低门槛：类型检查必须零错误（曾经 abandoned 未定义变量
+      # 因此溜进产物），测试全绿，构建成功。
+      - name: 类型检查（tsc + svelte-check）
+        run: npm run check
+
+      - name: 测试（含 build-script 承重断言 + sidecar 集成）
+        run: npm test
+        env:
+          # 集成测试单请求超时放宽（runner 比本地慢 2-3 倍）
+          CI: 'true'
+
+      - name: 打包产物自检（先于构建：sidecar import 全解析，不得引用 .ts）
+        run: npm run prepare:dev
+
+      - name: 构建
+        run: npm run build
+
+      # 承重脚本防误删已并入 npm test（tests/build-script.test.mjs，
+      # 借鉴 pi-agent-desktop 的 package.test.ts 思路）
+
+  rust:
+    name: Rust（Tauri 后端测试）
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: PI/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+
+      # P0 修复：tauri.conf.json 声明 bundle.resources: ["resources/**/*"]，
+      # tauri-build 的 copy_resources 对 0 匹配的 glob 会 panic（GlobPathNotFound），
+      # 而 .gitignore 忽略了整个 resources 目录 → 干净克隆上 cargo test 必挂。
+      # 这里预创建目录并提供一个占位文件让 glob 命中。
+      - name: 预创建 resources 目录（tauri-build glob 需要）
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path PI/src-tauri/resources/sidecar | Out-Null
+          Set-Content -Path PI/src-tauri/resources/sidecar/.gitkeep -Value '' -Encoding utf8
+
+      - name: 安装 Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: PI/src-tauri
+
+      - name: cargo test
+        run: cargo test --lib --message-format short

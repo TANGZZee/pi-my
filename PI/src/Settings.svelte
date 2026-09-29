@@ -2,6 +2,7 @@
   import { onMount } from 'svelte'
   import { version } from '../package.json'
   import { loadPrefs, patchPrefs, type Prefs, type Density, type SendShortcut, type BusySend, type ModePref, type ThemePref } from './prefs'
+  import { setLocale } from './i18n'
   import { loadAgents, removeAgent, upsertAgent, type AgentDef } from './agents'
   import { SKINS, type SkinId } from './skins'
   import { PETS, petPreviewUrl, type PetModel } from './pets'
@@ -12,7 +13,7 @@
   type ImageGenConfig = { baseUrl: string; apiKey: string; model: string; size: string }
   type SettingsInfo = { node: string; sdk: string; agentDir: string; sessionDir: string; authProviders: string[]; providers?: ProviderInfo[] }
   type ArchivedSession = { id: string; title: string; file?: string; cwd?: string; modifiedAt?: number; archived?: boolean }
-  type Tab = 'general' | 'appearance' | 'notify' | 'keys' | 'proxy' | 'agents' | 'imagegen' | 'git' | 'skills' | 'extensions' | 'store' | 'vision' | 'usage' | 'archived' | 'storage' | 'lan' | 'pet' | 'logs' | 'about'
+  type Tab = 'general' | 'appearance' | 'notify' | 'keys' | 'proxy' | 'agents' | 'imagegen' | 'git' | 'skills' | 'extensions' | 'mcp' | 'store' | 'vision' | 'usage' | 'archived' | 'storage' | 'lan' | 'pet' | 'logs' | 'about'
   type AgentUpdateInfo = { current: string; latest: string; installedVersion?: string; updateAvailable: boolean; url: string; repoUrl?: string; source?: string; sourceLabel?: string; updated?: boolean; restartRequired?: boolean; message?: string; checkedAt?: number }
 
   export let open = false
@@ -44,7 +45,7 @@
   const NAV: Array<{ group: string; items: Array<[Tab, string]> }> = [
     { group: '基础', items: [['general', '通用'], ['appearance', '外观'], ['notify', '通知'], ['keys', '快捷键'], ['proxy', '代理']] },
     { group: '能力', items: [['agents', '子代理'], ['imagegen', '生图'], ['git', 'Git']] },
-    { group: '生态', items: [['skills', '技能'], ['extensions', '扩展'], ['store', '商店'], ['vision', '视觉桥'], ['pet', '桌宠'], ['lan', '局域网']] },
+    { group: '生态', items: [['skills', '技能'], ['extensions', '扩展'], ['mcp', 'MCP'], ['store', '商店'], ['vision', '视觉桥'], ['pet', '桌宠'], ['lan', '局域网']] },
     { group: '维护', items: [['usage', '用量'], ['archived', '已归档的聊天'], ['storage', '存储'], ['logs', '日志'], ['about', '关于']] }
   ]
 
@@ -91,7 +92,7 @@
   let vision = { enabled: false, provider: '', model: '', baseUrl: '', apiKey: '', promptTemplate: '' }
   let ecoNotice = ''
   let petNotice = ''
-  let lanStatus: { enabled?: boolean; port?: number | null; urls?: string[]; clients?: number } | null = null
+  let lanStatus: { enabled?: boolean; writable?: boolean; port?: number | null; urls?: string[]; clients?: number } | null = null
   let lanBusy = false
   let logLines: string[] = []
   let oauthNotice = ''
@@ -99,6 +100,45 @@
   let archivedQuery = ''
   let archivedBusy = false
   let archivedNotice = ''
+  // U1：关窗最小化到托盘（由 Rust 侧持有真值；前端只在变更时下发）
+  let trayMinimize = true
+  let trayMinimizeBusy = false
+  // 2-10 MCP 服务器管理状态
+  type McpServer = { name: string; scope: string; command: string; transport: string; args: string[]; disabled: boolean }
+  let mcpServers: McpServer[] = []
+  let mcpGlobalPath = ''
+  let mcpBusy = false
+  let mcpTestStatus: Record<string, { busy?: boolean; ok?: boolean; message?: string }> = {}
+
+  async function loadMcpServers() {
+    if (!rpc || mcpBusy) return
+    mcpBusy = true
+    try {
+      const result = await rpc('mcp_list') as { global?: McpServer[]; project?: McpServer[]; globalPath?: string } | null
+      mcpServers = [...(result?.global ?? []), ...(result?.project ?? [])]
+      mcpGlobalPath = result?.globalPath ?? ''
+    } finally {
+      mcpBusy = false
+    }
+  }
+
+  async function testMcpServer(server: McpServer) {
+    if (!rpc || mcpTestStatus[server.name]?.busy) return
+    mcpTestStatus = { ...mcpTestStatus, [server.name]: { busy: true } }
+    try {
+      const result = await rpc('mcp_test', { server }) as { ok?: boolean; message?: string } | null
+      mcpTestStatus = { ...mcpTestStatus, [server.name]: { ok: result?.ok, message: result?.message ?? '无返回' } }
+    } catch (error) {
+      mcpTestStatus = { ...mcpTestStatus, [server.name]: { ok: false, message: String(error) } }
+    }
+  }
+
+  async function openMcpFile(file: string) {
+    if (!rpc || !file) return
+    // open_dir 期望目录：传 mcp.json 的父目录
+    const dir = file.replace(/[\\/][^\\/]+$/, '')
+    try { await rpc('open_dir', { path: dir }) } catch { /* ignore */ }
+  }
 
   onMount(() => {
     prefs = loadPrefs()
@@ -107,7 +147,29 @@
       const last = localStorage.getItem('pdn.settings-tab') as Tab | null
       if (last && NAV.some((section) => section.items.some(([id]) => id === last))) tab = last
     } catch { /* ignore */ }
+    // 读取 Rust 侧当前开关（审查 P1：此前前端零调用，用户无法关闭关窗到托盘）
+    void (async () => {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core')
+        trayMinimize = await invoke<boolean>('get_tray_minimize')
+      } catch { /* 非 Tauri 环境/旧版本：保持默认 */ }
+    })()
   })
+
+  async function setTrayMinimize(enabled: boolean) {
+    if (trayMinimizeBusy) return
+    trayMinimizeBusy = true
+    const previous = trayMinimize
+    trayMinimize = enabled // 乐观更新
+    try {
+      const { invoke } = await import('@tauri-apps/api/core')
+      await invoke('set_tray_minimize', { enabled })
+    } catch {
+      trayMinimize = previous // 失败回滚
+    } finally {
+      trayMinimizeBusy = false
+    }
+  }
 
   function setPane(next: 'settings' | 'config') {
     pane = next
@@ -123,6 +185,7 @@
   $: if (open) prefs = loadPrefs()
   $: if (open && tab === 'proxy') void loadProxy()
   $: if (open && (tab === 'skills' || tab === 'extensions')) void loadEco()
+  $: if (open && tab === 'mcp') void loadMcpServers()
   $: if (open && tab === 'vision') void loadVision()
   $: if (open && tab === 'lan') void loadLan()
   $: if (open && tab === 'logs') void loadLogs()
@@ -340,10 +403,22 @@
     try { lanStatus = await rpc('lan_status', {}) as typeof lanStatus } catch { lanStatus = { enabled: false, urls: [] } }
   }
 
-  async function setLan(enabled: boolean) {
+  async function setLan(enabled: boolean, writable = Boolean(lanStatus?.writable)) {
     if (!rpc) return
     lanBusy = true
-    try { lanStatus = await rpc('lan_set', { enabled, port: 18787 }) as typeof lanStatus } catch { /* keep */ }
+    try { lanStatus = await rpc('lan_set', { enabled, port: 18787, writable }) as typeof lanStatus } catch { /* keep */ }
+    lanBusy = false
+  }
+
+  /** 1-6：切换"允许远程写入"——需要重启 LAN 服务器使开关生效。 */
+  async function setLanWritable(writable: boolean) {
+    if (!rpc || !lanStatus?.enabled) return
+    lanBusy = true
+    try {
+      // 关闭再开启：token 重新生成，旧链接失效（切换到可写时尤其必要）
+      await rpc('lan_set', { enabled: false })
+      lanStatus = await rpc('lan_set', { enabled: true, port: 18787, writable }) as typeof lanStatus
+    } catch { /* keep */ }
     lanBusy = false
   }
 
@@ -572,6 +647,17 @@
                 <span>显示模型思考内容</span>
               </label>
               <p class="desc">关闭后仍会正常推理，只隐藏思考过程。</p>
+              <div class="radio-list">
+                <h3>思考指示器</h3>
+                <label class="radio-row">
+                  <input type="radio" name="orb" value="liquid" checked={prefs.thinkingOrb === 'liquid'} on:change={() => commit({ thinkingOrb: 'liquid' })} />
+                  <span class="radio-copy"><strong>液态思考球</strong><small>流动的液态光球（默认）</small></span>
+                </label>
+                <label class="radio-row">
+                  <input type="radio" name="orb" value="atom" checked={prefs.thinkingOrb === 'atom'} on:change={() => commit({ thinkingOrb: 'atom' })} />
+                  <span class="radio-copy"><strong>经典原子</strong><small>3D 电子轨道动画</small></span>
+                </label>
+              </div>
             </section>
 
             <section class="group">
@@ -584,6 +670,11 @@
                   </label>
                 {/each}
               </div>
+              <label class="check-row">
+                <input type="checkbox" checked={trayMinimize} disabled={trayMinimizeBusy} on:change={(event) => void setTrayMinimize((event.currentTarget as HTMLInputElement).checked)} />
+                <span>关闭窗口时最小化到系统托盘</span>
+              </label>
+              <p class="desc">开启后点 X 只隐藏窗口，后台任务继续运行；从托盘图标可恢复或退出。关闭后点 X 直接退出。</p>
             </section>
           {:else if tab === 'appearance'}
             <section class="group">
@@ -602,6 +693,12 @@
                 {/each}
               </div>
               <p class="desc">整套换色，不止深浅。根节点换一套 CSS 设计令牌，布局不变。</p>
+              <h3>语言 / Language</h3>
+              <div class="choice-row">
+                <button class="choice" class:on={prefs.language === 'zh'} on:click={() => { commit({ language: 'zh' }); setLocale('zh') }}>中文</button>
+                <button class="choice" class:on={prefs.language === 'en'} on:click={() => { commit({ language: 'en' }); setLocale('en') }}>English</button>
+              </div>
+              <p class="desc">2-11：界面语言。英文翻译按域渐进覆盖中（未覆盖区域仍显示中文）。</p>
             </section>
             <section class="group">
               <h3>明暗</h3>
@@ -702,6 +799,17 @@
                 <button class="choice" class:on={agentDraft.mode === 'ask'} on:click={() => (agentDraft = { ...agentDraft, mode: 'ask' })}>默认</button>
                 <button class="choice" class:on={agentDraft.mode === 'full'} on:click={() => (agentDraft = { ...agentDraft, mode: 'full' })}>完全</button>
               </div>
+              <!-- U5 审查 P2-②：per-agent 模型与思考档位现在有编辑入口 -->
+              <label class="field-row"><span>模型（可选）</span><input bind:value={agentDraft.model} placeholder="留空继承会话模型；如 Jy/glm-5.3-flash" /></label>
+              <label class="field-row">
+                <span>思考档位</span>
+                <select bind:value={agentDraft.thinking}>
+                  <option value="">低（默认，子代理要快）</option>
+                  {#each ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'] as level (level)}
+                    <option value={level}>{level}</option>
+                  {/each}
+                </select>
+              </label>
               <div class="choice-row" style="margin-top:12px">
                 <button class="choice on" on:click={() => { if (!agentDraft.name.trim() || !agentDraft.systemPrompt.trim()) return; agentList = upsertAgent(agentDraft); agentDraft = { name: '', description: '', systemPrompt: '', mode: 'plan' }; onPrefsChange() }}>保存 agent</button>
               </div>
@@ -792,6 +900,30 @@
                   {#if item.description}<p class="desc">{String(item.description)}</p>{/if}
                 </div>
               {/each}
+            </section>
+          {:else if tab === 'mcp'}
+            <!-- 2-10 MCP 服务器管理 -->
+            <section class="group">
+              <h3>MCP 服务器</h3>
+              <p class="desc">配置在 <code>~/.pi/agent/mcp.json</code>（全局）与 <code>&lt;工作区&gt;/.pi/mcp.json</code>（项目级）。修改后需重启会话生效。</p>
+              {#if mcpBusy}<p class="desc">加载中…</p>{/if}
+              {#each mcpServers as server (server.scope + ':' + server.name)}
+                <div class="p-card">
+                  <div class="p-head">
+                    <span class="p-name">{server.name}</span>
+                    <span class="badge" class:on={!server.disabled}>{server.scope === 'global' ? '全局' : '项目'}</span>
+                    <button class="ghost" on:click={() => void testMcpServer(server)}>{mcpTestStatus[server.name]?.busy ? '测试中…' : '测试连接'}</button>
+                  </div>
+                  <p class="desc">{server.transport} · {server.command}{server.args.length ? ' ' + server.args.join(' ') : ''}</p>
+                  {#if mcpTestStatus[server.name]?.message}<p class="desc" class:error={!mcpTestStatus[server.name]?.ok}>{mcpTestStatus[server.name].message}</p>{/if}
+                </div>
+              {:else}
+                <p class="muted">没有配置任何 MCP 服务器。在上述路径中添加 mcpServers 配置后刷新。</p>
+              {/each}
+              <div class="choice-row" style="margin-top:12px">
+                <button class="choice" on:click={() => void loadMcpServers()}>刷新</button>
+                <button class="choice" on:click={() => void openMcpFile(mcpGlobalPath)}>打开配置文件</button>
+              </div>
             </section>
           {:else if tab === 'store'}
             <section class="group">
@@ -899,13 +1031,18 @@
             </section>
           {:else if tab === 'lan'}
             <section class="group">
-              <h3>局域网观察</h3>
-              <p class="desc">开启后手机和电脑同一 Wi-Fi 可只读看会话进度。带随机 token，不要发到公网。</p>
+              <h3>局域网{lanStatus?.writable ? '遥控' : '观察'}</h3>
+              <p class="desc">开启后手机和电脑同一 Wi-Fi 可看会话进度。带随机 token，不要发到公网。1-6 安全修复：token 只在首次进入链接的地址里，API 走 header，不再留在浏览器历史。</p>
               <label class="check-row">
                 <input type="checkbox" checked={Boolean(lanStatus?.enabled)} disabled={lanBusy || !connected} on:change={(event) => void setLan((event.currentTarget as HTMLInputElement).checked)} />
                 <span>启用观察服务</span>
               </label>
               {#if lanStatus?.enabled}
+                <label class="check-row">
+                  <input type="checkbox" checked={Boolean(lanStatus?.writable)} disabled={lanBusy || !connected} on:change={(event) => void setLanWritable((event.currentTarget as HTMLInputElement).checked)} />
+                  <span>允许远程写入（发送消息 / 停止 / 回答权限确认）</span>
+                </label>
+                <p class="desc">⚠️ 可写模式 = 局域网内拿到链接的人可以操作会话。仅在家里等可信网络开启；切换开关会重新生成 token，旧链接立即失效。</p>
                 <p class="desc">端口 {lanStatus.port ?? '—'} · 连接 {lanStatus.clients ?? 0}</p>
                 {#each lanStatus.urls || [] as url}
                   <div class="row"><span class="path">{url}</span><button on:click={() => void navigator.clipboard.writeText(url)}>复制</button></div>

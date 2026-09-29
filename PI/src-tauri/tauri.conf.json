@@ -4,7 +4,7 @@
   "version": "0.2.10",
   "identifier": "com.tangzzee.pi-my",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run prepare:dev && npm run dev",
     "devUrl": "http://localhost:5173",
     "beforeBuildCommand": "node scripts/prepare-resources.mjs && npm run build",
     "frontendDist": "../dist"

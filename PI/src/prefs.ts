@@ -25,6 +25,12 @@ export type Prefs = {
   gitTemplate: string
   showQuickChips: boolean
   showThinking: boolean
+  /** U2：思考指示器样式——液态思考球（liquid）或经典原子（atom） */
+  thinkingOrb: 'liquid' | 'atom'
+  /** 2-8/U4：provider 额度重置周期，键为 provider 名（月度网关/每周订阅/每日） */
+  quotaCycles: Record<string, 'daily' | 'weekly' | 'monthly' | 'none'>
+  /** 2-11：界面语言（zh 源语言 / en 渐进翻译） */
+  language: 'zh' | 'en'
 }
 
 const KEY = 'pdn.prefs'
@@ -48,6 +54,9 @@ export const DEFAULT_PREFS: Prefs = {
   gitTemplate: '',
   showQuickChips: false,
   showThinking: true,
+  thinkingOrb: 'liquid',
+  quotaCycles: {},
+  language: 'zh',
 }
 
 function readLegacy(): Partial<Prefs> {

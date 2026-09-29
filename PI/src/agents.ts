@@ -6,6 +6,11 @@ export type AgentDef = {
   systemPrompt: string
   mode: AgentMode
   builtin?: boolean
+  /** U5：per-agent 模型覆盖（`provider:id` 键，同 App.svelte 的 modelKey）。
+   *  缺省时继承发起时会话的模型。 */
+  model?: string
+  /** U5：per-agent 思考档位（off/minimal/low/medium/high/xhigh）。缺省 'low'（子代理要快）。 */
+  thinking?: string
 }
 
 const KEY = 'pdn.agents'

@@ -1,11 +1,23 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte'
   import { renderMarkdown } from './markdown'
+  import { renderMarkdownIncremental, clearMarkdownCache } from './markdown-incremental'
 
   export let text = ''
   export let copyable = true
+  /** 增量缓存的 key：流式期间同一消息的 id 不变，可复用已闭合块的 HTML。
+   *  不传（如静态预览）则退回全量渲染。 */
+  export let streamKey = ''
 
   let copied = false
-  $: html = renderMarkdown(text || '')
+
+  // 0-7：流式期间每个 delta 只重渲染"活动尾部"，已闭合块复用缓存。
+  // 修复点：旧实现对全文从头解析，长回复是 O(N²) CPU。
+  $: html = streamKey
+    ? renderMarkdownIncremental(text || '', streamKey).html
+    : renderMarkdown(text || '')
+
+  onDestroy(() => { if (streamKey) clearMarkdownCache(streamKey) })
 
   async function copy() {
     try {

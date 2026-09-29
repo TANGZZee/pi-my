@@ -7,21 +7,52 @@
   import Terminal from './Terminal.svelte'
   import Settings from './Settings.svelte'
   import Atom from './Atom.svelte'
+  import ThinkingOrb from './ThinkingOrb.svelte'
+  import VirtualFile from './VirtualFile.svelte'
+  import { t as tt } from './i18n.ts'
+  import PluginCard from './PluginCard.svelte'
+  import { normalizePluginMessage, type PluginMessage } from './ui-plugins'
+
+  /** 2-11：把 liveLabel 的英文标签翻译成本地语言（缺 key 回退英文原文）。 */
+  function liveLabelKey(slot: RunSlot): string {
+    const label = liveLabel(slot)
+    if (!label) return ''
+    return tt(`live.${label.toLowerCase()}`)
+  }
   import Icon from './Icon.svelte'
   import MarkdownView from './MarkdownView.svelte'
   import Pet from './Pet.svelte'
-  import Live2DPet from './Live2DPet.svelte'
-  import SpritePet from './SpritePet.svelte'
+  import LazyPet from './LazyPet.svelte'
   import { petById, petModelUrl } from './pets'
   import { version } from '../package.json'
   import logoUrl from './assets/pi-my-logo.png'
   import { applyPrefsChrome, loadPrefs, patchPrefs } from './prefs'
   import { findAgent, loadAgents, wrapTask, type AgentDef } from './agents'
+  import { requestTimeoutMs, partitionPendingOnRestart, timeoutMessage } from './rpc-policy'
+  import { SLASH_COMMANDS, filterSlashCommands, findSlashCommand, slashTriggerQuery } from './slash-commands'
+  import type { AgentEnvelope } from './protocol'
+  import { activeBranchSiblingsOf, buildSessionRows, sessionRootId as sessionRootIdOf } from './session-tree'
+  import {
+    appendThinkToSteps,
+    brief,
+    closeOpenSteps,
+    endToolStep as endToolStepIn,
+    ensureThinkingStep,
+    formatReplyTime,
+    historyToTimeline,
+    lastAssistantReply,
+    liveLabel,
+    processSummary as processSummaryOf,
+    sentFromTimeline,
+  } from './run-slot'
+  import { stateSummary, type StateSnapshot } from './session-state'
+  import { withResetEstimate, formatResetCountdown } from './quota-reset'
+  import { casRemove, casReorder } from './queue-cas'
   import { cycleTodoStatus, loadTodos, newTodo, saveTodos, todoTree, type TodoItem, type TodoStatus } from './todos'
 
   type PanelTab = '文档' | '变更' | '终端' | '运行' | '待办'
-  type Session = { id: string; title: string; time: string; file?: string; cwd?: string; parentFile?: string; state?: 'active' | 'done'; model?: string; thinking?: string; mode?: string; pinned?: boolean; archived?: boolean; parentId?: string; branchParentId?: string; forkedFrom?: string; createdAt?: number; modifiedAt?: number; readOnly?: boolean }
-  type ModelInfo = { provider: string; id: string; name: string; reasoning: boolean }
+  type Session = { id: string; title: string; time: string; file?: string; cwd?: string; branch?: string; parentFile?: string; state?: 'active' | 'done'; model?: string; thinking?: string; mode?: string; pinned?: boolean; archived?: boolean; parentId?: string; branchParentId?: string; forkedFrom?: string; createdAt?: number; modifiedAt?: number; readOnly?: boolean }
+  type ModelInfo = { provider: string; id: string; name: string; reasoning: boolean; source?: 'config' | 'extension' }
   type GitChange = { code: string; path: string }
   type SidecarResponse = { type: 'response'; id: number; ok: boolean; result: unknown; error?: string }
   type SentMessage = { text: string; at: string }
@@ -29,7 +60,8 @@
   type SubRun = { id: string; agent: string; task: string; status: 'running' | 'done' | 'error'; reply: string }
   type Phase = 'idle' | 'thinking' | 'working' | 'writing' | 'waiting'
   type ProcessStep = { id: string; kind: 'think' | 'tool'; title: string; body: string; done: boolean }
-  type RunSlot = { reply: string; thinking: string; tool: string; phase: Phase; running: boolean; error?: string; queue: string[]; steer: string[]; sent: SentMessage[]; timeline: TimelineMessage[]; subRuns: SubRun[]; process: ProcessStep[]; processOpen: boolean; replyAt?: number; historyLoaded?: boolean; activeTurnId?: string; confirm?: { confirmId: string; toolName: string; summary: string } }
+  type QueuedMessage = { id: string; text: string }
+  type RunSlot = { reply: string; thinking: string; tool: string; phase: Phase; running: boolean; error?: string; queue: QueuedMessage[]; queueRevision: number; steer: string[]; sent: SentMessage[]; timeline: TimelineMessage[]; subRuns: SubRun[]; process: ProcessStep[]; processOpen: boolean; replyAt?: number; historyLoaded?: boolean; activeTurnId?: string; confirm?: { confirmId: string; toolName: string; summary: string }; images?: Array<{ id: string; src: string; name: string }>; retry?: { attempt: number; reason: string }; compacting?: boolean; pluginMessages?: PluginMessage[] }
   type SettingsInfo = { node: string; sdk: string; agentDir: string; sessionDir: string; authProviders: string[]; providers?: Array<{ provider: string; modelCount: number; configured: boolean }> }
   type CtxStats = { currentContext: number; window: number; totals: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number }; costUsd: number; cacheHitRate: number }
   type UsageStats = { sessions: number; turns: number; activeDays: number; totals: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number }; costUsd: number; costKnown: boolean; byModel: Array<{ model: string; tokens: number; turns: number }>; byProject?: Array<{ project: string; tokens: number; turns: number }>; byDay?: Record<string, number> }
@@ -59,6 +91,20 @@
   type LoginPrompt = { promptId: string; type: string; message: string; placeholder?: string; options?: Array<{ id: string; label: string }> }
   type LoginState = { provider: string; status: string; userCode?: string; verificationUri?: string; prompt?: LoginPrompt; value: string }
   let loginState: LoginState | null = null
+
+  // 扩展 UI 对话框（0-4）：select / input / editor / confirm
+  type ExtDialog = {
+    dialogId: string
+    kind: 'confirm' | 'select' | 'input' | 'editor'
+    title: string
+    message?: string
+    options?: string[]
+    placeholder?: string
+    prefill?: string
+  }
+  let extDialog: ExtDialog | null = null
+  let extDialogValue = ''
+  let extToasts: Array<{ id: string; text: string; type: string }> = []
   let petStatus: { base: string; pets: Array<{ id: string; model?: string | null; sprite?: string }> } = { base: '', pets: [] }
   let workspacePath = '.'
   let projects: WorkspaceProject[] = []
@@ -67,6 +113,8 @@
   let files: Array<{ path: string; kind: 'file' | 'directory' }> = []
   let selectedFile = ''
   let fileContent = ''
+  // 2-12：大文件走分块 + 虚拟化预览（read_file 对 >512KB 会报错，捕获后切此路径）
+  let largeFile: { path: string } | null = null
   let editingFile = false
   let gitChanges: GitChange[] = []
   let diffContent = ''
@@ -178,66 +226,17 @@
     ? filteredSessions.filter((item) => item.state === 'active' || slotFor(item.id).running)
     : filteredSessions
 
-  function sameSessionFile(left?: string, right?: string) {
-    if (!left || !right) return false
-    return left.replaceAll('\\', '/').toLowerCase() === right.replaceAll('\\', '/').toLowerCase()
-  }
-
-  function sessionParentId(session: Session) {
-    if (session.branchParentId) return session.branchParentId
-    if (!session.parentFile) return ''
-    return sessions.find((item) => sameSessionFile(item.file, session.parentFile))?.id || ''
-  }
-
-  function sessionRootId(session: Session) {
-    let current = session
-    const visited = new Set<string>()
-    while (current && !visited.has(current.id)) {
-      visited.add(current.id)
-      const parentId = sessionParentId(current)
-      if (!parentId) return current.id
-      const parent = sessions.find((item) => item.id === parentId)
-      if (!parent) return current.id
-      current = parent
-    }
-    return session.id
-  }
-
-  function sessionOrder(left: Session, right: Session) {
-    return (left.createdAt || 0) - (right.createdAt || 0) || left.id.localeCompare(right.id)
-  }
-
-  function buildSessionRows(items: Session[]) {
-    const visibleIds = new Set(items.map((item) => item.id))
-    const rows: Array<{ session: Session; depth: number; branch: boolean }> = []
-    const visited = new Set<string>()
-    const children = (parentId: string) => items
-      .filter((item) => sessionParentId(item) === parentId)
-      .sort(sessionOrder)
-    const walk = (session: Session, depth: number) => {
-      if (visited.has(session.id)) return
-      visited.add(session.id)
-      rows.push({ session, depth, branch: depth > 0 || Boolean(session.parentFile) })
-      for (const child of children(session.id)) walk(child, depth + 1)
-    }
-    for (const item of [...items].sort(sessionOrder)) {
-      const parentId = sessionParentId(item)
-      if (!parentId || !visibleIds.has(parentId)) walk(item, 0)
-    }
-    for (const item of items) walk(item, 0)
-    return rows
-  }
-
+  // 会话树构建与关系判定已抽到 session-tree.ts（纯函数，可单测；0-5 第一步）
   $: sessionRows = buildSessionRows(listedSessions)
-  $: activeBranchSiblings = (() => {
-    const active = sessions.find((item) => item.id === activeSessionId)
-    if (!active) return []
-    const rootId = sessionRootId(active)
-    return sessions
-      .filter((item) => !item.archived && !item.parentId && sessionRootId(item) === rootId)
-      .sort(sessionOrder)
-  })()
+  $: activeBranchSiblings = activeBranchSiblingsOf(sessions, activeSessionId)
   $: activeBranchIndex = Math.max(0, activeBranchSiblings.findIndex((item) => item.id === activeSessionId))
+  // 2-6 分支导航器：当前根下的完整树（带缩进深度），含归档过滤
+  $: branchTreeRows = buildSessionRows(sessions.filter((item) => {
+    if (item.archived) return false
+    const rootId = sessionRootIdOf(item, sessions)
+    const active = sessions.find((s) => s.id === activeSessionId)
+    return active ? rootId === sessionRootIdOf(active, sessions) : true
+  }))
 
   $: filteredFiles = files.filter((item) => item.path.toLowerCase().includes(query.toLowerCase()))
   let openDirs: Record<string, boolean> = {}
@@ -280,60 +279,32 @@
   let processSeq = 0
 
   function emptySlot(): RunSlot {
-    return { reply: '', thinking: '', tool: '', phase: 'idle', running: false, error: '', queue: [], steer: [], sent: [], timeline: [], subRuns: [], process: [], processOpen: false, replyAt: undefined, historyLoaded: false, activeTurnId: undefined }
+    return { reply: '', thinking: '', tool: '', phase: 'idle', running: false, error: '', queue: [], queueRevision: 0, steer: [], sent: [], timeline: [], subRuns: [], process: [], processOpen: false, replyAt: undefined, historyLoaded: false, activeTurnId: undefined }
   }
 
-  function brief(value: unknown) {
-    if (value == null) return ''
-    const text = typeof value === 'string' ? value : JSON.stringify(value)
-    return text.length > 220 ? `${text.slice(0, 220)}…` : text
-  }
-
-  function liveLabel(slot: RunSlot) {
-    if (!slot.running) return ''
-    if (slot.confirm || slot.phase === 'waiting') return 'Waiting'
-    if (slot.phase === 'thinking') return 'Thinking'
-    if (slot.phase === 'writing') return 'Writing'
-    if (slot.phase === 'working') return 'Working'
-    return ''
-  }
+  // brief / liveLabel / 过程摘要 / 历史映射已抽到 run-slot.ts（纯函数，0-5 第二步）
 
   function visibleProcess(slot: RunSlot) {
     return slot.process.filter((step) => uiPrefs.showThinking !== false || step.kind !== 'think')
   }
 
   function processSummary(slot: RunSlot) {
-    const process = visibleProcess(slot)
-    const thinks = process.filter((step) => step.kind === 'think').length
-    const tools = process.filter((step) => step.kind === 'tool').length
-    const parts = []
-    if (thinks) parts.push(`思考 ${thinks}`)
-    if (tools) parts.push(`工具 ${tools}`)
-    return parts.length ? `过程 · ${parts.join(' · ')}` : '过程'
-  }
-
-  function closeOpenSteps(steps: ProcessStep[]) {
-    return steps.map((step) => step.done ? step : { ...step, done: true })
+    return processSummaryOf(slot.process, uiPrefs.showThinking !== false)
   }
 
   function appendThink(id: string, text: string) {
     const slot = slotFor(id)
-    const steps = [...slot.process]
-    const last = steps[steps.length - 1]
-    if (last?.id === 'waiting-think') steps[steps.length - 1] = { ...last, body: text }
-    else if (last?.kind === 'think' && !last.done) steps[steps.length - 1] = { ...last, body: last.body + text }
-    else steps.push({ id: `think-${++processSeq}`, kind: 'think', title: '思考', body: text, done: false })
-    patchSlot(id, { process: steps, processOpen: true, phase: 'thinking', thinking: slot.thinking + text })
+    patchSlot(id, {
+      process: appendThinkToSteps(slot.process, text, ++processSeq),
+      processOpen: true,
+      phase: 'thinking',
+      thinking: slot.thinking + text
+    })
   }
 
   function markThinking(id: string) {
     const slot = slotFor(id)
-    const steps = [...slot.process]
-    const last = steps[steps.length - 1]
-    if (!last || last.kind !== 'think' || last.done) {
-      steps.push({ id: `think-${++processSeq}`, kind: 'think', title: '思考', body: '', done: false })
-    }
-    patchSlot(id, { process: steps, processOpen: true, phase: 'thinking' })
+    patchSlot(id, { process: ensureThinkingStep(slot.process, ++processSeq), processOpen: true, phase: 'thinking' })
   }
 
   function appendReply(id: string, text: string) {
@@ -346,39 +317,14 @@
     })
   }
 
-  function formatReplyTime(timestamp?: number) {
-    if (!timestamp) return ''
-    return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-  }
-
-  function historyToTimeline(history: Array<{ id?: string; role: 'user' | 'assistant'; text: string; timestamp?: number; userIndex?: number; entryId?: string }>) {
-    return history
-      .filter((item) => item && (item.role === 'user' || item.role === 'assistant') && String(item.text || '').trim())
-      .map((item, index) => {
-        const timestamp = Number(item.timestamp) || Date.now()
-        return {
-          id: item.entryId || item.id || `history-${timestamp}-${index}`,
-          role: item.role,
-          text: String(item.text),
-          timestamp,
-          at: formatReplyTime(timestamp),
-          userIndex: Math.max(0, Number(item.userIndex) || 0),
-          entryId: item.entryId || item.id
-        } satisfies TimelineMessage
-      })
-  }
-
   function applySessionHistory(id: string, history: Array<{ id?: string; role: 'user' | 'assistant'; text: string; timestamp?: number; userIndex?: number; entryId?: string }> = []) {
     const current = slotFor(id)
     if (current.running || current.historyLoaded) return
     const timeline = historyToTimeline(history)
-    const sent = timeline
-      .filter((item) => item.role === 'user')
-      .map((item) => ({ text: item.text, at: item.at }))
-    const lastReply = [...timeline].reverse().find((item) => item.role === 'assistant')
+    const lastReply = lastAssistantReply(timeline)
     patchSlot(id, {
       timeline,
-      sent,
+      sent: sentFromTimeline(timeline),
       reply: lastReply?.text || '',
       replyAt: lastReply?.timestamp,
       historyLoaded: true,
@@ -419,13 +365,11 @@
 
   function endToolStep(id: string, toolName: string, toolCallId: string, result: unknown, isError?: boolean) {
     const slot = slotFor(id)
-    const extra = brief(result)
-    const steps = slot.process.map((step) => {
-      const hit = (toolCallId && step.id === toolCallId) || (!toolCallId && step.kind === 'tool' && !step.done && step.title === (toolName || step.title))
-      if (!hit) return step
-      return { ...step, done: true, body: [step.body, extra].filter(Boolean).join(String.fromCharCode(10)) }
+    patchSlot(id, {
+      process: endToolStepIn(slot.process, toolCallId, toolName, result, isError),
+      phase: 'thinking',
+      tool: isError ? `${toolName || '工具'} 失败` : ''
     })
-    patchSlot(id, { process: steps, phase: 'thinking', tool: isError ? `${toolName || '工具'} 失败` : '' })
   }
 
   function slotFor(id: string): RunSlot {
@@ -462,6 +406,8 @@
       replyAt,
       activeTurnId: undefined,
       confirm: undefined,
+      retry: undefined,
+      compacting: false,
       steer: [],
       process,
       // 修改：结束后只保留一行“过程”摘要，用户点击后再展开。
@@ -528,6 +474,7 @@
       thinking: '',
       tool: '',
       queue: [],
+      queueRevision: 0,
       process: [],
       processOpen: false,
       phase: 'idle'
@@ -542,14 +489,26 @@
     const childId = `sub-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
     const run: SubRun = { id: childId, agent: def.name, task: task.trim(), status: 'running', reply: '' }
     patchSlot(parentId, { subRuns: [...slotFor(parentId).subRuns, run] })
-    sessions = [{ id: childId, title: `${def.name} · ${task.trim().slice(0, 24)}`, time: '刚刚', parentId, readOnly: true, mode: def.mode }, ...sessions]
+    sessions = [{ id: childId, title: `${def.name} · ${task.trim().slice(0, 24)}`, time: '刚刚', parentId, readOnly: true, mode: def.mode, model: def.model, thinking: def.thinking }, ...sessions]
     if (!sidecarReady) {
       window.setTimeout(() => finishSubRun(childId, 'done'), 800)
       return
     }
     try {
-      const created = await request('create_session', { sessionId: childId, cwd: workspacePath, mode: def.mode, thinking: 'low' }) as { id: string; file?: string }
-      remember(childId, { file: created.file, mode: def.mode, readOnly: true, parentId })
+      // U5：思考档位可被 per-agent 定义覆盖（默认 low —— 子代理要快）。
+      // 模型覆盖同理：def.model 是 `provider${MODEL_SEPARATOR}modelId` 键。
+      const created = await request('create_session', { sessionId: childId, cwd: workspacePath, mode: def.mode, thinking: def.thinking ?? 'low' }) as { id: string; file?: string }
+      remember(childId, { file: created.file, mode: def.mode, readOnly: true, parentId, thinking: def.thinking })
+      if (def.model) {
+        const [provider, modelId] = def.model.split(MODEL_SEPARATOR)
+        if (provider && modelId) {
+          // 审查 P2-①：set_model 失败（模型不存在/未配置）时不能静默降级——
+          // 会话记录里也不能留着未生效的 model，否则 UI 显示与实际不符。
+          const result = await request('set_model', { sessionId: childId, provider, modelId }) as { provider: string; id: string } | null
+          if (result) remember(childId, { model: `${result.provider}${MODEL_SEPARATOR}${result.id}` })
+          else console.warn(`[pi-my] 子代理 "${def.name}" 的模型 ${def.model} 设置失败，已回退默认模型`)
+        }
+      }
       await request('prompt', { sessionId: childId, text: wrapTask(def, task), cwd: workspacePath, behavior: 'steer', mode: def.mode })
     } catch {
       finishSubRun(childId, 'error')
@@ -738,13 +697,15 @@
     }
   }
 
-  async function unarchiveSession(session: Session) {
+  // 只依赖会话的最小形状：设置页的「已归档」列表用的是 ArchivedSession（没有 time 字段），
+  // 所以这里不能要求完整的 Session 类型。
+  async function unarchiveSession(session: { id: string; title?: string; file?: string }) {
     const response = await requestRaw('set_session_archived', { sessionId: session.id, archived: false })
     if (!response.ok) throw new Error(response.error || '取消归档失败')
     sessions = sessions.map((item) => item.id === session.id ? { ...item, archived: false } : item)
   }
 
-  async function deleteSession(session: Session, skipConfirm = false) {
+  async function deleteSession(session: { id: string; title?: string; file?: string }, skipConfirm = false) {
     sessionMenu = null
     if (!skipConfirm) {
       const ok = await confirm(`确定永久删除会话「${session.title}」吗？删除后无法恢复。`, { title: '删除会话', kind: 'warning' })
@@ -1068,17 +1029,68 @@
       const rect = ctxButtonRef?.getBoundingClientRect()
       if (rect) ctxMenuUp = window.innerHeight - rect.bottom < 320
       void refreshCtxStats()
+      void refreshQuotas()
     }
   }
+
+  // 2-8/U4：provider 额度 + 重置时间（打开面板时拉一次，不自动轮询——probe 有网络开销）
+  type QuotaRow = { provider: string; ok?: boolean; message?: string; value?: unknown } & { nextResetAt: string | null; msUntilReset: number | null; cycleElapsedPercent: number | null }
+  let quotas: QuotaRow[] = []
+  let quotasBusy = false
+  let quotasQueriedAt = 0
+
+  async function refreshQuotas() {
+    if (!sidecarReady || quotasBusy) return
+    quotasBusy = true
+    try {
+      const response = await requestRaw('provider_quotas', {})
+      if (response.ok && activeSessionId) {
+        const result = response.result as { quotas?: Array<{ provider: string; ok?: boolean; message?: string; value?: unknown }>; queriedAt?: number } | null
+        const cycles = loadPrefs().quotaCycles ?? {}
+        quotas = (result?.quotas ?? []).map((quota) => withResetEstimate({ ...quota, cycle: cycles[quota.provider] ?? 'monthly' }))
+        quotasQueriedAt = result?.queriedAt ?? Date.now()
+      }
+    } finally {
+      quotasBusy = false
+    }
+  }
+
+  function formatCountdown(ms: number | null): string {
+    return formatResetCountdown(ms)
+  }
+
+  // U4 状态栏面板：get_state 的完整快照（ctxOpen 面板里展示）
+  let sessionState: StateSnapshot | null = null
+  $: stateSummaryView = sessionState ? stateSummary(sessionState) : null
 
   async function refreshCtxStats() {
     if (!sidecarReady || !activeSessionId) return
     const id = activeSessionId
     try {
-      const stats = (await request('session_stats', { sessionId: id }) as CtxStats) ?? { ...EMPTY_CTX }
-      if (activeSessionId === id) ctxStats = stats
+      // 1-8：改用 get_state 单一快照（含 session_stats 的全部字段 + U4 需要的额外状态）。
+      // peekState 语义：只读，不重置任何会话生命周期。
+      const response = await requestRaw('get_state', { sessionId: id })
+      if (!response.ok || activeSessionId !== id) {
+        if (activeSessionId === id) ctxStats = { ...EMPTY_CTX }
+        return
+      }
+      const snapshot = response.result as StateSnapshot | null
+      if (!snapshot) { ctxStats = { ...EMPTY_CTX }; return }
+      // 既有上下文环继续用本地口径字段（get_state 已透传 currentContext/window/costUsd/cacheHitRate）
+      ctxStats = {
+        currentContext: Number(snapshot.currentContext) || 0,
+        window: Number(snapshot.window) || 0,
+        totals: (snapshot.stats?.tokens ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }) as CtxStats['totals'],
+        costUsd: Number(snapshot.stats?.cost ?? snapshot.costUsd) || 0,
+        cacheHitRate: Number(snapshot.cacheHitRate) || 0,
+      }
+      // U4 状态栏面板的完整快照
+      sessionState = snapshot
     } catch {
-      if (activeSessionId === id) ctxStats = { ...EMPTY_CTX }
+      if (activeSessionId === id) {
+        ctxStats = { ...EMPTY_CTX }
+        sessionState = null
+      }
     }
   }
 
@@ -1154,43 +1166,183 @@
     thinkingHelp = !thinkingHelp
   }
 
-  function request(type: string, payload = {}) {
+  // 统一的请求发送：挂 pending、按类型设超时、失败/超时都清理并 settle。
+  // 修复点：旧实现没有超时——sidecar 若挂住或悄悄死掉，pending 会永久泄漏且
+  // 调用方的 await 永不 settle（界面一直转圈，无任何提示）。
+  function sendRequest(type: string, payload: object): Promise<SidecarResponse> {
     const id = ++requestSequence
-    const promise = new Promise<unknown>((resolve) => pending.set(id, (res) => resolve(res.result)))
-    void invoke('agent_request', { request: { id, type, payload } }).catch((error) => {
-      const resolve = pending.get(id)
-      pending.delete(id)
-      resolve?.({ type: 'response', id, ok: false, result: null, error: String(error) })
+    const timeoutMs = requestTimeoutMs(type)
+    return new Promise<SidecarResponse>((resolve) => {
+      let timer: number | undefined
+      const settle = (response: SidecarResponse) => {
+        if (!pending.has(id)) return
+        pending.delete(id)
+        if (timer !== undefined) window.clearTimeout(timer)
+        resolve(response)
+      }
+      pending.set(id, settle)
+      if (Number.isFinite(timeoutMs)) {
+        timer = window.setTimeout(() => {
+          settle({ type: 'response', id, ok: false, result: null, error: timeoutMessage(type, timeoutMs) })
+        }, timeoutMs)
+      }
+      // outstanding 计数由 Rust 在 agent_request 成功路径 +1（lib.rs:348）；
+      // 前端只在收到响应时 -1。此前前端也 +1，造成每次请求净漏 +1，
+      // 应用空闲 6 分钟后必然被误判僵死并反复重启（审查高-1）。
+      void invoke('agent_request', { request: { id, type, payload } }).catch((error) => {
+        settle({ type: 'response', id, ok: false, result: null, error: String(error) })
+      })
     })
-    return promise
+  }
+
+  function request(type: string, payload = {}) {
+    return sendRequest(type, payload).then((response) => response.result)
   }
 
   function requestRaw(type: string, payload = {}) {
-    const id = ++requestSequence
-    const promise = new Promise<SidecarResponse>((resolve) => pending.set(id, resolve))
-    void invoke('agent_request', { request: { id, type, payload } }).catch((error) => {
-      const resolve = pending.get(id)
-      pending.delete(id)
-      resolve?.({ type: 'response', id, ok: false, result: null, error: String(error) })
-    })
-    return promise
+    return sendRequest(type, payload)
   }
 
-  onMount(async () => {
+  // sidecar 重启后，旧请求的响应永远不会到达；必须清空 pending 并明确告知用户，
+  // 否则界面会停在"运行中"且后续交互静默失效。
+  // `keepId` 是 Rust 侧重启后已经重新发起的那个请求——它仍然有效，不能一起丢掉。
+  function onSidecarRestarted(reason: string, keepId?: number) {
+    const { aborted, kept } = partitionPendingOnRestart([...pending.keys()], keepId)
+    const survivors = new Map<number, (value: SidecarResponse) => void>()
+    for (const id of kept) {
+      const settle = pending.get(id)
+      if (settle) survivors.set(id, settle)
+    }
+    for (const id of aborted) {
+      pending.get(id)?.({ type: 'response', id, ok: false, result: null, error: `Pi Agent 已重启，该请求被中止（${reason}）` })
+    }
+    // settle 内部会 delete，故在循环之后重建 Map。
+    pending.clear()
+    for (const [id, settle] of survivors) pending.set(id, settle)
+    for (const id of Object.keys(runState)) {
+      const slot = runState[id]
+      if (!slot?.running) continue
+      clearRunWatchdog(id)
+      patchSlot(id, {
+        running: false,
+        phase: 'idle',
+        tool: '',
+        processOpen: false,
+        confirm: undefined,
+        error: 'Pi Agent 侧车已重启，本次运行被中止。会话文件仍在，可继续对话。'
+      })
+      markSession(id, 'done')
+    }
+    sidecarReady = true
+    void refreshCtxStats()
+    // sidecar 重启后其内存态 sessions 为空，而前端仍持有会话 id → 文件路径的映射。
+    // 若不重新绑定，下次 prompt 会让 sidecar 按同一 id 新建一个会话文件，
+    // **静默丢掉原会话历史**（用户看不到任何错误，只是"接着聊"变成了新会话）。
+    // 故这里主动把已打开过的会话重新 open 回去。
+    void rebindSessionsAfterRestart()
+    if (aborted.length) console.warn(`[pi-my] sidecar 重启，已中止 ${aborted.length} 个未完成请求`)
+  }
+
+  async function rebindSessionsAfterRestart() {
+    const candidates = sessions.filter((item) => item.file && !item.parentId)
+    const dead = new Set<string>()
+    for (const session of candidates) {
+      // 把前端记住的模式传给 sidecar，并以回传值校正（重启后 sidecar 内存态已清空，
+      // 若不传，plan 会话会被静默重开成默认模式而获得写权限）。
+      const response = await requestRaw('open_session', { sessionId: session.id, file: session.file, mode: sessionMode(sessions, session.id) })
+      if (!response.ok) {
+        // 会话文件已不可读 → 下次发送前必须重建，否则会写进新文件。
+        // 只标记 historyLoaded（file 字段在 RunSlot 上不存在，真正清理在下面的 sessions.map）。
+        dead.add(session.id)
+        patchSlot(session.id, { historyLoaded: false })
+        continue
+      }
+      const result = response.result as { history?: Array<{ id?: string; role: 'user' | 'assistant'; text: string; timestamp?: number; userIndex?: number; entryId?: string }>; mode?: string } | null
+      if (result?.mode) remember(session.id, { mode: result.mode })
+      // 已加载过历史且当前没在运行，就不覆盖界面上的时间线
+      const slot = slotFor(session.id)
+      if (!slot.historyLoaded && !slot.running) applySessionHistory(session.id, result?.history ?? [])
+    }
+    if (dead.size) {
+      sessions = sessions.map((item) => (dead.has(item.id) ? { ...item, file: undefined, historyLoaded: false } : item))
+      if (activeSessionId && dead.has(activeSessionId)) {
+        patchSlot(activeSessionId, { error: '原会话文件已不可读，下一条消息将开始一个新会话。' })
+      }
+    }
+  }
+
+  // 注意：清理函数必须由**同步**回调返回。写成 `onMount(async () => { ...; return unlisten })`
+  // 时返回值是 Promise，Svelte 只在 `typeof cleanup === 'function'` 时才注册清理
+  // （svelte/src/index-client.js），于是 unlisten 永远不会被调用、监听器泄漏。
+  // 这里用同步外壳持有 unlisten，异步初始化放进内部 IIFE。
+  let appUnlisten: (() => void) | undefined
+  let appDisposed = false
+
+  onMount(() => {
     loadImageGenConfig()
     refreshPrefs()
     try { dismissedAgentUpdate = localStorage.getItem('pdn.dismissed-agent-update') ?? '' } catch { dismissedAgentUpdate = '' }
     projects = loadProjects()
     window.addEventListener('resize', clampToViewport)
     clampToViewport()
-    const unlisten = await listen<AgentEnvelope>('agent-message', ({ payload }) => {
+
+    void (async () => {
+      const unlisten = await listen<AgentEnvelope>('agent-message', ({ payload }) => {
       if (payload.type === 'response' && payload.id) {
         pending.get(payload.id)?.(payload)
         pending.delete(payload.id)
+        // 0-8 僵死探活：每收到一个响应就告诉 Rust"少了一个在途请求"
+        if (sidecarReady) void invoke('agent_outstanding', { delta: -1 }).catch(() => {})
+      }
+      if (payload.type === 'sidecar-restarted') {
+        onSidecarRestarted(String(payload.reason ?? '未知原因'), typeof payload.keepId === 'number' ? payload.keepId : undefined)
+        if (loadPrefs().notifyConfirm) desktopNotify('Pi-My', 'Pi Agent 已自动重启')
+      }
+      if (payload.type === 'sidecar-failed') {
+        sidecarReady = false
+        for (const [id, settle] of pending) {
+          settle({ type: 'response', id, ok: false, result: null, error: String(payload.message ?? 'Pi Agent 不可用') })
+        }
+        pending.clear()
+        window.alert(String(payload.message ?? 'Pi Agent 侧车已停止运行，请重启应用。'))
       }
       if (payload.type === 'confirm_request') {
         patchSlot(payload.sessionId || activeSessionId, { phase: 'waiting', confirm: { confirmId: String(payload.confirmId ?? ''), toolName: String(payload.toolName ?? ''), summary: String(payload.summary ?? '') } })
         if (loadPrefs().notifyConfirm) desktopNotify('Pi-My', '需要确认工具调用')
+      }
+      // 扩展 UI 请求（0-4）：select / input / editor / confirm。
+      // 必须响应，否则扩展的 await 会永久挂住（整个 agent 卡住）。
+      if (payload.type === 'ui_dialog_request') {
+        extDialog = {
+          dialogId: String(payload.dialogId ?? ''),
+          kind: String(payload.kind ?? 'input') as ExtDialog['kind'],
+          title: String(payload.title ?? ''),
+          message: payload.message ? String(payload.message) : undefined,
+          options: Array.isArray(payload.options) ? payload.options.map((item: unknown) => String(item)) : undefined,
+          placeholder: payload.placeholder ? String(payload.placeholder) : undefined,
+          prefill: payload.prefill ? String(payload.prefill) : undefined,
+        }
+        extDialogValue = payload.prefill ? String(payload.prefill) : ''
+        if (loadPrefs().notifyConfirm) desktopNotify('Pi-My', '扩展需要你的输入')
+      }
+      // 扩展发起的通知：带来源归因，便于用户知道是哪个扩展在说话
+      if (payload.type === 'ext_notify') {
+        const source = payload.source ? `（${payload.source}）` : ''
+        const text = `${payload.message ?? ''}${source}`
+        extToasts = [...extToasts, { id: `t${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, text, type: String(payload.notifyType ?? 'info') }].slice(-3)
+        window.setTimeout(() => { extToasts = extToasts.slice(1) }, 6000)
+      }
+      // 2-7：对话框超时提示（回落语义 sidecar 已按 kind 处理，这里让用户知道发生过）
+      if (payload.type === 'dialog_expired' && payload.fallback === 'default') {
+        const kindLabel = payload.kind === 'confirm' ? '确认框' : payload.kind === 'select' ? '选择框' : '对话框'
+        const text = `扩展${kindLabel}超时未回答，已按默认值继续`
+        extToasts = [...extToasts, { id: `t${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, text, type: 'warning' }].slice(-3)
+        window.setTimeout(() => { extToasts = extToasts.slice(1) }, 6000)
+      }
+      // 扩展要求把文本放进输入框（pasteToEditor / setEditorText）
+      if (payload.type === 'ext_editor_text') {
+        inputText = String(payload.text ?? '')
+        composerInput?.focus()
       }
       if (payload.type === 'login_event') {
         const ev = payload.event
@@ -1241,6 +1393,15 @@
           }
         }
         if (event.type === 'turn_start') markThinking(id)
+        // 1-5 UI 插件：role=custom 的插件消息（message_start/end 成对出现，取 end 落定版）
+        if (event.type === 'message_start' && (event.message as { role?: string })?.role === 'custom') patchSlot(id, { phase: 'working' })
+        if (event.type === 'message_end' && (event.message as { role?: string })?.role === 'custom') {
+          const normalized = normalizePluginMessage(event.message as unknown as Record<string, unknown>)
+          if (normalized) {
+            const slot = slotFor(id)
+            patchSlot(id, { pluginMessages: [...(slot.pluginMessages ?? []), { ...normalized, entryId: String((event.message as { id?: string })?.id ?? '') }] })
+          }
+        }
         if (event.type === 'tool_execution_start') startToolStep(id, String(event.toolName || '工具'), String(event.toolCallId || ''), event.args)
         if (event.type === 'tool_execution_update' && event.partialResult) {
           const current = slotFor(id)
@@ -1250,8 +1411,33 @@
             process: current.process.map((step) => step.id === callId || (!callId && step.kind === 'tool' && !step.done) ? { ...step, body: brief(event.partialResult) } : step)
           })
         }
-        if (event.type === 'tool_execution_end') endToolStep(id, String(event.toolName || '工具'), String(event.toolCallId || ''), event.result, Boolean(event.isError))
+        if (event.type === 'tool_execution_end') {
+          endToolStep(id, String(event.toolName || '工具'), String(event.toolCallId || ''), event.result, Boolean(event.isError))
+          // show_image 工具（1-3）：details.images 是发图数据源（模型不可见，仅供 UI）
+          const details = (event.result as { details?: { images?: Array<{ data: string; mimeType: string }>; paths?: string[] } } | null | undefined)?.details
+          if (details?.images?.length) {
+            const images = details.images.map((img, index) => ({
+              id: `img-${event.toolCallId}-${index}`,
+              src: `data:${img.mimeType || 'image/png'};base64,${img.data}`,
+              name: details.paths?.[index] ?? '',
+            }))
+            const slot = slotFor(id)
+            patchSlot(id, { images: [...(slot.images ?? []), ...images] })
+          }
+        }
         if (event.type === 'agent_start') { markThinking(id); patchSlot(id, { running: true, error: '' }); markSession(id, 'active') }
+        // 自动重试状态行（1-7）：SDK 在流中断等场景会自动重试，此前用户只看到"卡住"。
+        if (event.type === 'auto_retry_start') {
+          patchSlot(id, {
+            running: true,
+            phase: 'thinking',
+            retry: { attempt: Number(event.attempt ?? 0), reason: String(event.errorMessage ?? event.reason ?? '网络波动') },
+          })
+        }
+        if (event.type === 'auto_retry_end') patchSlot(id, { retry: undefined })
+        // 1-2 上下文蒸发：SDK 自动/手动压缩事件（此前透传但被忽略，用户只见"卡住"）
+        if (event.type === 'compaction_start') patchSlot(id, { compacting: true, phase: 'thinking' })
+        if (event.type === 'compaction_end') patchSlot(id, { compacting: false })
         if (event.type === 'agent_end') {
           // Pi SDK 在自动重试/压缩前也会发 agent_end，这时不能提前显示结束。
           if (event.willRetry) patchSlot(id, { running: true, phase: 'thinking', processOpen: true })
@@ -1298,7 +1484,18 @@
     } catch {
       // Browser preview mode remains useful without the native sidecar.
     }
-    return unlisten
+      // 组件已在监听注册期间卸载 → 立刻退订，避免泄漏
+      if (appDisposed) unlisten()
+      else appUnlisten = unlisten
+    })()
+
+    return () => {
+      // 只负责退订事件监听；其余（定时器、resize、拖拽）由 onDestroy 统一处理，
+      // 避免两处重复清理造成的顺序耦合。
+      appDisposed = true
+      appUnlisten?.()
+      appUnlisten = undefined
+    }
   })
 
   async function loadFiles(cwd = workspacePath) {
@@ -1383,10 +1580,41 @@
     selectedFile = file
     editingFile = false
     if (sidecarReady) {
-      const result = await request('read_file', { cwd: workspacePath, path: file }) as { content: string }
-      fileContent = result.content
-      panel = '文档'
+      // request() 对失败返回 undefined（ok:false 不 reject），所以判 result 而不是 catch
+      const response = await requestRaw('read_file', { cwd: workspacePath, path: file })
+      const result = response.ok ? response.result as { content: string } | null : null
+      if (result?.content !== undefined) {
+        fileContent = result.content
+        largeFile = null
+        panel = '文档'
+        return
+      }
+      // 2-12：超过 512KB 的文件 → 虚拟化分块预览（此前直接报错打不开）
+      const message = String(response.error || '')
+      if (message.includes('512 KB') || message.includes('超过')) {
+        await previewLargeFile(file)
+        return
+      }
+      fileContent = ''
+      selectedFile = ''
+      patchSlot(ensureActiveId(), { error: `读取文件失败: ${message || '未知错误'}` })
     }
+  }
+
+  /** 2-12：大文件分块读取（虚拟化预览路径）。 */
+  async function readFileChunk(offset: number, limit: number): Promise<{ totalLines: number; lines: string[]; offset: number }> {
+    const response = await requestRaw('read_file_chunk', { cwd: workspacePath, path: selectedFile, offset, limit })
+    if (!response.ok) throw new Error(response.error || '读取失败')
+    return response.result as { totalLines: number; lines: string[]; offset: number }
+  }
+
+  /** 大文件入口：read_file 会拒绝 >512KB，捕获后切虚拟化预览。 */
+  async function previewLargeFile(file: string) {
+    selectedFile = file
+    editingFile = false
+    fileContent = ''
+    largeFile = { path: file }
+    panel = '文档'
   }
   async function selectSession(session: Session) {
     if (session.parentId) {
@@ -1399,10 +1627,13 @@
     activeSession = session.title
     todos = loadTodos(session.id)
     if (sidecarReady && session.file) {
-      const opened = await requestRaw('open_session', { sessionId: session.id, file: session.file })
+      // 传当前会话记录的模式，并以 sidecar 回传的实际模式为准校正 UI。
+      // 修复：旧实现不传也不回读 mode，导致"UI 显示计划模式、sidecar 实际是 ask"的失同步。
+      const opened = await requestRaw('open_session', { sessionId: session.id, file: session.file, mode: sessionMode(sessions, session.id) })
       if (opened.ok) {
-        const result = opened.result as { history?: Array<{ id?: string; role: 'user' | 'assistant'; text: string; timestamp?: number; userIndex?: number; entryId?: string }> }
+        const result = opened.result as { history?: Array<{ id?: string; role: 'user' | 'assistant'; text: string; timestamp?: number; userIndex?: number; entryId?: string }>; mode?: string }
         applySessionHistory(session.id, result?.history)
+        if (result?.mode) remember(session.id, { mode: result.mode })
       } else {
         // 修复：读取失败时明确提示，不再用空历史覆盖成空白页。
         patchSlot(session.id, { error: opened.error || '读取历史会话失败', historyLoaded: false })
@@ -1542,6 +1773,28 @@
     if (sidecarReady) void request('confirm_response', { confirmId: confirm.confirmId, ok })
   }
 
+  /** 回答扩展的 UI 请求。
+   *  confirm 用 `confirmed` 布尔；其余用 `value`/`cancelled`。
+   *  修复：旧实现 confirm 的"允许"发的是 value='true'，而 sidecar 判
+   *  `payload.confirmed === true`，恒为 false —— 扩展的 confirm 永远拿不到"允许"。 */
+  function answerExtDialog(
+    value: string | undefined,
+    cancelled = false,
+    options: { confirmed?: boolean } = {},
+  ) {
+    const dialog = extDialog
+    if (!dialog) return
+    extDialog = null
+    extDialogValue = ''
+    if (!sidecarReady) return
+    void request('ui_dialog_response', {
+      dialogId: dialog.dialogId,
+      cancelled,
+      value,
+      confirmed: options.confirmed ?? (dialog.kind === 'confirm' && !cancelled && value === 'true'),
+    })
+  }
+
   async function refreshProviders() {
     if (!sidecarReady) return
     providers = await request('list_providers', {}) as typeof providers
@@ -1614,16 +1867,13 @@
       agentDefs = loadAgents()
       return
     }
-    const slash = SLASH.find((item) => text === `/${item.id}` || text === `/${item.label}`)
+    const slash = findSlashCommand(text)
     if (slash) {
       inputText = ''
       mention = null
-      if (slash.id === 'new') void newSession()
-      else if (slash.id === 'settings' || slash.id === 'login') void openSettings()
-      else if (slash.id === 'todo') { panel = '待办'; showRight = true }
-      else if (slash.id === 'plan') void setMode('plan')
-      else if (slash.id === 'scout' || slash.id === 'split') { splitOpen = true; agentDefs = loadAgents() }
-      else void chooseWorkspace()
+      // 2-5：取命令词后面的参数（如 /export md 的 "md"）
+      const args = text.replace(/^\s*\/\S+/, '').trim()
+      runSlashCommand(slash, args)
       return
     }
     const id = ensureActiveId()
@@ -1631,7 +1881,8 @@
     inputText = ''
     mention = null
     if (slot.running && behavior === 'followUp') {
-      patchSlot(id, { queue: [...slot.queue, text] })
+      // 2-4：队列项带稳定 id（CAS 重排/移除的键）
+      patchSlot(id, { queue: [...slot.queue, { id: `q-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, text }], queueRevision: slot.queueRevision + 1 })
       return
     }
     if (slot.running && behavior === 'steer') {
@@ -1723,25 +1974,25 @@
   function drainQueue(id: string) {
     const slot = slotFor(id)
     if (slot.running || !slot.queue.length) return
-    const [text, ...rest] = slot.queue
-    patchSlot(id, { queue: rest })
-    dispatchTurn(id, text, 'steer')
+    const [, ...rest] = slot.queue
+    patchSlot(id, { queue: rest, queueRevision: slot.queueRevision + 1 })
+    dispatchTurn(id, slot.queue[0].text, 'steer')
   }
 
+  // 2-4 队列 CAS：上移/下移/移除都基于读到的 revision 做乐观并发；
+  // stale（期间被 drain/其他操作改过）时拒绝本次操作，避免丢更新或"复活"已出队的项。
   function moveQueue(index: number, dir: -1 | 1) {
     const slot = slotFor(activeSessionId)
-    const next = [...slot.queue]
-    const target = index + dir
-    if (target < 0 || target >= next.length) return
-    const swap = next[index]
-    next[index] = next[target]
-    next[target] = swap
-    patchSlot(activeSessionId, { queue: next })
+    const result = casReorder(slot.queue, slot.queueRevision, slot.queueRevision, index, dir, slot.queue.map((item) => item.id))
+    if (!result.ok) return
+    patchSlot(activeSessionId, { queue: result.value, queueRevision: result.revision })
   }
 
-  function removeQueue(index: number) {
+  function removeQueue(id: string) {
     const slot = slotFor(activeSessionId)
-    patchSlot(activeSessionId, { queue: slot.queue.filter((_, i) => i !== index) })
+    const result = casRemove(slot.queue, slot.queueRevision, slot.queueRevision, id)
+    if (!result.ok) return
+    patchSlot(activeSessionId, { queue: result.value, queueRevision: result.revision })
   }
 
   async function copyText(text: string) {
@@ -1814,6 +2065,42 @@
       window.setTimeout(() => {
         if (copiedReplyId === messageId) copiedReplyId = ''
       }, 1400)
+    }
+  }
+
+  /** 2-3 worktree 分叉：在独立 git worktree 里开分支会话（风险改动与主工作区隔离）。 */
+  async function forkWorktree(userMessageIndex = -1) {
+    if (forkBusy || !sidecarReady) return
+    const parentTitle = sessions.find((item) => item.id === activeSessionId)?.title || '当前会话'
+    forkBusy = true
+    try {
+      const response = await requestRaw('create_worktree_fork', {
+        sourceSessionId: activeSessionId,
+        userMessageIndex,
+        label: parentTitle,
+      })
+      if (!response.ok) throw new Error(response.error || '创建 worktree 分叉失败')
+      const created = response.result as { id: string; file?: string; cwd: string; branch: string }
+      const now = Date.now()
+      sessions = [{
+        id: created.id,
+        title: `🌳 worktree · ${parentTitle}`,
+        time: '刚刚',
+        file: created.file,
+        cwd: created.cwd,
+        branch: created.branch,
+        branchParentId: activeSessionId,
+        createdAt: now,
+        modifiedAt: now,
+      }, ...sessions]
+      remember(created.id, { file: created.file, cwd: created.cwd, branch: created.branch, readOnly: false })
+      activeSessionId = created.id
+      activeSession = `🌳 worktree · ${parentTitle}`
+      patchSlot(created.id, { error: '' })
+    } catch (error) {
+      patchSlot(ensureActiveId(), { error: error instanceof Error ? error.message : String(error) })
+    } finally {
+      forkBusy = false
     }
   }
 
@@ -1897,30 +2184,99 @@
     leftTab = 'Chats'
   }
 
-  const SLASH = [
-    { id: 'new', label: '新建会话', desc: '打开一个空白会话' },
-    { id: 'settings', label: '打开设置', desc: '打开系统设置与配置管理' },
-    { id: 'workspace', label: '选择工作区', desc: '更换当前项目目录' },
-    { id: 'scout', label: '派 scout 侦察', desc: '只读探索，不改文件' },
-    { id: 'split', label: '并行拆分子代理', desc: '把任务拆给多个子代理' },
-    { id: 'todo', label: '添加待办', desc: '写入本会话待办列表' },
-    { id: 'compact', label: '压缩上下文', desc: '压缩会话上下文' },
-    { id: 'login', label: '订阅登录', desc: 'OAuth / API Key 登录（配置管理里）' },
-    { id: 'export', label: '导出会话', desc: '导出会话记录' },
-    { id: 'plan', label: '计划模式', desc: '切换只读探索' }
-  ]
   let mention: { kind: 'file' | 'cmd'; query: string; index: number } | null = null
   $: mentionItems = mentionList(mention, files)
   function mentionList(current: typeof mention, list: typeof files) {
     if (!current) return []
-    if (current.kind === 'cmd') return SLASH.filter((item) => item.id.startsWith(current.query) || item.label.includes(current.query))
+    if (current.kind === 'cmd') return filterSlashCommands(current.query)
     return list.filter((item) => item.kind === 'file' && item.path.toLowerCase().includes(current.query.toLowerCase())).slice(0, 8)
   }
 
+  // 斜杠命令的统一分派。每个 kind 都必须有分支——tests/slash-commands.test.mjs
+  // 会断言注册表的 kind 集合与本函数的覆盖集合一致，杜绝"列了但没实现"。
+  function runSlashCommand(command: { kind: string; id: string }, args = '') {
+    switch (command.kind) {
+      case 'new-session': void newSession(); return
+      case 'open-settings': case 'login': void openSettings(); return
+      case 'choose-workspace': void chooseWorkspace(); return
+      case 'split-subagents': splitOpen = true; agentDefs = loadAgents(); return
+      case 'todo-panel': panel = '待办'; showRight = true; return
+      case 'set-mode-plan': void setMode('plan'); return
+      case 'compact': void compactSession(); return
+      case 'export-session': {
+        // 2-5：/export md 走 Markdown，/export json 走既有 JSON 导出，默认 HTML
+        const arg = String(args.trim().toLowerCase())
+        if (arg === 'json') {
+          const session = sessions.find((item) => item.id === ensureActiveId())
+          if (session) void exportSession(session)
+          return
+        }
+        void exportActiveSession(arg === 'md' ? 'md' : 'html')
+        return
+      }
+      default:
+        // 未知 kind 不能静默做别的事（旧实现就是掉进"选择工作区"兜底）。
+        console.warn(`[pi-my] 未处理的斜杠命令类型: ${command.kind}`)
+    }
+  }
+
+  /** 压缩当前会话上下文（此前是假命令）。 */
+  async function compactSession() {
+    if (!sidecarReady) return
+    const id = ensureActiveId()
+    if (!sessions.some((item) => item.id === id && item.file)) {
+      patchSlot(id, { error: '当前会话还没有可压缩的上下文。' })
+      return
+    }
+    const slot = slotFor(id)
+    if (slot.running) {
+      patchSlot(id, { error: '正在运行中，请先停止再压缩上下文。' })
+      return
+    }
+    const response = await requestRaw('compact_session', { sessionId: id })
+    if (!response.ok) {
+      patchSlot(id, { error: response.error || '压缩上下文失败' })
+      return
+    }
+    const result = response.result as { summary?: string } | null
+    patchSlot(id, { error: '', historyLoaded: false })
+    await selectSession(sessions.find((item) => item.id === id) as Session)
+    if (result?.summary) console.info('[pi-my] 上下文压缩完成', result.summary)
+  }
+
+  /** 导出当前会话（HTML / Markdown / JSON，此前是假命令）。 */
+  async function exportActiveSession(format: 'html' | 'md' = 'html') {
+    if (!sidecarReady) return
+    const id = ensureActiveId()
+    const session = sessions.find((item) => item.id === id)
+    if (!session?.file) {
+      patchSlot(id, { error: '当前会话还没有可导出的文件。' })
+      return
+    }
+    const isMd = format === 'md'
+    const response = await requestRaw(isMd ? 'export_session_md' : 'export_session_html', { sessionId: id, file: session.file })
+    if (!response.ok) {
+      patchSlot(id, { error: response.error || '导出会话失败' })
+      return
+    }
+    const result = response.result as { html?: string; markdown?: string; name?: string } | null
+    const content = isMd ? result?.markdown : result?.html
+    if (!content) {
+      patchSlot(id, { error: '导出未返回内容' })
+      return
+    }
+    const blob = new Blob([content], { type: isMd ? 'text/markdown' : 'text/html' })
+    const link = document.createElement('a')
+    link.href = URL.createObjectURL(blob)
+    link.download = result?.name || `${session.title || session.id}.${isMd ? 'md' : 'html'}`
+    link.click()
+    URL.revokeObjectURL(link.href)
+  }
+
   function refreshMention() {
-    const slash = inputText.match(/^\/([^\s]*)$/)
+    const queryText = slashTriggerQuery(inputText)
     const at = inputText.match(/(^|\s)@([^\s]*)$/)
-    if (slash) mention = { kind: 'cmd', query: slash[1], index: 0 }
+    if (queryText !== null) mention = { kind: 'cmd', query: queryText, index: 0 }
     else if (at) {
       mention = { kind: 'file', query: at[2], index: 0 }
       if (!files.length) void loadFiles()
@@ -1931,16 +2287,16 @@
     if (!mention || !mentionItems[index]) return
     const item = mentionItems[index]
     if (mention.kind === 'cmd') {
+      // 走同一个分派表，避免"补全菜单里能选、但选了没反应/做别的事"。
+      const command = SLASH_COMMANDS.find((entry) => entry.id === (item as { id: string }).id)
       inputText = ''
       mention = null
-      const id = (item as { id: string }).id
-      if (id === 'new') void newSession()
-      else if (id === 'settings' || id === 'login') void openSettings()
-      else if (id === 'scout') { inputText = '/scout '; mention = null }
-      else if (id === 'split') { splitOpen = true; agentDefs = loadAgents() }
-      else if (id === 'todo') { panel = '待办'; showRight = true }
-      else if (id === 'plan') void setMode('plan')
-      else void chooseWorkspace()
+      if (!command) return
+      // scout 需要参数，预填而不是直接执行
+      if (command.id === 'scout') { inputText = '/scout '; return }
+      // 2-5：/export 带格式参数，预填让用户选择 md/json/html
+      if (command.id === 'export') { inputText = '/export '; return }
+      runSlashCommand(command)
       return
     }
     const path = (item as { path: string }).path
@@ -2106,12 +2462,24 @@
               </button>
               {#if branchOpen}
                 <div class="branch-menu" role="menu">
-                  {#each activeBranchSiblings as sibling, index (sibling.id)}
-                    <button class:selected={sibling.id === activeSessionId} type="button" role="menuitem" on:click={() => { branchOpen = false; if (sibling.id !== activeSessionId) void selectSession(sibling) }}>
-                      <span class="branch-index">{index + 1}</span>
-                      <span class="branch-item-copy"><strong>{sibling.title}</strong><small>{sibling.time}</small></span>
+                  <!-- 2-6 分支导航器：树形视图（缩进表层级），而非扁平兄弟列表 -->
+                  {#each branchTreeRows as row (row.session.id)}
+                    <button
+                      class:selected={row.session.id === activeSessionId}
+                      type="button"
+                      role="menuitem"
+                      style={`padding-left:${8 + row.depth * 16}px`}
+                      on:click={() => { branchOpen = false; if (row.session.id !== activeSessionId) void selectSession(row.session) }}
+                    >
+                      <span class="branch-index">{row.branch ? '└' : '●'}</span>
+                      <span class="branch-item-copy"><strong>{row.session.title}</strong><small>{row.session.time}</small></span>
                     </button>
                   {/each}
+                  <!-- 2-3 worktree 分叉：物理隔离的风险实验分支 -->
+                  <button type="button" role="menuitem" class="worktree-fork" disabled={forkBusy || !sidecarReady} title="创建独立 git worktree 并在新目录中分叉会话" on:click={() => { branchOpen = false; void forkWorktree() }}>
+                    <span class="branch-index">🌳</span>
+                    <span class="branch-item-copy"><strong>{forkBusy ? '创建中…' : 'worktree 分叉'}</strong><small>独立目录 · 与主工作区隔离</small></span>
+                  </button>
                 </div>
               {/if}
             </div>
@@ -2144,7 +2512,7 @@
               {:else}
                 <div class="message assistant-message">
                   <div class="message-meta"><span class="assistant-avatar">π</span><strong>Pi Agent</strong><span>回复</span></div>
-                  <MarkdownView text={message.text} copyable={false} />
+                  <MarkdownView text={message.text} copyable={false} streamKey={`msg:${message.id}`} />
                   <div class="assistant-actions">
                     <button class:copied={copiedReplyId === message.id} class="assistant-action" type="button" title={copiedReplyId === message.id ? '已复制' : '复制回复'} aria-label={copiedReplyId === message.id ? '已复制' : '复制回复'} on:click={() => void copyReply(message.id, message.text)}>
                       <Icon name={copiedReplyId === message.id ? 'check' : 'copy'} size={14} />
@@ -2160,11 +2528,32 @@
             {#if liveLabel(slotFor(activeSessionId))}
               <div class="message assistant-status">
                 <div class="live-status" data-phase={slotFor(activeSessionId).phase}>
-                  <Atom size={56} />
-                  <strong>{liveLabel(slotFor(activeSessionId))}</strong>
+                  {#if uiPrefs.thinkingOrb === 'liquid'}
+                    <ThinkingOrb size={56} />
+                  {:else}
+                    <Atom size={56} />
+                  {/if}
+                  <!-- 2-11：live 标签走 i18n（liveLabel 返回 Thinking 等 key 尾段） -->
+                  <strong>{liveLabelKey(slotFor(activeSessionId))}</strong>
                   {#if slotFor(activeSessionId).tool && slotFor(activeSessionId).phase === 'working'}<span>{slotFor(activeSessionId).tool}</span>{/if}
+                  {#if runState[activeSessionId]?.retry}
+                    <!-- 自动重试状态行（1-7）：让"卡住"变成可解释的状态 -->
+                    <span class="retry-status">自动重试（第 {runState[activeSessionId].retry.attempt || 1} 次）· {runState[activeSessionId].retry.reason}</span>
+                  {/if}
+                  {#if runState[activeSessionId]?.compacting}
+                    <!-- 1-2 上下文蒸发：压缩状态行（自动压缩触发时不再像卡住） -->
+                    <span class="retry-status compact-status">正在压缩上下文（上下文蒸发）· 完成后继续当前任务</span>
+                  {/if}
                 </div>
               </div>
+            {/if}
+            {#if (runState[activeSessionId]?.pluginMessages ?? []).filter((m) => m.slot === 'timeline').length}
+              <!-- 1-5 UI 插件：timeline 槽位的插件卡片 -->
+              {#each (runState[activeSessionId].pluginMessages ?? []).filter((m) => m.slot === 'timeline') as plugin (plugin.timestamp + plugin.customType)}
+                <div class="message plugin-message">
+                  <PluginCard message={plugin} />
+                </div>
+              {/each}
             {/if}
             {#if slotFor(activeSessionId).error}
               <div class="message assistant-status">
@@ -2200,13 +2589,23 @@
             {/if}
             {#if runState[activeSessionId]?.running && runState[activeSessionId]?.reply}
               <div class="message assistant-message">
-                <MarkdownView text={runState[activeSessionId]?.reply ?? ''} copyable={false} />
+                <MarkdownView text={runState[activeSessionId]?.reply ?? ''} copyable={false} streamKey={`live:${activeSessionId}`} />
               </div>
             {/if}
             {#if runState[activeSessionId]?.confirm}
               <div class="confirm-card">
                 <div class="confirm-head"><span class="confirm-tool">{runState[activeSessionId]?.confirm?.toolName}</span><span class="confirm-summary">{runState[activeSessionId]?.confirm?.summary}</span></div>
                 <div class="confirm-actions"><button class="confirm-allow" on:click={() => answerConfirm(true)}>允许</button><button on:click={() => answerConfirm(false)}>拒绝</button></div>
+              </div>
+            {/if}
+            {#if (runState[activeSessionId]?.images ?? []).length}
+              <!-- show_image 工具（1-3）：图片来自 details.images，不进模型上下文 -->
+              <div class="show-images">
+                {#each runState[activeSessionId].images as image (image.id)}
+                  <button class="show-image" type="button" title={image.name} on:click={() => window.open(image.src, '_blank', 'noopener')}>
+                    <img src={image.src} alt={image.name} loading="lazy" />
+                  </button>
+                {/each}
               </div>
             {/if}
           {/if}
@@ -2223,13 +2622,13 @@
           {#if (runState[activeSessionId]?.queue ?? []).length}
             <div class="queue-panel">
               <div class="queue-head"><strong>排队 {(runState[activeSessionId]?.queue ?? []).length} 条</strong><span>当前回合结束后按顺序发送 · 可上移/下移/移除</span></div>
-              {#each runState[activeSessionId].queue as item, index (index)}
+              {#each runState[activeSessionId].queue as item, index (item.id)}
                 <div class="queue-row">
-                  <pre>{item}</pre>
+                  <pre>{item.text}</pre>
                   <div class="queue-actions">
                     <button type="button" disabled={index === 0} on:click={() => moveQueue(index, -1)}>上移</button>
                     <button type="button" disabled={index === runState[activeSessionId].queue.length - 1} on:click={() => moveQueue(index, 1)}>下移</button>
-                    <button type="button" on:click={() => removeQueue(index)}>移除</button>
+                    <button type="button" on:click={() => removeQueue(item.id)}>移除</button>
                   </div>
                 </div>
               {/each}
@@ -2241,7 +2640,7 @@
             {#if attachments.length}<div class="attach-chips">{#each attachments as attachment, index (index)}<span class="attach-chip" class:image={attachment.kind === 'image'}>{#if attachment.kind === 'image'}<i></i>{/if}<span class="attach-name">{attachment.name}</span><button aria-label="移除附件" on:click={() => removeAttachment(index)}>×</button></span>{/each}</div>{/if}
             {#if mention && mentionItems.length}<div class="mention-menu">{#each mentionItems as item, i}<button class:on={i === mention.index} on:mousedown|preventDefault={() => applyMention(i)}>{mention.kind === 'cmd' ? `/${(item as { id: string }).id}  ${(item as { label: string }).label}${(item as { desc?: string }).desc ? `  ${(item as { desc?: string }).desc}` : ''}` : (item as { path: string }).path}</button>{/each}</div>{/if}
             <textarea bind:this={composerInput} bind:value={inputText} on:input={refreshMention} on:paste={handleClipboardPaste} on:keydown={handleKeydown} placeholder={imageGenMode ? '描述要生成的图片…' : '输入消息，@ 引用文件，/ 运行命令'} rows="2"></textarea>
-            <div class="composer-toolbar"><div class="composer-controls"><div class="kind-dropdown" use:clickOutsideKind><button class="kind-button" bind:this={kindButtonRef} aria-haspopup="true" aria-expanded={kindOpen} aria-label="输入模式" on:click={toggleKind}><img src={logoUrl} alt="" /><span>{imageGenMode ? '生图' : 'Pi'}</span><svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true"><path d="M1.5 2.5 4 5l2.5-2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>{#if kindOpen}<div class="kind-menu"><button class:selected={!imageGenMode} on:click={() => setAgentKind(false)}><img src={logoUrl} alt="" /><span>Pi</span></button><button class:selected={imageGenMode} on:click={() => setAgentKind(true)}><span>生图</span></button></div>{/if}</div><button class="attach-button" disabled={!sidecarReady} aria-label="添加附件" on:click={() => void addAttachments()}><Icon name="paperclip" size={13} /></button><div class="mode-dropdown" use:clickOutsideMode><button class="mode-button" class:plan={currentMode === 'plan'} bind:this={modeButtonRef} aria-haspopup="true" aria-expanded={modeOpen} aria-label="权限模式" on:click={toggleMode}><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.8 13.5 3.6v4.1c0 3.2-2.2 5.6-5.5 6.6-3.3-1-5.5-3.4-5.5-6.6V3.6L8 1.8Z"/></svg><span>{MODE_LABELS[currentMode] ?? currentMode}</span></button>{#if modeOpen}<div class="mode-menu" class:up={modeMenuUp}>{#each MODE_OPTIONS as option (option.value)}<button class="mode-option" class:selected={option.value === currentMode} on:click={() => void setMode(option.value)}><span class="mode-dot"></span><span class="mode-copy"><strong>{option.label}</strong><small>{option.desc}</small></span></button>{/each}</div>{/if}</div></div><div class="composer-model"><div class="model-dropdown" use:clickOutside><button class="model-button" bind:this={modelButtonRef} disabled={!models.length} aria-haspopup="listbox" aria-expanded={modelOpen} aria-label="模型" on:click={toggleModel}><span>{currentModelLabel}</span><svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true"><path d="M1.5 2.5 4 5l2.5-2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>{#if modelOpen}<div class="model-menu" class:up={modelMenuUp}><div class="model-search"><Icon name="search" size={12} /><input bind:this={modelSearchInput} bind:value={modelQuery} placeholder="搜索模型…" aria-label="搜索模型" /></div><div class="model-list">{#each modelDropdownGroups as group (group.provider)}<button class="model-group-title" type="button" aria-expanded={!providerCollapsed(group.provider)} on:click={() => toggleModelProvider(group.provider)}><span>{group.provider}</span><span class="model-group-count">{group.items.length}</span><Icon name={providerCollapsed(group.provider) ? 'chevron-right' : 'chevron-down'} size={10} /></button>{#if !providerCollapsed(group.provider)}<div class="model-group-items">{#each group.items as model (modelKey(model))}<button class="model-option" class:selected={modelKey(model) === currentModelKey} on:click={() => pickModel(model)}><span class="model-dot"></span><span class="model-name">{model.name}</span></button>{/each}</div>{/if}{:else}<div class="model-empty">没有匹配的模型</div>{/each}</div></div>{/if}</div><div class="thinking-dropdown" use:clickOutsideThinking><button class="thinking-button" bind:this={thinkingButtonRef} disabled={!sidecarReady} aria-haspopup="true" aria-expanded={thinkingOpen} aria-label="思考深度" on:click={toggleThinking}><span class="thinking-label">思考：</span><span class="thinking-value">{thinkingLabel}</span><svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true"><path d="M1.5 2.5 4 5l2.5-2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>{#if thinkingOpen}<div class="thinking-menu"><div class="thinking-head"><strong>思考深度</strong><span>{thinkingLabel}</span><button class="thinking-help-button" class:on={thinkingHelp} aria-label="档位说明" aria-expanded={thinkingHelp} on:click={toggleThinkingHelp}>?</button></div><div class="thinking-ends"><span>更快</span><span>更聪明</span></div><div class="thinking-slider" style={`--p:${thinkingPercent}`}><div class="thinking-track"></div><div class="thinking-fill"></div><input class="thinking-range" type="range" min="0" max={THINKING_LEVELS.length - 1} step="1" value={thinkingIndex} disabled={!sidecarReady} aria-label="思考档位" on:input={onThinkingInput} on:change={onThinkingChange} /></div>{#if thinkingHelp}<ul class="thinking-help">{#each THINKING_LEVELS as level (level)}<li class:on={level === thinkingLevel}><b>{THINKING_LABELS[level]}</b><span>{THINKING_HELP[level]}</span></li>{/each}</ul>{/if}</div>{/if}</div></div><div class="composer-right"><div class="ctx-dropdown" use:clickOutsideCtx><button class="ctx-button" class:empty={!activeSessionId || !ctxStats?.window} bind:this={ctxButtonRef} disabled={!sidecarReady} aria-label="上下文用量" aria-haspopup="true" aria-expanded={ctxOpen} on:click={toggleCtx}><svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><circle cx="9" cy="9" r="7" fill="none" stroke="currentColor" stroke-width="2"/>{#if ctxStats?.window}<circle cx="9" cy="9" r="7" fill="none" stroke="#333" stroke-width="2" stroke-linecap="round" stroke-dasharray={ctxDash()} transform="rotate(-90 9 9)"/>{/if}</svg></button>{#if ctxOpen}<div class="ctx-menu" class:up={ctxMenuUp}>{#if !activeSessionId}<div class="ctx-empty"><strong>本会话尚未开始</strong><small>发送第一条消息后显示用量</small></div>{:else if !ctxStats?.window}<div class="ctx-empty"><strong>暂无用量数据</strong><small>发送消息后显示上下文占用</small></div>{:else}<div class="ctx-head"><strong>上下文容量（估算）</strong><span>{ctxProgress()}%</span></div><div class="ctx-row"><span>当前上下文</span><span>{fmtWan(ctxStats.currentContext)}</span></div><div class="ctx-row"><span>可用容量</span><span>{fmtWan(Math.max(0, ctxStats.window - ctxStats.currentContext))}</span></div><div class="ctx-row"><span>上下文窗口</span><span>{fmtWan(ctxStats.window)}</span></div><div class="ctx-bar"><i style="width:{ctxProgress()}%"></i></div><div class="ctx-divider"></div><div class="ctx-sub">本会话累计</div><div class="ctx-row"><span>总 Token</span><span>{fmtWan(ctxStats.totals.total)}</span></div><div class="ctx-row"><span>输入</span><span>{fmtWan(ctxStats.totals.input)}</span></div><div class="ctx-row"><span>输出</span><span>{fmtWan(ctxStats.totals.output)}</span></div><div class="ctx-row"><span>缓存读取</span><span>{fmtWan(ctxStats.totals.cacheRead)}</span></div><div class="ctx-row"><span>缓存写入</span><span>{fmtWan(ctxStats.totals.cacheWrite)}</span></div><div class="ctx-divider"></div><div class="ctx-row"><span>本地费率估算</span><span>${ctxStats.costUsd.toFixed(2)}</span></div><div class="ctx-row"><span>平均缓存命中率</span><span>{(ctxStats.cacheHitRate * 100).toFixed(1)}%</span></div><div class="ctx-note">按本地模型费率估算，未提供费率则为 0</div>{/if}</div>{/if}</div><button class:imagegen-busy={imageGenBusy} class:stop={runState[activeSessionId]?.running} class="send" aria-label={imageGenMode ? '生成图片' : runState[activeSessionId]?.running ? '停止当前任务' : '发送消息'} title={imageGenMode ? '生成图片' : runState[activeSessionId]?.running ? '停止当前任务' : '发送消息'} on:click={imageGenMode ? generateImage : runState[activeSessionId]?.running ? stop : () => submit('steer')}>{#if imageGenBusy}<span class="send-dot"></span>{:else if runState[activeSessionId]?.running}<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><rect x="1.5" y="1.5" width="7" height="7" rx="1" fill="currentColor"/></svg>{:else}<Icon name="send" size={14} strokeWidth={1.9} />{/if}</button></div></div>
+            <div class="composer-toolbar"><div class="composer-controls"><div class="kind-dropdown" use:clickOutsideKind><button class="kind-button" bind:this={kindButtonRef} aria-haspopup="true" aria-expanded={kindOpen} aria-label="输入模式" on:click={toggleKind}><img src={logoUrl} alt="" /><span>{imageGenMode ? '生图' : 'Pi'}</span><svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true"><path d="M1.5 2.5 4 5l2.5-2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>{#if kindOpen}<div class="kind-menu"><button class:selected={!imageGenMode} on:click={() => setAgentKind(false)}><img src={logoUrl} alt="" /><span>Pi</span></button><button class:selected={imageGenMode} on:click={() => setAgentKind(true)}><span>生图</span></button></div>{/if}</div><button class="attach-button" disabled={!sidecarReady} aria-label="添加附件" on:click={() => void addAttachments()}><Icon name="paperclip" size={13} /></button><div class="mode-dropdown" use:clickOutsideMode><button class="mode-button" class:plan={currentMode === 'plan'} bind:this={modeButtonRef} aria-haspopup="true" aria-expanded={modeOpen} aria-label="权限模式" on:click={toggleMode}><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.8 13.5 3.6v4.1c0 3.2-2.2 5.6-5.5 6.6-3.3-1-5.5-3.4-5.5-6.6V3.6L8 1.8Z"/></svg><span>{MODE_LABELS[currentMode] ?? currentMode}</span></button>{#if modeOpen}<div class="mode-menu" class:up={modeMenuUp}>{#each MODE_OPTIONS as option (option.value)}<button class="mode-option" class:selected={option.value === currentMode} on:click={() => void setMode(option.value)}><span class="mode-dot"></span><span class="mode-copy"><strong>{option.label}</strong><small>{option.desc}</small></span></button>{/each}</div>{/if}</div></div><div class="composer-model"><div class="model-dropdown" use:clickOutside><button class="model-button" bind:this={modelButtonRef} disabled={!models.length} aria-haspopup="listbox" aria-expanded={modelOpen} aria-label="模型" on:click={toggleModel}><span>{currentModelLabel}</span><svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true"><path d="M1.5 2.5 4 5l2.5-2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>{#if modelOpen}<div class="model-menu" class:up={modelMenuUp}><div class="model-search"><Icon name="search" size={12} /><input bind:this={modelSearchInput} bind:value={modelQuery} placeholder="搜索模型…" aria-label="搜索模型" /></div><div class="model-list">{#each modelDropdownGroups as group (group.provider)}<button class="model-group-title" type="button" aria-expanded={!providerCollapsed(group.provider)} on:click={() => toggleModelProvider(group.provider)}><span>{group.provider}{#if group.items[0]?.source === "extension"}<span class="ext-badge" title="由本机 Pi 扩展动态注册">扩展</span>{/if}</span><span class="model-group-count">{group.items.length}</span><Icon name={providerCollapsed(group.provider) ? 'chevron-right' : 'chevron-down'} size={10} /></button>{#if !providerCollapsed(group.provider)}<div class="model-group-items">{#each group.items as model (modelKey(model))}<button class="model-option" class:selected={modelKey(model) === currentModelKey} on:click={() => pickModel(model)}><span class="model-dot"></span><span class="model-name">{model.name}</span></button>{/each}</div>{/if}{:else}<div class="model-empty">没有匹配的模型</div>{/each}</div></div>{/if}</div><div class="thinking-dropdown" use:clickOutsideThinking><button class="thinking-button" bind:this={thinkingButtonRef} disabled={!sidecarReady} aria-haspopup="true" aria-expanded={thinkingOpen} aria-label="思考深度" on:click={toggleThinking}><span class="thinking-label">思考：</span><span class="thinking-value">{thinkingLabel}</span><svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true"><path d="M1.5 2.5 4 5l2.5-2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>{#if thinkingOpen}<div class="thinking-menu"><div class="thinking-head"><strong>思考深度</strong><span>{thinkingLabel}</span><button class="thinking-help-button" class:on={thinkingHelp} aria-label="档位说明" aria-expanded={thinkingHelp} on:click={toggleThinkingHelp}>?</button></div><div class="thinking-ends"><span>更快</span><span>更聪明</span></div><div class="thinking-slider" style={`--p:${thinkingPercent}`}><div class="thinking-track"></div><div class="thinking-fill"></div><input class="thinking-range" type="range" min="0" max={THINKING_LEVELS.length - 1} step="1" value={thinkingIndex} disabled={!sidecarReady} aria-label="思考档位" on:input={onThinkingInput} on:change={onThinkingChange} /></div>{#if thinkingHelp}<ul class="thinking-help">{#each THINKING_LEVELS as level (level)}<li class:on={level === thinkingLevel}><b>{THINKING_LABELS[level]}</b><span>{THINKING_HELP[level]}</span></li>{/each}</ul>{/if}</div>{/if}</div></div><div class="composer-right"><div class="ctx-dropdown" use:clickOutsideCtx><button class="ctx-button" class:empty={!activeSessionId || !ctxStats?.window} bind:this={ctxButtonRef} disabled={!sidecarReady} aria-label="上下文用量" aria-haspopup="true" aria-expanded={ctxOpen} on:click={toggleCtx}><svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><circle cx="9" cy="9" r="7" fill="none" stroke="currentColor" stroke-width="2"/>{#if ctxStats?.window}<circle cx="9" cy="9" r="7" fill="none" stroke="#333" stroke-width="2" stroke-linecap="round" stroke-dasharray={ctxDash()} transform="rotate(-90 9 9)"/>{/if}</svg></button>{#if ctxOpen}<div class="ctx-menu" class:up={ctxMenuUp}>{#if !activeSessionId}<div class="ctx-empty"><strong>本会话尚未开始</strong><small>发送第一条消息后显示用量</small></div>{:else if !ctxStats?.window}<div class="ctx-empty"><strong>暂无用量数据</strong><small>发送消息后显示上下文占用</small></div>{:else}<div class="ctx-head"><strong>上下文容量（估算）</strong><span>{ctxProgress()}%</span></div><div class="ctx-row"><span>当前上下文</span><span>{fmtWan(ctxStats.currentContext)}</span></div><div class="ctx-row"><span>可用容量</span><span>{fmtWan(Math.max(0, ctxStats.window - ctxStats.currentContext))}</span></div><div class="ctx-row"><span>上下文窗口</span><span>{fmtWan(ctxStats.window)}</span></div><div class="ctx-bar"><i style="width:{ctxProgress()}%"></i></div><div class="ctx-divider"></div><div class="ctx-sub">本会话累计</div><div class="ctx-row"><span>总 Token</span><span>{fmtWan(ctxStats.totals.total)}</span></div><div class="ctx-row"><span>输入</span><span>{fmtWan(ctxStats.totals.input)}</span></div><div class="ctx-row"><span>输出</span><span>{fmtWan(ctxStats.totals.output)}</span></div><div class="ctx-row"><span>缓存读取</span><span>{fmtWan(ctxStats.totals.cacheRead)}</span></div><div class="ctx-row"><span>缓存写入</span><span>{fmtWan(ctxStats.totals.cacheWrite)}</span></div><div class="ctx-divider"></div><div class="ctx-row"><span>本地费率估算</span><span>${ctxStats.costUsd.toFixed(2)}</span></div><div class="ctx-row"><span>平均缓存命中率</span><span>{(ctxStats.cacheHitRate * 100).toFixed(1)}%</span></div><div class="ctx-note">按本地模型费率估算，未提供费率则为 0</div>{#if stateSummaryView}<div class="ctx-divider"></div><div class="ctx-sub">运行状态（1-8 get_state）</div><div class="ctx-row"><span>权限模式</span><span>{stateSummaryView.mode}</span></div>{#if stateSummaryView.model}<div class="ctx-row"><span>模型</span><span>{stateSummaryView.model}</span></div>{/if}{#if stateSummaryView.thinking}<div class="ctx-row"><span>思考档位</span><span>{stateSummaryView.thinking}</span></div>{/if}<div class="ctx-row"><span>消息数</span><span>{Number(sessionState?.stats?.totalMessages ?? 0)}</span></div><div class="ctx-row"><span>排队消息</span><span>{stateSummaryView.queued}</span></div>{/if}{#if quotas.length}<div class="ctx-divider"></div><div class="ctx-sub">Provider 额度（2-8）{quotasBusy ? " · 查询中" : ""}</div>{#each quotas as q (q.provider)}<div class="ctx-row"><span>{q.provider}</span><span>{q.message || "—"}{#if q.nextResetAt} · {formatCountdown(q.msUntilReset)}{/if}</span></div>{/each}<div class="ctx-note">重置时间为按周期估算（设置页可为每个 provider 配置）；接口提供真实重置时间时优先展示</div>{/if}<div class="ctx-note">按本地模型费率估算，未提供费率则为 0</div>{/if}</div>{/if}</div><!-- END-CTX --><button class:imagegen-busy={imageGenBusy} class:stop={runState[activeSessionId]?.running} class="send" aria-label={imageGenMode ? '生成图片' : runState[activeSessionId]?.running ? '停止当前任务' : '发送消息'} title={imageGenMode ? '生成图片' : runState[activeSessionId]?.running ? '停止当前任务' : '发送消息'} on:click={imageGenMode ? generateImage : runState[activeSessionId]?.running ? stop : () => submit('steer')}>{#if imageGenBusy}<span class="send-dot"></span>{:else if runState[activeSessionId]?.running}<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><rect x="1.5" y="1.5" width="7" height="7" rx="1" fill="currentColor"/></svg>{:else}<Icon name="send" size={14} strokeWidth={1.9} />{/if}</button></div></div>
           </div>
         </div>
       </main>
@@ -2273,8 +2672,13 @@
             {@render treeRows('', 0)}
           </div>
           {#if selectedFile}
-            <div class="resource-preview-head"><span class="doc-name">{selectedFile}</span><span class="doc-stats">{documentStats()}</span>{#if !editingFile}<button on:click={() => (editingFile = true)}>编辑</button>{:else}<button on:click={() => void saveFile()}>保存</button><button on:click={() => (editingFile = false)}>取消</button>{/if}</div>
-            <article class="resource-preview">{#if editingFile}<textarea class="file-editor" bind:value={fileContent}></textarea>{:else}<pre class="file-preview">{fileContent}</pre>{/if}</article>
+            <div class="resource-preview-head"><span class="doc-name">{selectedFile}</span><span class="doc-stats">{largeFile ? '大文件 · 虚拟化预览' : documentStats()}</span>{#if !largeFile}{#if !editingFile}<button on:click={() => (editingFile = true)}>编辑</button>{:else}<button on:click={() => void saveFile()}>保存</button><button on:click={() => (editingFile = false)}>取消</button>{/if}{/if}</div>
+            {#if largeFile}
+              <!-- 2-12：大文件虚拟化预览（只读；编辑仍限 512KB 内文件） -->
+              <VirtualFile path={largeFile.path} readFileChunk={readFileChunk} height={480} />
+            {:else}
+              <article class="resource-preview">{#if editingFile}<textarea class="file-editor" bind:value={fileContent}></textarea>{:else}<pre class="file-preview">{fileContent}</pre>{/if}</article>
+            {/if}
           {/if}
         {:else if panel === '变更'}
           <div class="git-panel">
@@ -2304,7 +2708,7 @@
             </div>
           </div>
         {:else if panel === '终端'}
-          <Terminal visible={panel === '终端'} />
+          <!-- 终端组件常驻在下方（见 {:else} 之后），此处仅留位。 -->
         {:else if panel === '待办'}
           <div class="todo-panel">
             <div class="resource-head"><span>任务清单</span><button type="button" on:click={() => { splitOpen = true; agentDefs = loadAgents() }}>拆分</button></div>
@@ -2347,6 +2751,15 @@
             {/if}
           </div>
         {/if}
+          <!-- 终端常驻挂载（不随面板切换销毁重建）。
+               旧写法把它放在 {:else if} 分支里，每切一次面板就销毁并重建 Terminal：
+               pty_spawn 一个新 shell（丢掉当前工作目录与正在跑的命令），
+               并可能泄漏一个尚未注册完成的 'pty-output' 监听。
+               必须留在 .workspace-content **内部**：放到外面会成为 .workspace 的
+               第 3 个 grid item，撑出隐式第三列，终端宽度由内容驱动而非 1fr。 -->
+          <div class="panel-content terminal-keepalive" class:hidden={panel !== '终端'}>
+            <Terminal visible={panel === '终端'} />
+          </div>
         </div>
       </aside>
       {#if showRight}
@@ -2394,9 +2807,64 @@
               </div>
             </div>
           {/if}
-          {#if slotFor(viewingSub.id).running}<div class="live-status"><Atom size={56} /><strong>{liveLabel(slotFor(viewingSub.id)) || 'Working'}</strong></div>{/if}
+          {#if slotFor(viewingSub.id).running}
+            <div class="live-status">
+              {#if uiPrefs.thinkingOrb === 'liquid'}
+                <ThinkingOrb size={56} />
+              {:else}
+                <Atom size={56} />
+              {/if}
+              <strong>{liveLabelKey(slotFor(viewingSub.id)) || tt('live.working')}</strong>
+            </div>
+          {/if}
         </div>
         <footer>只读检视，请在父会话继续对话。</footer>
+      </div>
+    </div>
+  {/if}
+  {#if extToasts.length}
+    <div class="ext-toasts" role="status" aria-live="polite">
+      {#each extToasts as toast (toast.id)}
+        <div class="ext-toast" class:warning={toast.type === 'warning'} class:error={toast.type === 'error'}>{toast.text}</div>
+      {/each}
+    </div>
+  {/if}
+  {#if extDialog}
+    <div class="overlay" role="presentation">
+      <div class="ext-dialog" role="dialog" aria-label={extDialog.title}>
+        <header><strong>{extDialog.title}</strong>{#if extDialog.kind !== 'confirm'}<button type="button" aria-label="取消" on:click={() => answerExtDialog(undefined, true)}>×</button>{/if}</header>
+        <div class="ext-dialog-body">
+          {#if extDialog.message}<p class="ext-dialog-message">{extDialog.message}</p>{/if}
+          {#if extDialog.kind === 'select'}
+            <div class="ext-options">
+              {#each extDialog.options ?? [] as option}
+                <button type="button" on:click={() => answerExtDialog(option)}>{option}</button>
+              {/each}
+            </div>
+          {:else if extDialog.kind === 'editor'}
+            <textarea class="ext-editor" bind:value={extDialogValue} rows="8"></textarea>
+            <div class="ext-dialog-actions">
+              <button class="primary" type="button" on:click={() => answerExtDialog(extDialogValue)}>提交</button>
+              <button type="button" on:click={() => answerExtDialog(undefined, true)}>取消</button>
+            </div>
+          {:else if extDialog.kind === 'confirm'}
+            <div class="ext-dialog-actions">
+              <button class="primary" type="button" on:click={() => answerExtDialog('true', false, { confirmed: true })}>允许</button>
+              <button type="button" on:click={() => answerExtDialog(undefined, true, { confirmed: false })}>拒绝</button>
+            </div>
+          {:else}
+            <input
+              class="ext-input"
+              bind:value={extDialogValue}
+              placeholder={extDialog.placeholder ?? ''}
+              on:keydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); answerExtDialog(extDialogValue) } }}
+            />
+            <div class="ext-dialog-actions">
+              <button class="primary" type="button" on:click={() => answerExtDialog(extDialogValue)}>提交</button>
+              <button type="button" on:click={() => answerExtDialog(undefined, true)}>取消</button>
+            </div>
+          {/if}
+        </div>
       </div>
     </div>
   {/if}
@@ -2422,17 +2890,15 @@
     </div>
   {/if}
   {#if uiPrefs.petEnabled}
-    {#if uiPrefs.petModel && petById(uiPrefs.petModel)}
-      {#key currentPetUrl()}
-        {#if petById(uiPrefs.petModel)?.type === 'sprite'}
-          <SpritePet enabled url={currentPetUrl()} />
-        {:else}
-          <Live2DPet enabled url={currentPetUrl()} />
-        {/if}
-      {/key}
-    {:else}
-      <Pet enabled />
-    {/if}
+    {#key currentPetUrl()}
+      {#if petById(uiPrefs.petModel)?.type === 'sprite'}
+        <LazyPet kind="sprite" enabled url={currentPetUrl()} />
+      {:else if uiPrefs.petModel}
+        <LazyPet kind="live2d" enabled url={currentPetUrl()} />
+      {:else}
+        <LazyPet kind="atom" enabled />
+      {/if}
+    {/key}
   {/if}
   <Settings open={showSettings} connected={sidecarReady} info={settingsInfo} usageStats={usageStats} imageGenConfig={imageGenConfig} onSaveImageGenConfig={saveImageGenConfig} onclose={() => { showSettings = false; settingsInitialTab = undefined; refreshPrefs() }} openDir={openDir} workspacePath={workspacePath} onChooseWorkspace={chooseWorkspace} onOpenRepo={() => void request('open_url', { url: 'https://github.com/TANGZZee/pi-my' })} providers={providers} onRefreshProviders={refreshProviders} onRefreshUsage={refreshUsage} onPrefsChange={refreshPrefs} onRestoreArchived={(session) => unarchiveSession(session)} onDeleteArchived={(session) => deleteSession(session, true)} agentUpdate={agentUpdate} agentUpdateBusy={agentUpdateBusy} onCheckAgentUpdate={() => void checkAgentUpdate(true)} onUpdateAgent={() => void updatePiSdk()} onOpenAgentUpdate={openAgentUpdate} onOpenAgentRepo={openAgentRepo} initialTab={settingsInitialTab} rpc={request} />
 </div>

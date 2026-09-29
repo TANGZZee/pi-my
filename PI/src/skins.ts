@@ -1,5 +1,5 @@
 /** 皮肤 = 完整色板（表面/文字/边框/主色），再叠加浅色/深色。扩展：这里加一条 + app.css [data-appearance] 覆盖即可。 */
-export type SkinId = 'graphite' | 'moss' | 'sea' | 'paper' | 'ink'
+export type SkinId = 'graphite' | 'moss' | 'sea' | 'paper' | 'ink' | 'glass'
 
 export type SkinPreset = {
   id: SkinId
@@ -39,5 +39,11 @@ export const SKINS: readonly SkinPreset[] = [
     label: '夜墨',
     desc: '高对比深色墨底',
     preview: { bg: '#121212', sidebar: '#171717', panel: '#1c1c1c', accent: '#e8e8e8', border: '#333333' }
+  },
+  {
+    id: 'glass',
+    label: '液态玻璃',
+    desc: '半透明毛玻璃层叠，随浅色/深色切换',
+    preview: { bg: '#e8f0f8', sidebar: '#dde9f3', panel: '#f4f9fd', accent: '#2563eb', border: '#c2d4e4' }
   }
 ]

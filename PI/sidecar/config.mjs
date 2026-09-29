@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
+import { atomicWriteText } from './atomic-write.mjs'
 import {
   defaultBalanceUrl,
   flattenModelsDev,
@@ -64,7 +65,9 @@ async function readJson(file, fallback) {
 async function writeJson(file, data) {
   await mkdir(path.dirname(file), { recursive: true })
   const text = `${JSON.stringify(data, null, 2)}\n`
-  await writeFile(file, text, 'utf8')
+  // 2-13（审查 P2-4）：probes/proxy/catalog 缓存同样被并发读写，统一走原子写。
+  // 一处改动覆盖 writeJson 的全部调用点（desktop-proxy.json / usage-probes.json / models-dev 缓存）。
+  await atomicWriteText(file, text)
   return text
 }
 
@@ -97,7 +100,9 @@ export async function writeConfigFile(agentDir, kind, raw) {
   JSON.parse(text)
   const file = path.join(agentDir, name)
   await mkdir(agentDir, { recursive: true })
-  await writeFile(file, text.endsWith('\n') ? text : `${text}\n`, 'utf8')
+  // 2-13：配置文件走原子写（临时文件 + rename + Windows EPERM 重试）。
+  // models.json / auth.json 被 SDK 与 UI 并发读写，直接 writeFile 有截断风险。
+  await atomicWriteText(file, text.endsWith('\n') ? text : `${text}\n`)
   return { kind, path: file, saved: true }
 }
 

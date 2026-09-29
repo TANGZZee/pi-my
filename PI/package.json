@@ -6,7 +6,13 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test": "node --test \"tests/**/*.test.mjs\"",
+    "check": "npm run check:types && npm run check:svelte",
+    "check:types": "tsc --noEmit",
+    "check:svelte": "svelte-check --tsconfig ./tsconfig.json --output human",
+    "verify": "npm run check && npm run test && npm run build",
     "prepare:runtime": "node scripts/prepare-resources.mjs",
+    "prepare:dev": "node scripts/prepare-resources.mjs --sidecar-only",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -24,6 +30,9 @@
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^4.0.0",
     "@tauri-apps/cli": "^2.11.4",
+    "@types/node": "^26.6.3",
+    "svelte-check": "^4.7.6",
+    "typescript": "^5.9.3",
     "vite": "^5.4.6"
   }
 }
