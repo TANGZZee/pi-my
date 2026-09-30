@@ -173,8 +173,10 @@ export function summarizeEvent(event) {
 
   // 之五：agent_end.messages 累积了**整个 run** 的全部消息（含每个 toolResult），
   // 是体量最大的一份载体——一次读 20 张图可达单行 20MB，经 lib.rs 逐行 JSON.parse 跨 IPC。
-  // 前端对 agent_end 只读 willRetry（App.svelte:1255-1258），messages 零消费，故可安全瘦身。
-  // 注意：只碰 role === 'toolResult' 的项，assistant/user 终态一律不动。
+  // 前端从 agent_end.messages 里取 assistant 终态的 stopReason/errorMessage 生成"请求失败"文案，
+  // 故**只能**瘦 role === 'toolResult' 的项；assistant 终态一旦被动过，模型报错就会重新变成
+  // "没有任何反馈"（真实事故：provider 回 404 时界面永久卡在 Thinking，见 1-7b）。
+  // 承重不变量由 tests/event-slim.test.mjs 的 agent_end 用例守卫，勿改成对全部项瘦身。
   if (event.type === 'agent_end') {
     if (!Array.isArray(event.messages)) return event
     let changed = false

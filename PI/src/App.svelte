@@ -34,20 +34,27 @@
   import { activeBranchSiblingsOf, buildSessionRows, sessionRootId as sessionRootIdOf } from './session-tree'
   import {
     appendThinkToSteps,
+    assistantErrorFrom,
     brief,
     closeOpenSteps,
     endToolStep as endToolStepIn,
     ensureThinkingStep,
     formatReplyTime,
     historyToTimeline,
+    isCancellationText,
     lastAssistantReply,
     liveLabel,
+    mergeHistoryIntoTimeline,
     processSummary as processSummaryOf,
+    removeProviderError,
     sentFromTimeline,
+    stashProviderError,
+    takeProviderError,
   } from './run-slot'
   import { stateSummary, type StateSnapshot } from './session-state'
   import { withResetEstimate, formatResetCountdown } from './quota-reset'
   import { casRemove, casReorder } from './queue-cas'
+  import { collectSubRunUpdates, createEpochGuard, createRunEpoch, createTurnIdFactory, isTurnAlive, isTurnCurrent, planDrain } from './session-run'
   import { cycleTodoStatus, loadTodos, newTodo, saveTodos, todoTree, type TodoItem, type TodoStatus } from './todos'
 
   type PanelTab = '文档' | '变更' | '终端' | '运行' | '待办'
@@ -102,7 +109,11 @@
     placeholder?: string
     prefill?: string
   }
-  let extDialog: ExtDialog | null = null
+  // D-F（外部审计 P2）：原先 extDialog 是**全局单值**，新请求直接整体覆盖旧请求，
+  // 于是两个扩展（或两个会话）同时请求时，先到的那个 dialogId 永远收不到回答，
+  // 只能等 sidecar 的 600s 超时后按默认值回落。改为队列：模板仍消费单个 extDialog。
+  let extDialogs: ExtDialog[] = []
+  $: extDialog = extDialogs[0] ?? null
   let extDialogValue = ''
   let extToasts: Array<{ id: string; text: string; type: string }> = []
   let petStatus: { base: string; pets: Array<{ id: string; model?: string | null; sprite?: string }> } = { base: '', pets: [] }
@@ -125,6 +136,20 @@
   let query = ''
   let runState: Record<string, RunSlot> = {}
   let runWatchdogs: Record<string, number> = {}
+  // provider 终态错误暂存（会话级）：SDK 在模型报错时**不发 type:'error' 事件**，
+  // 而是产出一条 stopReason:'error' 的 assistant 终态消息，再照常发 agent_end。
+  // 若不在此处接住，错误文本会被整条丢弃 —— 用户看到的就是"没有任何反馈"。
+  let providerErrors: Record<string, string> = {}
+  // 已关闭 / 已删除的会话 id（外部审计缺陷 3）：closeTab 删掉 runState[id] 之后，
+  // 在途事件（agent_start/message_update/…）仍会到达。patchSlot 对未知 id 会以
+  // emptySlot 兜底**重新长出槽位**，agent_start 分支还会无条件写 running:true 并
+  // touchRunWatchdog 重新武装 180s 看门狗 —— 而此时会话已不在 sessions 里：没有
+  // 标签、没有停止按钮，用户完全无法中止，180 秒后错误文本落进一个不可见的槽。
+  // 修法：把这类 id 记下来，patchSlot 直接拒绝写入；重新打开同一个 id 时移除。
+  const closedIds = new Set<string>()
+
+  // 因"会话正在运行"而被跳过的磁盘历史（缺陷 10）：先存这里，finishRun 时合并。
+  let pendingHistory: Record<string, Array<{ id?: string; role: 'user' | 'assistant'; text: string; timestamp?: number; userIndex?: number; entryId?: string }>> = {}
   let sidecarReady = false
   let models: ModelInfo[] = []
   let composerInput: HTMLTextAreaElement
@@ -275,8 +300,59 @@
   $: thinkingLabel = THINKING_LABELS[thinkingLevel] ?? thinkingLevel
   $: thinkingPercent = THINKING_LEVELS.length > 1 ? thinkingIndex / (THINKING_LEVELS.length - 1) : 0
   $: if (typeof document !== 'undefined') document.body.classList.toggle('resizing', dragging !== null)
+  // D-B（外部审计 P1）：权限确认原先只渲染 active 槽（模板 `runState[activeSessionId].confirm`），
+  // 也只由 active 槽回答（answerConfirm 取 activeSessionId）。后台会话的确认因此**完全不可见**，
+  // 用户切走期间那个工具调用一直挂着，直到 sidecar 的 600s 超时按 confirm→false 保守拒绝。
+  // 存储本来就是按会话的（confirm_request 用 payload.sessionId），缺的只是渲染与回答。
+  $: pendingConfirms = Object.keys(runState)
+    .filter((id) => runState[id]?.confirm && id !== activeSessionId)
+    .map((id) => ({
+      id,
+      title: sessions.find((item) => item.id === id)?.title || id,
+      confirm: runState[id].confirm!,
+    }))
 
   let processSeq = 0
+  // 单调递增的回合号：用 `turn-${Date.now()}` 做 id 时，同一毫秒内的两次派发会撞出
+  // 重复 key（timeline 以 message.id 为 key，Svelte 会报重复键并复用错误节点）。
+  // 实现见 src/session-run.ts（纯函数，有单测）。
+  const nextTurnId = createTurnIdFactory()
+
+  // 会话 id 同理：`session-${Date.now()}` 在同一毫秒内新建两次会撞出同一个 id，
+  // 后者会被 sessions 的 map 分支当成"已存在"而静默覆盖（或让两个会话共用槽位）。
+  const nextSessionId = createTurnIdFactory('session')
+
+  // 会话切换代数：每次"换到别的会话/关掉会话"都自增，用于判定一个 await 之后
+  // 是否已经被更新的一次切换取代（关闭→重开同一个 id 时仅靠 id 比对抓不住）。
+  // 实现见 src/session-run.ts（纯函数，有单测）。
+  const sessionEpoch = createEpochGuard()
+
+  // 运行世代：Stop / 关标签会 abort 当前回合，但 SDK 的 `agent_end`/`agent_settled`
+  // 仍然会迟到（它们是在 abort 请求飞行期间发出的），且事件里**不带回合身份**。
+  // 若这时用户已经发了下一条消息，迟到事件会把新回合当成已结束 —— running 归零、
+  // 半截回复被提交成终态，此后 text_delta 写进 reply 但 finishRun 早退，
+  // 这部分内容永远进不了 timeline（外部审计缺陷 1）。实现见 src/session-run.ts。
+  const runEpoch = createRunEpoch()
+
+  // 队列 drain 定时器：缺陷 2 —— finishRun 里的 40ms `setTimeout(() => drainQueue(id))`
+  // 会在 Stop 之后仍然触发，把 follow-up 悄悄派发成新回合，而上一轮的尾部文本
+  // 还在往同一个 reply 缓冲区追加，于是一条完整回答被劈成两个气泡。
+  // Stop / 关标签 / 删除会话时必须一并 clearTimeout。
+  let drainTimers: Record<string, number> = {}
+
+  function clearDrainTimer(id: string) {
+    const handle = drainTimers[id]
+    if (handle === undefined) return
+    window.clearTimeout(handle)
+    const next = { ...drainTimers }
+    delete next[id]
+    drainTimers = next
+  }
+
+  function scheduleDrain(id: string) {
+    clearDrainTimer(id)
+    drainTimers = { ...drainTimers, [id]: window.setTimeout(() => { clearDrainTimer(id); drainQueue(id) }, 40) }
+  }
 
   function emptySlot(): RunSlot {
     return { reply: '', thinking: '', tool: '', phase: 'idle', running: false, error: '', queue: [], queueRevision: 0, steer: [], sent: [], timeline: [], subRuns: [], process: [], processOpen: false, replyAt: undefined, historyLoaded: false, activeTurnId: undefined }
@@ -319,7 +395,22 @@
 
   function applySessionHistory(id: string, history: Array<{ id?: string; role: 'user' | 'assistant'; text: string; timestamp?: number; userIndex?: number; entryId?: string }> = []) {
     const current = slotFor(id)
-    if (current.running || current.historyLoaded) return
+    if (current.running) {
+      // 缺陷 10（外部审计 P2）：这里原先是**直接 return 丢掉**。运行中打开一个
+      // 有历史的会话时（或重启重绑时该会话正在跑），磁盘历史就此永久消失 —— 此后
+      // 没有任何重试点，finishRun 不回头补加载，用户看到的时间线只有当前这一轮。
+      // 改为记下来，在 finishRun 收尾时合并到时间线**前面**（当前轮的条目保留）。
+      if (history.length) pendingHistory = { ...pendingHistory, [id]: history }
+      return
+    }
+    if (current.historyLoaded) {
+      // 界面已经有时间线（例如 dispatchTurn 在 prompt 尚未 ack 时就置了
+      // historyLoaded，随后重启重绑又读到同一份磁盘历史）。此时**合并**而不是
+      // 覆盖：既补回被跳过的历史，又不会抹掉正在显示的内容。
+      const merged = mergeHistoryIntoTimeline(history, current.timeline)
+      patchSlot(id, { timeline: merged, sent: sentFromTimeline(merged) })
+      return
+    }
     const timeline = historyToTimeline(history)
     const lastReply = lastAssistantReply(timeline)
     patchSlot(id, {
@@ -334,6 +425,30 @@
       process: [],
       processOpen: false
     })
+  }
+
+  /**
+   * 把暂存的迟到历史补进时间线（缺陷 10）。
+   * 由 finishRun 调用：此刻 running 已归零、本轮回复已落进 timeline，合并是安全的
+   * （当前轮条目按 id 去重保留，不会被历史覆盖）。
+   */
+  function flushPendingHistory(id: string) {
+    const parked = pendingHistory[id]
+    if (!parked) return
+    // 先确认这次合并真的落得下去，再删停泊项。原先"先 delete 再 patchSlot"在 patchSlot
+    // 被 closedIds 拒绝（会话在 finishRun 与 flush 之间被关掉）时会**静默丢失**整段
+    // 磁盘历史，且没有任何重试点（外部审计缺陷 13）。
+    if (closedIds.has(id)) {
+      const pruned = { ...pendingHistory }
+      delete pruned[id]
+      pendingHistory = pruned
+      return
+    }
+    const merged = mergeHistoryIntoTimeline(parked, slotFor(id).timeline)
+    patchSlot(id, { timeline: merged, sent: sentFromTimeline(merged), historyLoaded: true })
+    const next = { ...pendingHistory }
+    delete next[id]
+    pendingHistory = next
   }
 
   function clearRunWatchdog(id: string) {
@@ -351,8 +466,68 @@
       [id]: window.setTimeout(() => {
         if (!slotFor(id).running) return
         clearRunWatchdog(id)
-        finishRun(id, '模型超过 3 分钟没有返回任何结果。请检查当前模型的网络连接、额度或中转服务是否正常。')
+        // 若期间已记下 provider 错误，超时文案优先显示真正的失败原因，
+        // 否则用户只会看到"没有返回结果"，仍然不知道是 404 / 401 还是网络问题。
+        const pending = consumeProviderError(id)
+        finishRun(
+          id,
+          pending ||
+            '模型超过 3 分钟没有返回任何结果。请检查当前模型的网络连接、额度或中转服务是否正常。'
+        )
       }, 180000)
+    }
+  }
+
+  /**
+   * provider 错误暂存的三个壳（语义在 run-slot.ts 的纯函数里，可单测）。
+   *
+   * 为什么只是壳：对抗性审查的 M11/M12 变异实证 —— 把这三个函数体整个清成 `return`，
+   * 全套测试照样 61/61 通过（wiring 测试只匹配源码文本，验不了语义）。暂存是本次修复的
+   * 语义核心，写坏就等于让 provider 报错重新"没有反馈"，故把逻辑搬进纯函数并直接单测。
+   */
+  function setProviderError(id: string, raw: string) {
+    providerErrors = stashProviderError(providerErrors, id, raw)
+  }
+
+  function clearProviderError(id: string) {
+    providerErrors = removeProviderError(providerErrors, id)
+  }
+
+  /**
+   * 取走暂存的 provider 错误并转成给用户看的中文归因。
+   * 没有暂存时返回空串 —— 正常结束（stop / aborted / 无错误）绝不能报错。
+   */
+  function consumeProviderError(id: string): string {
+    const taken = takeProviderError(providerErrors, id)
+    providerErrors = taken.stash
+    return taken.message
+  }
+
+  /**
+   * 把当前所有"运行中"的槽改为失败终态并给出原因。
+   * 用于 sidecar 崩溃/被放弃重启这类**永远等不到 agent_settled** 的场景：
+   * 此前只清 pending 请求，running 槽与看门狗都留着，用户看到的就是永久 Thinking。
+   */
+  function abortRunningRuns(message: string) {
+    for (const id of Object.keys(runState)) {
+      if (!runState[id]?.running) continue
+      clearRunWatchdog(id)
+      clearProviderError(id)
+      patchSlot(id, {
+        running: false,
+        phase: 'idle',
+        tool: '',
+        processOpen: false,
+        confirm: undefined,
+        retry: undefined,
+        compacting: false,
+        error: message,
+        // 必须清掉 activeTurnId：finishRun 的早退条件是
+        // `!running && !activeTurnId`，留着它会让之后任何一次 `finishRun(id, '')`
+        // 走进写入分支，用空串把这条"侧车已停止"的提示抹掉。
+        activeTurnId: undefined
+      })
+      markSession(id, 'done')
     }
   }
 
@@ -377,13 +552,52 @@
   }
 
   // 整体替换 runState，保证 Svelte 检测到变化
+  // 注意：对**已关闭/已删除**的会话必须拒绝写入，否则在途事件会把僵尸槽位复活
+  // （见 closedIds 的注释）。这里的判断放在最前面，保证任何路径都拦得住。
   function patchSlot(id: string, patch: Partial<RunSlot>) {
+    if (closedIds.has(id)) return
     runState = { ...runState, [id]: { ...emptySlot(), ...runState[id], ...patch } }
   }
 
-  function finishRun(id: string, errorMessage = '') {
-    clearRunWatchdog(id)
+  /** 会话关掉/删掉时统一登记，之后一切针对它的异步写入都会被 patchSlot 丢弃。 */
+  function markSlotClosed(id: string) {
+    closedIds.add(id)
+    // 缺陷 13：运行中打开一个会话时，磁盘历史会停泊在 pendingHistory 里等 finishRun
+    // 补合。若这个 id 先被关掉/删掉，停泊项既不会被清（patchSlot 此后一律拒绝写入）
+    // 也不会被重试 —— 等同一个 id 被重新创建（remember() 会把 id 放回侧栏）后，
+    // finishRun 一 flush 就把**上一个生命周期**的历史并进新会话，时间线错乱。
+    if (pendingHistory[id]) {
+      const pruned = { ...pendingHistory }
+      delete pruned[id]
+      pendingHistory = pruned
+    }
+    teardownRun(id)
+    if (runState[id]) {
+      const next = { ...runState }
+      delete next[id]
+      runState = next
+    }
+  }
+
+  /** 会话（重新）建立时解除封禁 —— 关闭→重开同一个 id 必须还能用。 */
+  function markSlotOpen(id: string) {
+    closedIds.delete(id)
+  }
+
+  // expectedTurnId 是"发起这次收尾的人所认为的回合"。终态事件（agent_end /
+  // agent_settled / auto_retry_end）都不带回合身份，所以调用方必须在派发时把
+  // 当时的 activeTurnId 钉住传进来 —— 否则点 Stop 后立刻再发一条时，旧回合的
+  // 终态事件会把新回合当成已结束（外部审计缺陷 1：running 归零、半截回复被
+  // 提交成终态，之后 text_delta 再也进不了 timeline，因为本函数会早退）。
+  // 判据本身是纯函数 isTurnCurrent（src/session-run.ts，有单测）。
+  function finishRun(id: string, errorMessage = '', expectedTurnId?: string) {
     const current = slotFor(id)
+    // 守卫必须在清理动作之前：否则陈旧事件会把新回合的看门狗与暂存错误一起清掉。
+    if (!isTurnCurrent(current.activeTurnId, expectedTurnId)) return
+    clearRunWatchdog(id)
+    // 运行已收尾，暂存的 provider 错误必须一并清掉，否则下一次正常结束的会话
+    // 可能被上一次残留的错误文本污染（误报"请求失败"）。
+    clearProviderError(id)
     if (!current.running && !current.activeTurnId) return
     const process = closeOpenSteps(current.process)
     const replyAt = current.reply && !current.replyAt ? Date.now() : current.replyAt
@@ -415,10 +629,14 @@
       timeline
     })
     markSession(id, 'done')
+    // 缺陷 10：运行期间被跳过的磁盘历史在此补进时间线**前面**（当前轮条目按 id
+    // 去重保留），否则那段历史永久丢失。必须在 patchSlot 之后调用：要基于刚写好
+    // 的时间线做合并。
+    flushPendingHistory(id)
     finishSubRun(id, errorMessage ? 'error' : 'done')
     void refreshCtxStats()
     if (!errorMessage && loadPrefs().notifyDone && !sessions.find((item) => item.id === id)?.parentId) desktopNotify('Pi-My', '任务已完成')
-    if (!errorMessage) window.setTimeout(() => drainQueue(id), 40)
+    if (!errorMessage) scheduleDrain(id)
   }
 
   $: if (activeSessionId) todos = loadTodos(activeSessionId)
@@ -447,27 +665,39 @@
 
   function finishSubRun(id: string, status: SubRun['status']) {
     const reply = slotFor(id).reply
-    for (const [parentId, slot] of Object.entries(runState)) {
-      if (!slot.subRuns?.some((run) => run.id === id)) continue
-      patchSlot(parentId, {
-        subRuns: slot.subRuns.map((run) => run.id === id ? { ...run, status, reply } : run)
-      })
+    // 两段式（先收集父槽 id，再逐个重新读取最新槽）：patchSlot 是整体替换，
+    // 若在遍历时用 `Object.entries(runState)` 拿到的旧 `slot.subRuns` 做 map，
+    // 同一轮里对同一父槽的第二次匹配会拿旧值覆盖第一次的结果（丢更新）。
+    // 判定逻辑抽到 src/session-run.ts，由单测固定。
+    for (const update of collectSubRunUpdates(runState, id, status, reply)) {
+      patchSlot(update.parentId, { subRuns: update.subRuns })
     }
     if (viewingSub?.id === id) viewingSub = { ...viewingSub, status, reply }
   }
 
-  function recallMessage(index: number) {
-    const slot = slotFor(activeSessionId)
+  async function recallMessage(index: number) {
+    // 缺陷 12（外部审计 P2）：必须把发起时的会话 id 钉死。`stop()` 是一个真正的
+    // await（它要等 abort 在 sidecar 里结算完），而 activeSessionId 是模块级的 ——
+    // 等待期间用户完全可以切到另一个会话。原先 await 之后重读 activeSessionId，
+    // 于是"在 A 点撤回、等待中切到 B"会把 **B** 的时间线按 B 自己的 userIndex 截断、
+    // 把 B 的已发送列表砍掉，而 A 分毫未动：用户看到的是另一个会话的消息凭空消失。
+    const idAtEntry = activeSessionId
+    const slot = slotFor(idAtEntry)
     const message = slot.sent[index]
     if (!message) return
-    if (slot.running) stop()
+    if (slot.running) await stop()
+    // 等待期间换了目标就整个放弃：文本不再填进输入框，也不写任何槽。
+    if (activeSessionId !== idAtEntry) return
+    // stop() 之后重新取一次：等待期间槽可能已被收尾（running 归零、reply 清空），
+    // 但取的仍是**同一个 id** 的槽。
+    const current = slotFor(idAtEntry)
     inputText = message.text
     mention = null
-    const cutIndex = slot.timeline.findIndex((item) => item.role === 'user' && item.userIndex === index)
-    const timeline = cutIndex >= 0 ? slot.timeline.slice(0, cutIndex) : slot.timeline
+    const cutIndex = current.timeline.findIndex((item) => item.role === 'user' && item.userIndex === index)
+    const timeline = cutIndex >= 0 ? current.timeline.slice(0, cutIndex) : current.timeline
     const previousReply = [...timeline].reverse().find((item) => item.role === 'assistant')
-    patchSlot(activeSessionId, {
-      sent: slot.sent.slice(0, index),
+    patchSlot(idAtEntry, {
+      sent: current.sent.slice(0, index),
       timeline,
       reply: previousReply?.text || '',
       replyAt: previousReply?.timestamp,
@@ -477,6 +707,7 @@
       queueRevision: 0,
       process: [],
       processOpen: false,
+      activeTurnId: undefined,
       phase: 'idle'
     })
     window.setTimeout(() => composerInput?.focus(), 0)
@@ -509,6 +740,12 @@
           else console.warn(`[pi-my] 子代理 "${def.name}" 的模型 ${def.model} 设置失败，已回退默认模型`)
         }
       }
+      // S-1 发送侧（外部审计确证缺陷 1）核查结论：**子代理不需要 turnId**。
+      // 每次 spawnSubagent 都新造一个 childId（见上方 `sub-${Date.now()}-…`），一个槽
+      // 只跑一轮、也只可能有一轮；晚到的 `type:'error'` 回显的 undefined 与
+      // `isTurnCurrent(childId 的 activeTurnId, undefined)` 恒放行恰好同义，不存在
+      // "旧轮错误收尾新回合"的场景。这里的 request 已被 await 且在 try/catch 内，
+      // 也无需补 .catch。
       await request('prompt', { sessionId: childId, text: wrapTask(def, task), cwd: workspacePath, behavior: 'steer', mode: def.mode })
     } catch {
       finishSubRun(childId, 'error')
@@ -529,6 +766,14 @@
   // 记住会话级的模型 / 思考档位选择；无记录时建占位会话
   function remember(id: string, patch: Partial<Session>) {
     if (!id) return
+    // D-D（外部审计 P2）：已关闭/已删除的会话不得复活成"新会话"幽灵标签。
+    // 触发路径：set_model / set_thinking 的 await 之后才 remember（:1382/:1383/:1399），
+    // 若 await 期间用户关掉了这个标签，patchSlot 会因 closedIds 拒绝写槽位，但
+    // remember 只动 sessions 数组 —— 于是一个没有会话文件、点开即空的标签凭空出现。
+    // 合法路径都先 markSlotOpen（它会从 closedIds 里删掉该 id）再 remember：
+    // :1498→:1507（重启重绑）、:1944→:1961（selectSession）、:2249→:2285（dispatchTurn）。
+    // 子代理 id（:717/:724）与 fork 出来的新 id（:2480）从不进入 closedIds，不受影响。
+    if (closedIds.has(id)) return
     const now = Date.now()
     if (!sessions.some((item) => item.id === id)) sessions = [{ id, title: '新会话', time: '刚刚', createdAt: now, modifiedAt: now, ...patch }, ...sessions]
     else sessions = sessions.map((item) => (item.id === id ? { ...item, ...patch, modifiedAt: now } : item))
@@ -536,7 +781,7 @@
 
   function ensureActiveId() {
     if (!activeSessionId) {
-      activeSessionId = `session-${Date.now()}`
+      activeSessionId = nextSessionId()
       activeSession = '新会话'
     }
     return activeSessionId
@@ -687,6 +932,18 @@
       return
     }
     sessions = sessions.map((item) => item.id === session.id ? { ...item, archived: true } : item)
+    // 缺陷 7 的对称化（外部审计 P2）：归档后会话从侧栏消失，此时若它还在运行，180s
+    // 看门狗与 40ms drain 定时器都会带着句柄残留，且用户已无法从列表点进它。
+    // 与 deleteSession 同样处理：先 abort（并记下世代），再统一 teardown。
+    if (activeSessionId === session.id) sessionEpoch.bump()
+    if (slotFor(session.id).running) {
+      runEpoch.markAborted(session.id)
+      if (sidecarReady) await request('abort', { sessionId: session.id }).catch(() => {})
+      teardownRun(session.id)
+      patchSlot(session.id, { running: false, phase: 'idle', activeTurnId: undefined, steer: [] })
+    }
+    // 注意**不** markSlotClosed：归档是可撤销的，取消归档后同一 id 还要能用；
+    // 只有 closeTab / deleteSession 才真正封禁。
     if (activeSessionId === session.id) {
       const next = sessions.find((item) => !item.archived && !item.parentId && item.id !== session.id)
       if (next) void selectSession(next)
@@ -705,24 +962,53 @@
     sessions = sessions.map((item) => item.id === session.id ? { ...item, archived: false } : item)
   }
 
+  /**
+   * 运行相关的统一清理（外部审计缺陷 7：closeTab 有、deleteSession 没有）。
+   *
+   * deleteSession 原先只删 `runState[id]` + 清 provider 暂存，缺三样：
+   *   ① clearRunWatchdog —— 180s 定时器句柄与条目永久残留；
+   *   ② clearDrainTimer —— 40ms 队列 drain 定时器可能正好在删除后触发；
+   *   ③ 运行世代 forget —— 泄漏且可能污染后续同 id 复用；
+   * 且 `activeTurnId` 未清会留下"槽位已删但回合仍在跑"的不一致。
+   * 关标签、删除、归档、abort 全部走这里，保证四者对称。
+   */
+  function teardownRun(id: string) {
+    clearRunWatchdog(id)
+    clearDrainTimer(id)
+    clearProviderError(id)
+    runEpoch.forget(id)
+    runEpoch.clearSuperseded(id)
+  }
+
   async function deleteSession(session: { id: string; title?: string; file?: string }, skipConfirm = false) {
     sessionMenu = null
     if (!skipConfirm) {
       const ok = await confirm(`确定永久删除会话「${session.title}」吗？删除后无法恢复。`, { title: '删除会话', kind: 'warning' })
       if (!ok) return
     }
+    if (activeSessionId === session.id) sessionEpoch.bump()
+    // D-C（外部审计 P2）：deleteSession 原先只 abort、不记中止世代 —— 与 closeTab/
+    // archiveSession 不对称。窗口： abort 会让 SDK 随后发出 agent_end + agent_settled，
+    // 而 markSlotClosed 要到下面的 await 之后才执行；这段时间里槽位既没进 closedIds、
+    // 又从未 markAborted、running 仍为真 ⇒ 迟到的终态事件会被当成正常收尾完整提交：
+    // running 归零、会话被标记 'done'、还会弹"任务已完成"通知。
+    // 这里按 closeTab 的形状补齐：先记世代（挡住迟到终态），再把槽位收回并清掉
+    // activeTurnId，使 :586 的 `!running && !activeTurnId` 早退生效。
+    const wasRunning = slotFor(session.id).running
+    if (wasRunning) {
+      runEpoch.markAborted(session.id)
+      patchSlot(session.id, { running: false, phase: 'idle', activeTurnId: undefined, steer: [] })
+    }
+    if (wasRunning && sidecarReady) await request('abort', { sessionId: session.id }).catch(() => {})
     const response = await requestRaw('delete_session', { sessionId: session.id, file: session.file })
     if (!response.ok) {
       window.alert(response.error || '删除会话失败')
       return
     }
+    // 先登记为已关闭，再删槽位 —— 中间到达的在途事件不会再复活它（缺陷 3）。
+    markSlotClosed(session.id)
     const rest = sessions.filter((item) => item.id !== session.id)
     sessions = rest
-    if (runState[session.id]) {
-      const nextState = { ...runState }
-      delete nextState[session.id]
-      runState = nextState
-    }
     if (activeSessionId === session.id) {
       const next = rest.find((item) => !item.archived && !item.parentId)
       if (next) await selectSession(next)
@@ -738,19 +1024,24 @@
   }
 
   async function closeTab(session: Session) {
+    // 关闭当前会话即作废：正在飞行中的 open_session 响应可能把已关闭的会话
+    // 复活回 runState（它只在最后一步查 activeSessionId，而那时可能还没变）。
+    // 但**不能无条件 bump** —— 关一个后台标签会连带作废当前会话正在加载的历史：
+    // selectSession 在 await 期间 activeSessionId 已指向新会话，epoch 被顶掉后
+    // 新会话的历史就不再落库（切过去一片空白），重启后的重绑循环也会被整体中止。
+    const closingActive = activeSessionId === session.id
+    if (closingActive) sessionEpoch.bump()
     if (slotFor(session.id).running) {
+      // 记下被中止的世代：旧回合的终态事件随后会迟到（缺陷 1），不能被当成
+      // 当前回合的收尾。这里与 stop() 的语义一致。
+      runEpoch.markAborted(session.id)
       if (sidecarReady) await request('abort', { sessionId: session.id }).catch(() => {})
-      clearRunWatchdog(session.id)
-      patchSlot(session.id, { running: false, phase: 'idle', tool: '', processOpen: false, confirm: undefined })
     }
     if (sidecarReady) await request('close_session', { sessionId: session.id }).catch(() => {})
+    // 先封禁再删槽位：await 期间到达的事件不得复活这个已关闭的会话（缺陷 3）。
+    markSlotClosed(session.id)
     const rest = sessions.filter((item) => item.id !== session.id)
     sessions = rest
-    if (runState[session.id]) {
-      const nextState = { ...runState }
-      delete nextState[session.id]
-      runState = nextState
-    }
     if (activeSessionId !== session.id) return
     const next = rest.find((item) => !item.archived && !item.parentId)
     if (next) await selectSession(next)
@@ -1219,20 +1510,7 @@
     // settle 内部会 delete，故在循环之后重建 Map。
     pending.clear()
     for (const [id, settle] of survivors) pending.set(id, settle)
-    for (const id of Object.keys(runState)) {
-      const slot = runState[id]
-      if (!slot?.running) continue
-      clearRunWatchdog(id)
-      patchSlot(id, {
-        running: false,
-        phase: 'idle',
-        tool: '',
-        processOpen: false,
-        confirm: undefined,
-        error: 'Pi Agent 侧车已重启，本次运行被中止。会话文件仍在，可继续对话。'
-      })
-      markSession(id, 'done')
-    }
+    abortRunningRuns('Pi Agent 侧车已重启，本次运行被中止。会话文件仍在，可继续对话。')
     sidecarReady = true
     void refreshCtxStats()
     // sidecar 重启后其内存态 sessions 为空，而前端仍持有会话 id → 文件路径的映射。
@@ -1250,6 +1528,16 @@
       // 把前端记住的模式传给 sidecar，并以回传值校正（重启后 sidecar 内存态已清空，
       // 若不传，plan 会话会被静默重开成默认模式而获得写权限）。
       const response = await requestRaw('open_session', { sessionId: session.id, file: session.file, mode: sessionMode(sessions, session.id) })
+      // 重连期间用户可能已经关掉/删掉这个会话：它已不在 sessions 里，写回去会凭空
+      // 造出一个没人持有的槽。**只能跳过这一个，绝不能因切换而 break** —— 切换标签
+      // 同样会推进代数，而重连的职责恰恰是把**所有**会话重新绑回 sidecar；中途放弃
+      // 会让剩下那些会话的 file 与 sidecar 内存态脱钩，下次发送静默新建文件、丢掉历史
+      // （正是本函数存在要防的那件事）。
+      if (!sessions.some((item) => item.id === session.id)) continue
+      // 这个 id 仍在会话列表里（用户可见的标签/行）→ 必须解除 closedIds 封禁，
+      // 否则下面所有 patchSlot 写入都会被静默丢弃，会话重绑等于没做。
+      // 位置放在成员资格检查**之后**：真正已被关闭/删除的 id 不该在这里复活。
+      markSlotOpen(session.id)
       if (!response.ok) {
         // 会话文件已不可读 → 下次发送前必须重建，否则会写进新文件。
         // 只标记 historyLoaded（file 字段在 RunSlot 上不存在，真正清理在下面的 sessions.map）。
@@ -1300,20 +1588,33 @@
       }
       if (payload.type === 'sidecar-failed') {
         sidecarReady = false
+        const message = String(payload.message ?? 'Pi Agent 侧车已停止运行，请重启应用。')
         for (const [id, settle] of pending) {
-          settle({ type: 'response', id, ok: false, result: null, error: String(payload.message ?? 'Pi Agent 不可用') })
+          settle({ type: 'response', id, ok: false, result: null, error: message })
         }
         pending.clear()
-        window.alert(String(payload.message ?? 'Pi Agent 侧车已停止运行，请重启应用。'))
+        // sidecar 已被放弃自动重启 → 之后**永远不会有** agent_settled。
+        // 此前只 fail 了 pending 请求，running 槽与看门狗都留着：若看门狗恰好
+        // 已被 auto_retry_*/compaction_* 心跳续期，界面就会永久停在 Thinking。
+        abortRunningRuns(message)
+        window.alert(message)
       }
       if (payload.type === 'confirm_request') {
-        patchSlot(payload.sessionId || activeSessionId, { phase: 'waiting', confirm: { confirmId: String(payload.confirmId ?? ''), toolName: String(payload.toolName ?? ''), summary: String(payload.summary ?? '') } })
-        if (loadPrefs().notifyConfirm) desktopNotify('Pi-My', '需要确认工具调用')
+        const confirmSessionId = payload.sessionId || activeSessionId
+        patchSlot(confirmSessionId, { phase: 'waiting', confirm: { confirmId: String(payload.confirmId ?? ''), toolName: String(payload.toolName ?? ''), summary: String(payload.summary ?? '') } })
+        // D-B：通知里带上会话名 —— 后台会话的确认不会渲染在主区域（另有 pendingConfirms
+        // 浮动面板兜底），通知是用户切走期间唯一的线索。
+        if (loadPrefs().notifyConfirm) {
+          const title = sessions.find((item) => item.id === confirmSessionId)?.title
+          desktopNotify('Pi-My', title ? `「${title}」需要确认工具调用` : '需要确认工具调用')
+        }
       }
       // 扩展 UI 请求（0-4）：select / input / editor / confirm。
       // 必须响应，否则扩展的 await 会永久挂住（整个 agent 卡住）。
       if (payload.type === 'ui_dialog_request') {
-        extDialog = {
+        // D-F：入队而不是整体覆盖。只有队首（用户即将看到的那个）才用 prefill
+        // 初始化输入框 —— 后面排队的对话框等成为队首时再由 answerExtDialog 重置。
+        const dialog: ExtDialog = {
           dialogId: String(payload.dialogId ?? ''),
           kind: String(payload.kind ?? 'input') as ExtDialog['kind'],
           title: String(payload.title ?? ''),
@@ -1322,7 +1623,9 @@
           placeholder: payload.placeholder ? String(payload.placeholder) : undefined,
           prefill: payload.prefill ? String(payload.prefill) : undefined,
         }
-        extDialogValue = payload.prefill ? String(payload.prefill) : ''
+        const wasEmpty = extDialogs.length === 0
+        extDialogs = [...extDialogs, dialog]
+        if (wasEmpty) extDialogValue = dialog.prefill ?? ''
         if (loadPrefs().notifyConfirm) desktopNotify('Pi-My', '扩展需要你的输入')
       }
       // 扩展发起的通知：带来源归因，便于用户知道是哪个扩展在说话
@@ -1333,11 +1636,23 @@
         window.setTimeout(() => { extToasts = extToasts.slice(1) }, 6000)
       }
       // 2-7：对话框超时提示（回落语义 sidecar 已按 kind 处理，这里让用户知道发生过）
-      if (payload.type === 'dialog_expired' && payload.fallback === 'default') {
-        const kindLabel = payload.kind === 'confirm' ? '确认框' : payload.kind === 'select' ? '选择框' : '对话框'
-        const text = `扩展${kindLabel}超时未回答，已按默认值继续`
-        extToasts = [...extToasts, { id: `t${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, text, type: 'warning' }].slice(-3)
-        window.setTimeout(() => { extToasts = extToasts.slice(1) }, 6000)
+      // D-F：无论是否回落成默认值，都要把该对话框从队列里摘掉 —— 否则一个已经
+      // 超时作废的对话框会永远卡在队首，把后面所有排队的请求全部挡住。
+      if (payload.type === 'dialog_expired') {
+        const expiredId = String(payload.dialogId ?? '')
+        if (expiredId) {
+          const nextQueue = extDialogs.filter((item) => item.dialogId !== expiredId)
+          if (nextQueue.length !== extDialogs.length) {
+            extDialogs = nextQueue
+            extDialogValue = nextQueue[0]?.prefill ?? ''
+          }
+        }
+        if (payload.fallback === 'default') {
+          const kindLabel = payload.kind === 'confirm' ? '确认框' : payload.kind === 'select' ? '选择框' : '对话框'
+          const text = `扩展${kindLabel}超时未回答，已按默认值继续`
+          extToasts = [...extToasts, { id: `t${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, text, type: 'warning' }].slice(-3)
+          window.setTimeout(() => { extToasts = extToasts.slice(1) }, 6000)
+        }
       }
       // 扩展要求把文本放进输入框（pasteToEditor / setEditorText）
       if (payload.type === 'ext_editor_text') {
@@ -1373,7 +1688,64 @@
         const event = payload.event
         if (!event) return
         const id = payload.sessionId || activeSessionId
-        touchRunWatchdog(id)
+        if (!id) return
+        // 已关闭/已删除的会话不再接受任何事件（缺陷 3 的入口防线）。patchSlot 本身
+        // 也会拒绝，但事件涟漪还会调 touchRunWatchdog / markSession / startToolStep，
+        // 那些不走 patchSlot，必须在入口就拦掉，否则会重新武装一个无人能停的看门狗。
+        if (closedIds.has(id)) return
+        // 场景：回合 A 流式中点 Stop，紧接着又发了回合 B。A 的终态事件是在 abort
+        // 请求飞行期间发出的，会**迟到**；而 SDK 的事件不带回合身份。若放行，它们
+        // 会把新回合 B 当成已结束（缺陷 1：running 归零、半截回复被提交成终态，
+        // 之后 B 的 text_delta 再也进不了 timeline，因为 finishRun 会早退）。
+        // 判据：abort 之后是否又派发过新一轮 —— sidecar 的 serialChain 保证 abort
+        // 请求在下一轮 prompt 之前完成，所以此刻到达的非 agent_start 事件必属旧轮。
+        // 标记只在**新一轮真正开始**（agent_start）时解除，不能在这里消费：
+        // 一次失败会连发 agent_end + agent_settled 两条终态事件，提前消费会让第二条
+        // 被误当成当前轮的收尾，缺陷照旧。
+        // D-A（外部审计 P1）：preflight 阶段（模型校验/鉴权/自动压缩/扩展钩子）点"停止"
+        // 是**无效**的 —— SDK 的 `agent.abort()` 只对已建立的 activeRun 生效
+        //（pi-agent-core/dist/agent.js:202 `this.activeRun?.abortController.abort()`），
+        // 而那时 activeRun 还不存在；这一轮随后照常进入 loop，并无条件发 `agent_start`
+        //（agent-loop.js:49 之前没有任何 signal 检查）。旧代码在下面 agent_start 分支
+        // 里无条件 `patchSlot({running:true})`，把用户刚按下的停止原样撤销；而
+        // activeTurnId 已被 stop() 清空 ⇒ 此后所有回合判据恒真，用户只能等 180s
+        // 看门狗超时，还被归因成"模型超过 3 分钟没有返回"。
+        // 判据必须在下面 `clearSuperseded` **之前**取：它会把 abortedAt 删掉。
+        const startedButAborted = event.type === 'agent_start' && runEpoch.isAborted(id)
+        // D-A 残留（Lead 复现）：这里**只在本轮不是"被停掉的那一轮"时才解标记**。
+        // 原先无条件 `if (event.type === 'agent_start') clearSuperseded(id)` 让下面早退
+        // 分支注释里"标记要留着拦住这一轮随后迟到的 agent_end/agent_settled"变成空话：
+        // 早退后 running 仍为假、activeTurnId 仍为空，用户随即再发一条 ⇒ dispatch 推进到
+        // 新一代、running 重新为真；此时旧轮迟到的 agent_end 因为标记已被删而不算
+        // superseded，被放行 → isTurnCurrent(新回合, undefined) 恒真且 running 为真 ⇒
+        // 旧轮终态把新回合完整收尾打死（探针实测：`旧轮终态提交收尾，新轮被打死`）。
+        // 保留标记则 dispatch 后 `current > aborted` 成立 ⇒ 旧轮终态被正常丢弃；
+        // 而**新一轮自己的 agent_start** 到达时 startedButAborted 为假，依旧会解标记，
+        // 新轮事件照常流动（这条清除不能省：isSuperseded 判的正是 current > aborted，
+        // 不解标记会把新轮自己的全部事件当成旧轮丢掉）。
+        if (event.type === 'agent_start' && !startedButAborted) runEpoch.clearSuperseded(id)
+        else if (runEpoch.isSuperseded(id)) {
+          // 例外：sidecar 的 type:'error'（PI/sidecar/index.mjs:1744，prompt 的 .catch）
+          // 绝不能在此静默丢弃。标记被武装 = 新一轮还没发出 agent_start，而新一轮**在
+          // agent_start 之前**失败时（无模型 / 鉴权失败 / 压缩进行中 / 扩展在
+          // emitBeforeAgentStart 里抛错）恰恰只会发出这一条 error —— 丢掉它，前端就
+          // 永远等不到解标记的消息：running 卡在 true，180s 看门狗给出错误归因，且此后
+          // submit 会走 steer 分支、再也不经 dispatchTurn，于是 agent_start 永不到来，
+          // 会话彻底卡死（外部审计缺陷 4）。
+          // 放行它的代价可控：标记仍武装 ⇒ 新一轮尚未开始，迟到的旧轮终态事件（agent_end
+          // / agent_settled）依旧被拦住，不会把新轮误判为结束。
+          if (event.type !== 'error') return
+        }
+        // 自动重试的心跳不算"有进展"：否则 auto_retry_start/end 会不断续期看门狗，
+        // 一个反复失败又反复重试的模型可以让界面永远停在 Thinking。
+        if (event.type !== 'auto_retry_start' && event.type !== 'auto_retry_end') touchRunWatchdog(id)
+        // provider 失败时 SDK 不发 type:'error'，只给一条 stopReason:'error' 的 assistant
+        // 终态消息。这里先暂存，等**真正的终态**（agent_end 且不重试 / agent_settled）再报。
+        // 正常结束时 assistantErrorFrom 返回空串，会顺手清掉上一次的暂存，避免误报。
+        if (event.type === 'message_end' && (event.message as { role?: string })?.role === 'assistant') {
+          setProviderError(id, assistantErrorFrom(event.message))
+        }
+        if (event.type === 'turn_end') setProviderError(id, assistantErrorFrom(event.message))
         if (event.type === 'message_update') {
           const assistantEvent = event.assistantMessageEvent
           const eventType = String(assistantEvent?.type || '')
@@ -1425,7 +1797,35 @@
             patchSlot(id, { images: [...(slot.images ?? []), ...images] })
           }
         }
-        if (event.type === 'agent_start') { markThinking(id); patchSlot(id, { running: true, error: '' }); markSession(id, 'active') }
+        if (event.type === 'agent_start') {
+          // D-A：这一轮在 preflight 阶段就被用户停过（上面的 startedButAborted）。
+          // 停止必须作数：此刻 agent_start 已到达，说明 `agent.activeRun` 已经建立
+          //（agent.js:330-343 在跑 executor 之前就赋了 activeRun），**补发一次 abort
+          // 是有效的** —— 这正好补上 preflight 期那次空操作。然后不 markThinking、
+          // 不把 running 打回 true、不 markSession。
+          // D2（外部对抗性审查确证回归）：这里**不能** clearRunWatchdog 把它拆掉。
+          // :1741 刚为这个事件重新武装了 180s 看门狗；若补发的 abort 因 IPC 失败或
+          // sidecar 悬挂而丢失，stop() 的 `.then` 永不落地，而唯一还能自救的兜底就是
+          // 这个看门狗。touchRunWatchdog 在 running 已为假时是空转（回调首行
+          // `if (!slotFor(id).running) return`），running 仍为真时则会给出真正的超时
+          // 反馈 —— 两种情况都不会误报，因此比直接拆掉严格更安全。
+          // 也不在此 clearSuperseded：标记要留着拦住这一轮随后迟到的终态事件（它们会走
+          // finishRun，但那时 running 已为假、activeTurnId 已为空，:601 会早退，因此
+          // 不会误报"任务已完成"）。下一次 dispatch 会推进世代，标记自然失效。
+          if (startedButAborted) {
+            if (sidecarReady) {
+              void request('abort', { sessionId: id }).catch((error) => {
+                // 补发中止失败必须可观测：这是"停止没停干净"的唯一线索。
+                console.warn('[pi-my] 补发中止失败：', error)
+              })
+            }
+            touchRunWatchdog(id)
+            return
+          }
+          markThinking(id)
+          patchSlot(id, { running: true, error: '' })
+          markSession(id, 'active')
+        }
         // 自动重试状态行（1-7）：SDK 在流中断等场景会自动重试，此前用户只看到"卡住"。
         if (event.type === 'auto_retry_start') {
           patchSlot(id, {
@@ -1434,18 +1834,47 @@
             retry: { attempt: Number(event.attempt ?? 0), reason: String(event.errorMessage ?? event.reason ?? '网络波动') },
           })
         }
-        if (event.type === 'auto_retry_end') patchSlot(id, { retry: undefined })
+        if (event.type === 'auto_retry_end') {
+          patchSlot(id, { retry: undefined })
+          // 重试彻底失败（`success:false`）时 SDK 给出 `finalError`，这是最权威的
+          // 失败原因，比从消息里翻更可靠；同时它标志着该次运行即将收尾。
+          // 但用户主动 Stop 会打断退避 sleep，SDK 随即发
+          // `auto_retry_end{success:false, finalError:"Retry cancelled"}`
+          //（agent-session.js:2315-2326）—— 那是"用户自己按了停止"，不是 provider 故障，
+          // 记下来就会在收尾时弹出莫名其妙的"请求失败"。故此处必须过滤掉。
+          if (event.success === false) {
+            const finalError = String(event.finalError ?? '')
+            if (!isCancellationText(finalError)) setProviderError(id, finalError)
+          }
+        }
         // 1-2 上下文蒸发：SDK 自动/手动压缩事件（此前透传但被忽略，用户只见"卡住"）
         if (event.type === 'compaction_start') patchSlot(id, { compacting: true, phase: 'thinking' })
         if (event.type === 'compaction_end') patchSlot(id, { compacting: false })
         if (event.type === 'agent_end') {
+          // agent_end.messages 是权威终态数据（event-slim 只瘦化 role==='toolResult' 的项，
+          // assistant 的 stopReason/errorMessage 原样保留）。在这里再取一次，避免只依赖
+          // turn_end 的事件顺序。
+          setProviderError(id, assistantErrorFrom(event.messages))
           // Pi SDK 在自动重试/压缩前也会发 agent_end，这时不能提前显示结束。
+          // willRetry 为真时**必须保留**暂存的错误文本：下一轮若仍然失败，它就是
+          // 最终原因；若下一轮成功，agent_end(willRetry:false) 会携带正常消息并清空它。
           if (event.willRetry) patchSlot(id, { running: true, phase: 'thinking', processOpen: true })
-          else finishRun(id)
+          else finishRun(id, consumeProviderError(id))
         }
-        if (event.type === 'agent_settled') finishRun(id)
+        // agent_settled 是 SDK 保证到达的**唯一终态信号**（agent-session.js:347）。
+        // 它一定会发，因此是兜底：即使前面 agent_end 因 willRetry 被跳过、或压缩
+        // 触发了一次 continue，这里也能把 running 收回并显示真正的失败原因。
+        if (event.type === 'agent_settled') finishRun(id, consumeProviderError(id))
         if (event.type === 'turn_end' && slotFor(id).running && !slotFor(id).reply.trim()) patchSlot(id, { phase: 'thinking' })
-        if (event.type === 'error') finishRun(id, String(event.message || 'Agent 请求失败'))
+        if (event.type === 'error') {
+          clearProviderError(id)
+          // S-1：sidecar 的这条 error 是在 prompt 的 .catch 里发的，**整轮不被 await**，
+          // 可以晚到（PI/sidecar/index.mjs 的 prompt 处理器）。若期间已派发了新回合，
+          // 不传回合身份就会把上一轮的错误写到新回合上（红条闪现）。sidecar 已把请求
+          // 里的 turnId 回显到事件上，这里原样当作 expectedTurnId 用 —— 旧 sidecar 不带
+          // 该字段时为 undefined，退回原先"一律放行"的语义。
+          finishRun(id, String(event.message || 'Agent 请求失败'), (event as { turnId?: string }).turnId)
+        }
       }
     })
     try {
@@ -1623,6 +2052,18 @@
       return
     }
     branchOpen = false
+    // 用户显式打开一个会话 = 该 id 重新活跃，必须解除 closedIds 封禁。
+    // 缺口背景：markSlotOpen 原先只在 dispatchTurn 里调用，而关闭标签/删除会话后
+    // 同一 id 完全可能重新出现在侧栏（remember() 是那 13 个调用点唯一的入口，
+    // 例如关闭期间某个在飞的 open_session 回读 mode 走了 `remember(session.id, ...)`，
+    // 或 setMode/setModel 抢先落库）。此时点开会话：patchSlot 因为 closedIds 命中而
+    // 静默丢弃一切写入 —— 包括 applySessionHistory 的历史和"读取历史会话失败"的错误，
+    // 界面永远空白，且只有用户真的在这个会话里再发一条消息（走 dispatchTurn）才解禁。
+    markSlotOpen(session.id)
+    // 每次切换会话都推进代数：open_session 是慢请求，期间用户可能又切走、
+    // 甚至关掉再重开同一个 id。仅比对 id 无法区分"同一 id 的新一代"，
+    // 晚到的历史/错误就会落到新状态上（陈旧响应覆盖）。
+    const epoch = sessionEpoch.bump()
     activeSessionId = session.id
     activeSession = session.title
     todos = loadTodos(session.id)
@@ -1630,6 +2071,8 @@
       // 传当前会话记录的模式，并以 sidecar 回传的实际模式为准校正 UI。
       // 修复：旧实现不传也不回读 mode，导致"UI 显示计划模式、sidecar 实际是 ask"的失同步。
       const opened = await requestRaw('open_session', { sessionId: session.id, file: session.file, mode: sessionMode(sessions, session.id) })
+      // 期间已切走 / 又切了一次 / 会话已被关闭 → 这次响应作废，绝不写回状态。
+      if (!sessionEpoch.check(epoch) || activeSessionId !== session.id) return
       if (opened.ok) {
         const result = opened.result as { history?: Array<{ id?: string; role: 'user' | 'assistant'; text: string; timestamp?: number; userIndex?: number; entryId?: string }>; mode?: string }
         applySessionHistory(session.id, result?.history)
@@ -1765,8 +2208,8 @@
   }
 
 
-  function answerConfirm(ok: boolean) {
-    const id = activeSessionId
+  function answerConfirm(ok: boolean, sessionId = activeSessionId) {
+    const id = sessionId
     const confirm = runState[id]?.confirm
     if (!confirm) return
     patchSlot(id, { confirm: undefined })
@@ -1784,8 +2227,10 @@
   ) {
     const dialog = extDialog
     if (!dialog) return
-    extDialog = null
-    extDialogValue = ''
+    // D-F：出队（而不是把全局单值置空），并让下一个排队者的 prefill 接管输入框。
+    const rest = extDialogs.filter((item) => item.dialogId !== dialog.dialogId)
+    extDialogs = rest
+    extDialogValue = rest[0]?.prefill ?? ''
     if (!sidecarReady) return
     void request('ui_dialog_response', {
       dialogId: dialog.dialogId,
@@ -1891,9 +2336,19 @@
       patchSlot(id, {
         sent: [...slot.sent, { text, at }],
         steer: [...slot.steer, text],
-        timeline: [...slot.timeline, { id: `user-${Date.now()}`, role: 'user', text, at, timestamp: Date.now(), userIndex }]
+        // 与 dispatchTurn 同理：同一毫秒内连发两条插话会撞出重复 key（timeline 以 message.id 为 key）。
+        timeline: [...slot.timeline, { id: `user-${nextTurnId()}`, role: 'user', text, at, timestamp: Date.now(), userIndex }]
       })
-      if (sidecarReady) void request('prompt', { sessionId: id, text, cwd: workspacePath, behavior: 'steer' })
+      // S-1 发送侧（外部审计确证缺陷 1）：插话同样是 prompt，同样会在 sidecar 里产生
+      // `type:'error'`。不带上 turnId 时 sidecar 回显的就是 undefined，而
+      // `isTurnCurrent(X, undefined)` 恒放行 —— 一旦这条 error 晚到（prompt 处理器整轮
+      // 不被 await，而 sidecar 的串行链保证不了它与下一轮 dispatch 的先后），它会把
+      // **新回合**整个收尾：running 归零、activeTurnId 清空、半截回复被提交成终态。
+      // 插话注入的正是当前这一轮，所以回合号直接取 activeTurnId。
+      // 顺带补 .catch：原先 `void request(...)` 在 RPC 层失败时会变成未处理的 rejection。
+      if (sidecarReady) {
+        void request('prompt', { sessionId: id, text, cwd: workspacePath, behavior: 'steer', turnId: slotFor(id).activeTurnId }).catch(() => {})
+      }
       return
     }
     dispatchTurn(id, text, behavior)
@@ -1905,7 +2360,22 @@
     const at = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     const timestamp = Date.now()
     const userIndex = slot.sent.length
-    const activeTurnId = `turn-${timestamp}`
+    const activeTurnId = nextTurnId()
+    // 新一轮开始：清掉上一轮的 provider 错误暂存，否则它会污染本次运行的结果。
+    clearProviderError(id)
+    // 推进运行世代（缺陷 1）：从这一刻起，任何"abort 之后才到达的旧轮终态事件"
+    // 都能被 event 入口识别并丢弃。
+    //
+    // ⚠️ 这里**绝不能**顺手 clearSuperseded(id)。曾经的写法是 dispatch + clear 一起做，
+    // 理由是"新一轮已经开始，上一轮的标记该解除了"——但派发只是发出了 prompt，旧轮的
+    // 终态事件正是在 abort 飞行期间、新一轮 agent_start 之前到达的：提前清掉标记，
+    // event 入口的 isSuperseded 在这个唯一该起作用的窗口里恒为 false，旧 agent_end /
+    // agent_settled 被当成新回合的收尾（running 归零、activeTurnId 清空、半截回复提交成
+    // 终态），之后新回合的 text_delta 因 finishRun 早退再也进不了 timeline —— 正是缺陷 1
+    // 的原症状。标记必须活到新一轮真正开始（agent_start），由事件入口解除。
+    runEpoch.dispatch(id)
+    // 派发即代表这个 id 重新活跃（关闭→重开同一 id 的场景），解除封禁。
+    markSlotOpen(id)
     patchSlot(id, {
       sent: [...slot.sent, { text, at }],
       timeline: [...slot.timeline, { id: `user-${activeTurnId}`, role: 'user', text, at, timestamp, userIndex }],
@@ -1926,6 +2396,12 @@
       const pendingFiles = attachments
       attachments = []
       attachError = ''
+      // 缺陷 4（外部审计 P1）：这段前奏有多个 await（create_session / read_attachment /
+      // vision_describe），期间用户完全可能把标签关掉或删掉会话。原先全程没有存活校验，
+      // 于是最后仍然会发出 prompt —— 而 sidecar 的 prompt 处理器当时还会**静默重建会话**
+      // 并真跑模型，前端这边却已无标签无槽无看门狗：一个无法查看、无法停止的僵尸运行。
+      // sidecar 侧已改为"会话不存在就报错"，这里再补上前端的存活校验作为第一道防线。
+      const stillMine = () => isTurnAlive(closedIds.has(id), slotFor(id).activeTurnId, activeTurnId)
       void (async () => {
         const rec = sessions.find((item) => item.id === id)
         if (!rec?.file) {
@@ -1934,11 +2410,13 @@
           const payload: Record<string, unknown> = { sessionId: id, cwd: workspacePath, mode: rec?.mode ?? defaults.mode }
           if (rawThinking && THINKING_LEVELS.includes(rawThinking)) payload.thinking = rawThinking
           const created = await request('create_session', payload) as { id: string; file?: string } | null
+          if (!stillMine()) return
           if (created?.file) remember(id, { file: created.file })
           const model = sessions.find((item) => item.id === id)?.model
           if (model) {
             const [provider, modelId] = model.split(MODEL_SEPARATOR)
             await request('set_model', { sessionId: id, provider, modelId })
+            if (!stillMine()) return
           }
         }
         const extra = [] as typeof pendingFiles
@@ -1946,6 +2424,7 @@
           const hit = files.find((file) => file.kind === 'file' && (file.path === name || fileName(file.path) === name))
           if (!hit || extra.concat(pendingFiles).some((file) => file.name === fileName(hit.path))) continue
           const res = await requestRaw('read_attachment', { cwd: workspacePath, path: hit.path })
+          if (!stillMine()) return
           if (res.ok) extra.push(res.result as typeof pendingFiles[number])
         }
         const outgoing = [...pendingFiles, ...extra]
@@ -1954,43 +2433,74 @@
           if (file.kind !== 'image' || !file.data) { bridged.push(file); continue }
           try {
             const vision = await request('vision_describe', { data: file.data, mimeType: file.mimeType }) as { skipped?: boolean; description?: string }
+            if (!stillMine()) return
             if (vision?.skipped || !vision?.description) bridged.push(file)
             else bridged.push({ kind: 'text', name: `${file.name}.vision.txt`, content: `[视觉桥] ${file.name}\n${vision.description}` })
           } catch {
             bridged.push(file)
           }
         }
-        await request('prompt', { sessionId: id, text, cwd: workspacePath, behavior, attachments: bridged })
+        if (!stillMine()) return
+        // S-1：把回合身份随 prompt 一起发给 sidecar，它会在 prompt 失败时把 turnId 回显到
+        // type:'error' 事件上（sidecar 的 prompt 处理器整轮不被 await，这条 error 可以
+        // 晚到）。事件入口据此传给 finishRun 当 expectedTurnId，避免把上一轮的错误
+        // 写到新回合上。旧 sidecar 不带该字段 ⇒ 事件上没有 turnId ⇒ 退回旧语义。
+        await request('prompt', { sessionId: id, text, cwd: workspacePath, behavior, attachments: bridged, turnId: activeTurnId })
       })()
         .then(() => { if (newTitle) void request('rename_session', { sessionId: id, name: newTitle }) })
         .catch((error) => {
-          finishRun(id, error instanceof Error ? error.message : '发送请求失败，请检查 sidecar 是否仍在运行。')
+          // 精确回合守卫（审查者 S1）：这条 prompt 的失败只属于**本次派发**。
+          // 若 await 期间用户已 Stop 并发了新一条，把错误写到新回合上会误报。
+          // 与 finishRun 的世代守卫不同，这里手上的回合身份是明确的，直接比。
+          if (!isTurnCurrent(slotFor(id).activeTurnId, activeTurnId)) return
+          finishRun(id, error instanceof Error ? error.message : '发送请求失败，请检查 sidecar 是否仍在运行。', activeTurnId)
         })
     } else {
-      window.setTimeout(() => patchSlot(id, { running: false, phase: 'idle' }), 1400)
+      // sidecar 未就绪：这一轮不会有任何事件回来，必须立刻收掉看门狗定时器 ——
+      // 否则它会在 180 秒后把「模型超过 3 分钟没有返回任何结果」的错误盖到界面上。
+      clearRunWatchdog(id)
+      // 延迟收起运行态（让用户看得见"已发送"），但要确认这一轮没有被更晚的派发取代：
+      // 期间用户可能又发了一条，此时无条件置 idle 会把新回合的运行态抹掉。
+      window.setTimeout(() => {
+        clearRunWatchdog(id)
+        if (slotFor(id).activeTurnId !== activeTurnId) return
+        patchSlot(id, { running: false, phase: 'idle', activeTurnId: undefined })
+      }, 1400)
     }
   }
 
   function drainQueue(id: string) {
     const slot = slotFor(id)
     if (slot.running || !slot.queue.length) return
-    const [, ...rest] = slot.queue
-    patchSlot(id, { queue: rest, queueRevision: slot.queueRevision + 1 })
-    dispatchTurn(id, slot.queue[0].text, 'steer')
+    // CAS 出队：finishRun 里的 40ms 定时器与用户手动 removeQueue/moveQueue 在**时间上**
+    // 会交错，纯"读→写"会让已移除的项复活、或同一项被派发两次。
+    // ⚠️ 诚实标注（外部审计缺陷 8）：目前读与写之间没有 await，所以 expected 恒等于
+    // revision、拒绝分支不可达。它现在的价值是"把意图写成可单测的代码"+"将来 drain
+    // 一旦引入 await 立刻生效"，而不是当前就存在的保护 —— 旧注释宣称的"有并发保护"
+    // 与事实不符，已改掉。逻辑在 src/session-run.ts 的 planDrain（纯函数，有单测）。
+    const expected = slot.queueRevision
+    const plan = planDrain(slot.queue, slot.queueRevision, expected)
+    if (!plan) return
+    patchSlot(id, { queue: plan.queue, queueRevision: plan.revision })
+    dispatchTurn(id, plan.text, 'steer')
   }
 
-  // 2-4 队列 CAS：上移/下移/移除都基于读到的 revision 做乐观并发；
-  // stale（期间被 drain/其他操作改过）时拒绝本次操作，避免丢更新或"复活"已出队的项。
+  // 2-4 队列 CAS：上移/下移/移除都基于读到的 revision 做乐观并发。
+  // ⚠️ 与 drainQueue 同理（缺陷 8）：这些函数目前是同步读→算→写，expected 必然等于
+  // revision，所以 stale 分支当前**不可达**；这里是留好的并发保护接口，不是既有保护。
+  // reorder/remove 额外校验 id 全集，那一层是**当前就生效**的（防止用旧集合复活已移除项）。
   function moveQueue(index: number, dir: -1 | 1) {
     const slot = slotFor(activeSessionId)
-    const result = casReorder(slot.queue, slot.queueRevision, slot.queueRevision, index, dir, slot.queue.map((item) => item.id))
+    const expected = slot.queueRevision
+    const result = casReorder(slot.queue, slot.queueRevision, expected, index, dir, slot.queue.map((item) => item.id))
     if (!result.ok) return
     patchSlot(activeSessionId, { queue: result.value, queueRevision: result.revision })
   }
 
   function removeQueue(id: string) {
     const slot = slotFor(activeSessionId)
-    const result = casRemove(slot.queue, slot.queueRevision, slot.queueRevision, id)
+    const expected = slot.queueRevision
+    const result = casRemove(slot.queue, slot.queueRevision, expected, id)
     if (!result.ok) return
     patchSlot(activeSessionId, { queue: result.value, queueRevision: result.revision })
   }
@@ -2071,11 +2581,18 @@
   /** 2-3 worktree 分叉：在独立 git worktree 里开分支会话（风险改动与主工作区隔离）。 */
   async function forkWorktree(userMessageIndex = -1) {
     if (forkBusy || !sidecarReady) return
-    const parentTitle = sessions.find((item) => item.id === activeSessionId)?.title || '当前会话'
+    // 同 forkAtUserIndex：worktree 分叉也要落盘 + 重扫目录，先把来源会话钉死，
+    // 否则失败提示会落到用户分叉期间切到的那个会话上。
+    const parentId = activeSessionId
+    const parentTitle = sessions.find((item) => item.id === parentId)?.title || '当前会话'
+    // 缺陷 6（外部审计 P1）：分叉是慢请求，期间用户完全可能切到别的会话。原先这里
+    // 无条件 `activeSessionId = created.id`，会把用户已经切过去的会话**夺走**。
+    // 钉住派发时的 epoch，回来时只有"用户没换过会话"才接管。
+    const epoch = sessionEpoch.current()
     forkBusy = true
     try {
       const response = await requestRaw('create_worktree_fork', {
-        sourceSessionId: activeSessionId,
+        sourceSessionId: parentId,
         userMessageIndex,
         label: parentTitle,
       })
@@ -2089,16 +2606,20 @@
         file: created.file,
         cwd: created.cwd,
         branch: created.branch,
-        branchParentId: activeSessionId,
+        branchParentId: parentId,
         createdAt: now,
         modifiedAt: now,
       }, ...sessions]
       remember(created.id, { file: created.file, cwd: created.cwd, branch: created.branch, readOnly: false })
-      activeSessionId = created.id
-      activeSession = `🌳 worktree · ${parentTitle}`
-      patchSlot(created.id, { error: '' })
+      // 分叉本身已经成功（会话已建好、已入列表），只是"是否切换到它"要尊重用户
+      // 在这段时间里的操作。没换会话才自动切过去。
+      if (activeSessionId === parentId && sessionEpoch.check(epoch)) {
+        activeSessionId = created.id
+        activeSession = `🌳 worktree · ${parentTitle}`
+        patchSlot(created.id, { error: '' })
+      }
     } catch (error) {
-      patchSlot(ensureActiveId(), { error: error instanceof Error ? error.message : String(error) })
+      patchSlot(parentId, { error: error instanceof Error ? error.message : String(error) })
     } finally {
       forkBusy = false
     }
@@ -2108,18 +2629,23 @@
     if (forkBusy || !sidecarReady) return
     const slot = slotFor(activeSessionId)
     if (userMessageIndex < 0) return
+    // 分叉是慢请求（要落盘 + 重扫目录），期间用户完全可能切到别的会话。
+    // 先把来源会话钉死在这里：失败提示必须回到发起分叉的那个会话，
+    // 否则 catch 里现读 activeSessionId 会把错误糊到无关会话上。
+    const parentId = activeSessionId
+    // 缺陷 6（外部审计 P1）：同 forkWorktree —— 分叉回来后不得夺走用户已切到的会话。
+    const epoch = sessionEpoch.current()
     forkBusy = true
     try {
-      const forkId = `session-${Date.now()}`
+      const forkId = nextSessionId()
       const response = await requestRaw('fork_session', {
-        sourceSessionId: activeSessionId,
+        sourceSessionId: parentId,
         sessionId: forkId,
         userMessageIndex,
         position: 'before'
       })
       if (!response.ok) throw new Error(response.error || '创建分支失败')
       const created = response.result as { id: string; file?: string; parentFile?: string; cwd?: string; selectedText?: string; history?: Array<{ id?: string; role: 'user' | 'assistant'; text: string; timestamp?: number; userIndex?: number; entryId?: string }> }
-      const parentId = activeSessionId
       const parentTitle = sessions.find((item) => item.id === parentId)?.title || '当前会话'
       const previousMessages = slot.sent.slice(0, userMessageIndex).map((item) => ({ ...item }))
       const now = Date.now()
@@ -2134,27 +2660,78 @@
         createdAt: now,
         modifiedAt: now
       }, ...sessions]
-      activeSessionId = created.id
-      activeSession = `分支 · ${parentTitle}`
-      branchOpen = false
-      patchSlot(created.id, { sent: previousMessages })
-      applySessionHistory(created.id, created.history)
-      inputText = created.selectedText || ''
-      window.setTimeout(() => composerInput?.focus(), 0)
+      // 分支会话已经建好了（无论用户看的是哪个会话，它都在列表里）；只有"用户这段
+      // 时间没换过会话"才把它推上前台并注入它的历史。否则只入列表，不动视图 ——
+      // 否则会把用户的输入框内容、branchOpen 状态、焦点一次性抢走。
+      if (activeSessionId === parentId && sessionEpoch.check(epoch)) {
+        activeSessionId = created.id
+        activeSession = `分支 · ${parentTitle}`
+        branchOpen = false
+        patchSlot(created.id, { sent: previousMessages })
+        applySessionHistory(created.id, created.history)
+        inputText = created.selectedText || ''
+        window.setTimeout(() => composerInput?.focus(), 0)
+      }
     } catch (error) {
-      patchSlot(activeSessionId, { error: error instanceof Error ? error.message : String(error) })
+      // 写回发起分叉的那个会话，不是"此刻用户可能已经切到的"会话。
+      patchSlot(parentId, { error: error instanceof Error ? error.message : String(error) })
     } finally {
       forkBusy = false
     }
   }
 
-  function stop() {
+  // 返回 Promise 是为了缺陷 12：撤回重发必须在 abort **真正完成之后**才能剪辑时间线，
+  // 否则被中止的那一轮迟到的 text_delta 会继续追加进"重发后"的时间线。
+  function stop(): Promise<void> {
     const id = activeSessionId
-    if (!sidecarReady) { clearRunWatchdog(id); patchSlot(id, { running: false, phase: 'idle' }); return }
-      void request('abort', { sessionId: id }).finally(() => {
-        clearRunWatchdog(id)
-        patchSlot(id, { running: false, phase: 'idle', tool: '', processOpen: false, confirm: undefined })
-      })
+    // 用户主动中止：必须丢掉暂存的 provider 错误，否则 abort 之后收尾时
+    // 会把"上一次失败的 provider 错误"当成这次的结果报给用户（误报）。
+    clearProviderError(id)
+    // 缺陷 11（外部审计 P2）：原先 stop() 只把 running/phase 打回，activeTurnId
+    // 与 steer[] 都留着 —— 于是"停止后立刻再答确认框/再插话"时旧回合身份还在，
+    // 下一次 dispatchTurn 生成的新回合无法与它区分；队列里的插话也一直显示为
+    // 待发送。这里一并清干净。
+    // 缺陷 2：40ms 的 drain 定时器必须一起撤销 —— 否则刚 Stop 就又静默把队列里的
+    // follow-up 派发出去，而上一轮尾部还在往 reply 缓冲区追加，一条完整回答被拆成
+    // 两个气泡。
+    clearDrainTimer(id)
+    // 标记"本轮已被中止"：从这一刻起到达的终态事件属于被打断的那一轮，若期间又
+    // 派发过新一轮（runEpoch.dispatch），事件入口会靠它把旧轮终态丢掉（缺陷 1）。
+    runEpoch.markAborted(id)
+    // D1（外部对抗性审查确证回归）：停止必须**立刻**反映到界面上。此前这里只记世代
+    // 标记、不动 running，于是 abort 回执落地前（SDK 的 abort() 要 `await
+    // waitForIdle()`，见 agent-session.js:1222-1228，回执必然很晚）用户在同一个会话
+    // 再回车，submit() 会命中 :2324 的 steer 分支：它只发 prompt、**不调用
+    // dispatchTurn**，因此世代不推进（仍停在被中止的世代）。等 SDK 因
+    // `hasQueuedMessages()` 为真而 `continue()` 去服务那条插话时
+    //（agent-loop.js:67 无条件发 agent_start），事件入口的 `startedButAborted` 判为真
+    // ⇒ 走 :1811 早退，把**用户刚发的那一轮**补发 abort 杀掉：消息丢了、没有回复。
+    // 乐观清空 running/activeTurnId 后，下一次提交会走 dispatchTurn 推进世代，
+    // 被停掉的旧轮终态由 isSuperseded 拦下，新轮的 agent_start 正常流动。
+    patchSlot(id, { running: false, phase: 'idle', activeTurnId: undefined, steer: [] })
+    if (!sidecarReady) {
+      clearRunWatchdog(id)
+      return Promise.resolve()
+    }
+    // S-4（外部审计疑点）：`.then` 里原先零守卫 —— 若 abort 回执飞行期间用户又派发了
+    // 新一轮（runEpoch.dispatch 推进世代、槽位写入新的 activeTurnId），旧 stop 的收尾会
+    // 把新回合打回 idle 并拆掉它的看门狗。这里在发请求前钉住世代与回合身份，回执到达
+    // 时若已被取代就什么都不做（新回合自己管自己的收尾）。
+    // 注意快照取在上面那次乐观清空**之后**：此刻 activeTurnId 已被清成 undefined，
+    // 于是"期间有人派发过新一轮"就表现为 turnId 被写成新值，守卫照样命中。
+    const generation = runEpoch.generationOf(id)
+    const turnId = slotFor(id).activeTurnId
+    return request('abort', { sessionId: id }).catch(() => undefined).then(() => {
+      if (runEpoch.generationOf(id) !== generation) return
+      if (slotFor(id).activeTurnId !== turnId) return
+      clearRunWatchdog(id)
+      // 退避 sleep 期间点 Stop 时，SDK 的 `auto_retry_end{finalError:"Retry cancelled"}`
+      // 是在 abort 请求**飞行途中**才到达的，入口那次 clear 拦不住它 —— 所以收尾这里
+      // 再清一遍，并显式把 error 写空：patchSlot 是浅合并，漏掉这个字段会保留旧值，
+      // 让"请求失败"红条留在界面上。
+      clearProviderError(id)
+      patchSlot(id, { running: false, phase: 'idle', tool: '', processOpen: false, confirm: undefined, error: '', activeTurnId: undefined, steer: [] })
+    })
   }
 
   function quickPrompt(text: string) {
@@ -2164,22 +2741,34 @@
 
   async function newSession() {
     if (!sidecarReady) {
-      const draftId = `draft-${Date.now()}`
+      const draftId = nextSessionId()
       activeSession = '新会话'
       activeSessionId = draftId
       sessions = [{ id: draftId, title: '新会话', time: '刚刚' }, ...sessions]
       leftTab = 'Chats'
       return
     }
-    const id = `session-${Date.now()}`
+    const id = nextSessionId()
     const defaults = loadPrefs()
     const thinking = THINKING_LEVELS.includes(defaults.thinking) ? defaults.thinking : undefined
     const payload: Record<string, unknown> = { sessionId: id, cwd: workspacePath, mode: defaults.mode }
     if (thinking) payload.thinking = thinking
+    // 缺陷 B1（外部审计）：`create_session` 是慢请求（要落盘 + 让 SDK 建会话）。期间
+    // 用户完全可能点开别的会话或再点一次「新建」—— 原先这里无条件把 activeSessionId
+    // 抢过来，会把用户刚切到的会话顶掉，且新会话列表里凭空多一个空壳。钉住 epoch，
+    // 回来时确认用户还停在我们发起时的那个会话上。
+    const epoch = sessionEpoch.current()
+    const startedFrom = activeSessionId
     const created = await request('create_session', payload) as { id: string; file?: string }
+    const now = Date.now()
+    if (!sessionEpoch.check(epoch) || activeSessionId !== startedFrom) {
+      // 用户已经走开了：会话仍然建好并入列表（否则它会在磁盘上但没有标签），
+      // 只是不抢焦点。这也是"再点一次新建"的正常结果。
+      sessions = [{ id: created.id, title: '新会话', time: '刚刚', thinking, mode: defaults.mode, file: created.file, createdAt: now, modifiedAt: now }, ...sessions]
+      return
+    }
     activeSessionId = created.id
     activeSession = '新会话'
-    const now = Date.now()
     sessions = [{ id: created.id, title: '新会话', time: '刚刚', thinking, mode: defaults.mode, file: created.file, createdAt: now, modifiedAt: now }, ...sessions]
     leftTab = 'Chats'
   }
@@ -2234,6 +2823,9 @@
       return
     }
     const response = await requestRaw('compact_session', { sessionId: id })
+    // 压缩期间用户可能已经切走：这条请求是慢操作（要写入新文件），
+    // 绝不能因为它的返回把界面强行拉回旧会话 —— 只有仍停在原会话时才刷新。
+    if (activeSessionId !== id) return
     if (!response.ok) {
       patchSlot(id, { error: response.error || '压缩上下文失败' })
       return
@@ -2610,6 +3202,29 @@
             {/if}
           {/if}
         </div>
+
+        <!-- D-B（外部审计 P1）：其它会话挂起的权限确认。原先只有 active 槽会渲染
+             （模板 `runState[activeSessionId].confirm`），也只由 active 槽回答
+             （answerConfirm 取 activeSessionId），后台会话的确认因此**完全不可见**，
+             用户切走期间那个工具调用一直挂着，直到 sidecar 的 600s 超时按
+             confirm→false 保守拒绝（工具静默失败）。
+             ⚠️ 必须放在 `{#if activeSessionIdle}` 的**外面**（会话列表容器之上）：
+             active 槽为空白页时整段消息区都不渲染，放进去会让"刚切到一个空会话、
+             后台恰好有确认"这个最常见的场景重新变回不可见。 -->
+        {#if pendingConfirms.length}
+          <div class="remote-confirm-bar" role="region" aria-label="后台会话的权限确认">
+            {#each pendingConfirms as item (item.id)}
+              <div class="confirm-card confirm-card-remote">
+                <div class="confirm-head">
+                  <span class="confirm-session">{item.title}</span>
+                  <span class="confirm-tool">{item.confirm.toolName}</span>
+                  <span class="confirm-summary">{item.confirm.summary}</span>
+                </div>
+                <div class="confirm-actions"><button class="confirm-allow" on:click={() => answerConfirm(true, item.id)}>允许</button><button on:click={() => answerConfirm(false, item.id)}>拒绝</button></div>
+              </div>
+            {/each}
+          </div>
+        {/if}
 
         <div class="composer-wrap">
           {#if (runState[activeSessionId]?.steer ?? []).length}

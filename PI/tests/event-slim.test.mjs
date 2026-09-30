@@ -278,6 +278,44 @@ test('agent_end：无 toolResult 时引用稳定（不拷贝）', () => {
   assert.equal(summarizeEvent(event), event)
 })
 
+test('agent_end：assistant 终态的 stopReason/errorMessage 必须存活（承重）', () => {
+  // 真实事故：provider 返回 404 时 SDK **不发 type:'error'**，只产出一条
+  // stopReason:'error' + errorMessage 的 assistant 终态消息。前端正是靠这两个字段
+  // 把"永久 Thinking / 没有任何反馈"变成可见的错误提示（App.svelte 的 provider 错误归因）。
+  // 一旦 event-slim 把 assistant 当 toolResult 一起瘦身，错误文本就会重新消失 ——
+  // 这类静默失效无法靠 UI 冒烟发现，故在此锁死。
+  const assistant = {
+    role: 'assistant',
+    // 必须带一个**会被瘦身命中**的大 text 块：此前这里是 content: []，而 slimToolResult
+    // 遍历的正是 content —— 空数组时它必然原样返回，于是"assistant 被误当 toolResult
+    // 一起瘦身"这种破坏仍能通过（变异验证 M2 实证）。带上大 text 后，一旦 assistant
+    // 被送进 slimToolResult，引用相等断言立刻失败。
+    content: [{ type: 'text', text: 'x'.repeat(20 * 1024) }],
+    stopReason: 'error',
+    errorMessage: '404 404 page not found\n',
+    // 故意带一个大 images 字段，确认"不清洗非 toolResult 项"包括不碰体积大的 details
+    details: { images: [{ data: 'z'.repeat(50 * 1024), mimeType: 'image/png' }] },
+  }
+  const event = {
+    type: 'agent_end',
+    willRetry: false,
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: '你好' }] },
+      { role: 'toolResult', content: [{ type: 'image', data: 'y'.repeat(2000) }] },
+      assistant,
+    ],
+  }
+  const slim = summarizeEvent(event)
+  const kept = slim.messages.find((item) => item.role === 'assistant')
+  assert.equal(kept, assistant, 'assistant 终态必须是原引用（零拷贝）')
+  assert.equal(kept.stopReason, 'error')
+  assert.equal(kept.errorMessage, '404 404 page not found\n', '错误文本不得被任何清洗动到')
+  assert.equal(kept.details.images[0].data.length, 50 * 1024, 'assistant 自带的大字段也不得截断')
+  // 同一事件里的 toolResult 仍然必须被压掉（瘦身能力不能被这次修复削弱）
+  const trimmed = slim.messages.find((item) => item.role === 'toolResult')
+  assert.match(trimmed.content[0].data, /stripped/)
+})
+
 test('agent_end：累积整个 run 的大 toolResult 被压掉（第 5 份载体）', () => {
   // 模拟一次 run 里读了 20 张 1MB 图：未处理时单行 NDJSON 可达 ~20MB
   const big = { role: 'toolResult', content: [{ type: 'image', data: 'z'.repeat(1024 * 1024) }] }

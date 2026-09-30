@@ -18,6 +18,8 @@ import { closeMemoryDb, listMemories, rememberMemory, searchMemories, supersedeM
 import * as piConfig from './config.mjs'
 import * as eco from './ecosystem.mjs'
 import * as lan from './lan.mjs'
+import { releaseAllConfirms, releaseSessionConfirm, forgetConfirm, lastConfirmOfSession } from './session-confirms.mjs'
+import { teardownSession, cancelSessionInteractions } from './session-teardown.mjs'
 import * as petServer from './pet-server.mjs'
 
 const sessions = new Map()
@@ -73,15 +75,30 @@ let sdkSource = loadedSdk.source
 const pendingConfirms = new Map()
 let confirmSeq = 0
 // 1-6：按会话索引的待决权限确认（供局域网遥控页枚举"待确认的权限请求"）。
-// confirm_response / abort 清理时同步删除。
+// 值是**数组**：同一会话理论上可能有多条（审查缺陷 9 —— 早期单值索引会让第二条
+// 覆盖第一条的索引，第一条就再也 release 不掉了）。当前 SDK 串行确认使其不可达，
+// 但数组形式零代价地消除了这个隐患。confirm_response / abort / close 时同步清理。
 const pendingConfirmsBySession = new Map()
 const confirmBridge = {
   requestConfirm: ({ sessionId, toolName, summary }) => new Promise((resolve) => {
     const confirmId = `c${++confirmSeq}`
+    const sid = String(sessionId || '')
     pendingConfirms.set(confirmId, resolve)
-    pendingConfirmsBySession.set(String(sessionId || ''), { dialogId: confirmId, toolName: String(toolName || '工具'), summary: String(summary || '') })
+    const list = pendingConfirmsBySession.get(sid) || []
+    list.push({ dialogId: confirmId, toolName: String(toolName || '工具'), summary: String(summary || '') })
+    pendingConfirmsBySession.set(sid, list)
     send({ type: 'confirm_request', sessionId, confirmId, toolName, summary })
   }),
+}
+
+// 会话被关闭/删除/重建时，必须把该会话挂着的权限确认一起放行。
+// 此前只有 abort 请求会清 pendingConfirms，而 closeSession/deleteSession 是直接
+// 调 `entry.session.abort()`、绕过了那个处理函数 —— 结果：① `pendingConfirms` 里
+// 永远留着一个不会有人回答的 resolve（扩展的工具调用永久悬挂）；
+// ② `pendingConfirmsBySession` 的陈旧项会一直出现在局域网遥控页的"待确认"列表里。
+function releaseSessionConfirms(sessionId) {
+  const { released, resolved } = releaseSessionConfirm(pendingConfirms, pendingConfirmsBySession, sessionId)
+  if (released.length) log(`会话 ${sessionId} 关闭，已放行待决权限确认 ${released.length}（resolved=${resolved}）`)
 }
 
 // 通用对话框桥（0-4）：扩展的 select/input/editor 也走同一套 request → response。
@@ -116,31 +133,41 @@ function dialogTimeoutDefault(kind, payload) {
   }
   return fallback
 }
-function requestDialog(kind, payload) {
+function requestDialog(kind, payload, sessionId = '') {
   return new Promise((resolve) => {
     const dialogId = `d${++dialogSeq}`
     const timer = setTimeout(() => {
       if (!pendingDialogs.has(dialogId)) return
       pendingDialogs.delete(dialogId)
       const fallback = dialogTimeoutDefault(kind, payload)
-      send({ type: 'dialog_expired', dialogId, kind, fallback: fallback === undefined ? 'cancel' : 'default' })
+      send({ type: 'dialog_expired', dialogId, kind, sessionId, fallback: fallback === undefined ? 'cancel' : 'default' })
       resolve(fallback)
     }, DIALOG_TIMEOUT_MS)
-    pendingDialogs.set(dialogId, { resolve, kind, timer })
-    send({ type: 'ui_dialog_request', dialogId, kind, ...payload })
+    // 记下归属会话：abort/close/delete 只能取消**本会话**的对话框，
+    // 否则中止一个会话会连别的会话正在等待的扩展对话框一起取消（审查 D1/#5）。
+    pendingDialogs.set(dialogId, { resolve, kind, timer, sessionId: String(sessionId || '') })
+    send({ type: 'ui_dialog_request', dialogId, kind, sessionId, ...payload })
   })
 }
 
-/** 统一清理所有待决对话框（abort / close_session / 会话重建时调用）。 */
-function drainPendingDialogs(reason) {
-  for (const [, pending] of pendingDialogs) {
+/**
+ * 统一清理待决对话框（abort / close_session / 会话重建时调用）。
+ * 传入 sessionId 时只清理该会话的（abort 必须收窄，否则会波及其它会话）；
+ * 不传则全清（进程级 teardown）。
+ */
+function drainPendingDialogs(reason, sessionId) {
+  const scope = sessionId === undefined ? undefined : String(sessionId || '')
+  let count = 0
+  for (const [dialogId, pending] of pendingDialogs) {
+    if (scope !== undefined && pending.sessionId !== scope) continue
     clearTimeout(pending.timer)
     pending.resolve(undefined)
+    pendingDialogs.delete(dialogId)
+    count += 1
   }
-  if (pendingDialogs.size) {
-    log(`已取消 ${pendingDialogs.size} 个待决扩展对话框（${reason}）`)
-    send({ type: 'dialog_expired', count: pendingDialogs.size, reason })
-    pendingDialogs.clear()
+  if (count) {
+    log(`已取消 ${count} 个待决扩展对话框（${reason}）`)
+    send({ type: 'dialog_expired', count, reason, sessionId: scope })
   }
 }
 
@@ -364,23 +391,22 @@ async function ensureRuntime(refresh = false) {
   return runtime
 }
 
-/** 统一的扩展 UI 上下文（三处会话创建共用，避免某个路径漏接）。 */
-let cachedUiContext
-function uiContext() {
-  if (!cachedUiContext) {
-    cachedUiContext = createUiContext({
-      dialogs: {
-        confirm: (title, message) => requestDialog('confirm', { title, message }),
-        select: (title, options) => requestDialog('select', { title, options }),
-        input: (title, placeholder) => requestDialog('input', { title, placeholder }),
-        editor: (title, prefill) => requestDialog('editor', { title, prefill }),
-      },
-      notify: notifyFromExtension,
-      setEditorText: (text, source) => send({ type: 'ext_editor_text', text, source }),
-      log: logUnsupportedUi,
-    })
-  }
-  return cachedUiContext
+/** 统一的扩展 UI 上下文（四处会话创建共用，避免某个路径漏接）。
+ *  按会话现建：对话框要能归因到发起它的会话，abort/close 才能只清本会话的。
+ *  不做全局缓存 —— 缓存按 sessionId 会随会话数无界增长，而这里一次会话只调一次。 */
+function uiContext(sessionId = '') {
+  const key = String(sessionId || '')
+  return createUiContext({
+    dialogs: {
+      confirm: (title, message) => requestDialog('confirm', { title, message }, key),
+      select: (title, options) => requestDialog('select', { title, options }, key),
+      input: (title, placeholder) => requestDialog('input', { title, placeholder }, key),
+      editor: (title, prefill) => requestDialog('editor', { title, prefill }, key),
+    },
+    notify: notifyFromExtension,
+    setEditorText: (text, source) => send({ type: 'ext_editor_text', text, source }),
+    log: logUnsupportedUi,
+  })
 }
 
 /** 统一构造扩展工厂列表（三处会话创建都用它，避免参数漂移）。 */
@@ -431,7 +457,7 @@ async function createSession(id, cwd = workspace, thinking, mode = DEFAULT_MODE)
     modelRuntime,
     sessionManager: SessionManager.create(cwd, path.join(agentDir, 'sessions')),
     resourceLoader: loader,
-    uiContext: uiContext(),
+    uiContext: uiContext(id),
     tools: BASE_TOOLS,
     customTools: [makeShowImageTool()],
   })
@@ -465,9 +491,17 @@ async function openSession(id, file, requestedMode) {
     }
   }
   if (existing) {
-    try { await existing.session?.abort() } catch { /* ignore */ }
-    try { existing.unsubscribe?.() } catch { /* ignore */ }
-    sessions.delete(id)
+    // 顺序承重（放行先于 abort）见 ./session-teardown.mjs（审查 D1）：
+    // 旧实例若正卡在权限确认上，abort() 会永远等不到 waitForIdle。
+    await teardownSession({
+      id,
+      reason: `重建会话 ${id}`,
+      releaseConfirms: releaseSessionConfirms,
+      drainDialogs: drainPendingDialogs,
+      abort: () => existing.session?.abort(),
+      unsubscribe: () => existing.unsubscribe?.(),
+      forget: (sid) => sessions.delete(sid),
+    })
   }
   const modelRuntime = await ensureRuntime()
   const sessionManager = SessionManager.open(file)
@@ -491,7 +525,7 @@ async function openSession(id, file, requestedMode) {
     modelRuntime,
     sessionManager,
     resourceLoader: loader,
-    uiContext: uiContext(),
+    uiContext: uiContext(id),
     tools: BASE_TOOLS,
     customTools: [makeShowImageTool()],
   })
@@ -615,11 +649,17 @@ async function updatePiSdk() {
 async function closeSession(id) {
   const entry = sessions.get(id)
   if (!entry) return { closed: false }
-  try { await entry.session?.abort() } catch { /* ignore */ }
-  try { entry.unsubscribe?.() } catch { /* ignore */ }
-  // 该会话挂着的扩展对话框一并取消，避免残留的 await 把主循环卡死
-  drainPendingDialogs(`关闭会话 ${id}`)
-  sessions.delete(id)
+  // 顺序承重逻辑（放行必须在 abort() 之前）抽在 ./session-teardown.mjs，
+  // 那里有完整的 SDK 源码级论证 + 行为化单测（审查 D1 + T1：文本正则测不出顺序）。
+  await teardownSession({
+    id,
+    reason: `关闭会话 ${id}`,
+    releaseConfirms: releaseSessionConfirms,
+    drainDialogs: drainPendingDialogs,
+    abort: () => entry.session?.abort(),
+    unsubscribe: () => entry.unsubscribe?.(),
+    forget: (sid) => sessions.delete(sid),
+  })
   return { closed: true }
 }
 
@@ -657,9 +697,16 @@ async function deleteSession(id, file) {
     throw new Error('会话文件路径无效，已拒绝删除')
   }
   if (entry) {
-    try { await entry.session?.abort() } catch { /* ignore */ }
-    try { entry.unsubscribe?.() } catch { /* ignore */ }
-    sessions.delete(id)
+    // 顺序承重（放行先于 abort）见 ./session-teardown.mjs（审查 D1）。
+    await teardownSession({
+      id,
+      reason: `删除会话 ${id}`,
+      releaseConfirms: releaseSessionConfirms,
+      drainDialogs: drainPendingDialogs,
+      abort: () => entry.session?.abort(),
+      unsubscribe: () => entry.unsubscribe?.(),
+      forget: (sid) => sessions.delete(sid),
+    })
   }
   try {
     await unlink(target)
@@ -706,7 +753,7 @@ async function forkSession(sourceId, id, userMessageIndex, position = 'before') 
     modelRuntime: await ensureRuntime(),
     sessionManager: targetManager,
     resourceLoader: loader,
-    uiContext: uiContext(),
+    uiContext: uiContext(id),
     // 与 createSession 一致：注册并集，plan 的只读限制在创建后施加，
     // 否则分叉出来的会话会继承"只能往小里切"的缺陷。
     tools: BASE_TOOLS,
@@ -968,7 +1015,7 @@ async function createWorktreeFork(payload) {
       modelRuntime: await ensureRuntime(),
       sessionManager: targetManager,
       resourceLoader: loader,
-      uiContext: uiContext(),
+      uiContext: uiContext(forkId),
       tools: BASE_TOOLS,
       customTools: [makeShowImageTool()],
     })
@@ -1673,12 +1720,15 @@ async function handle(request) {
       return
     }
     if (type === 'prompt') {
-      let entry = sessions.get(payload.sessionId)
-      if (!entry) {
-        await createSession(payload.sessionId, payload.cwd || workspace, payload.thinking, payload.mode)
-        entry = sessions.get(payload.sessionId)
-      }
-      if (!entry) throw new Error('无法创建 Agent 会话')
+      const entry = sessions.get(payload.sessionId)
+      // 缺陷 4（外部审计 P1）：这里原先会**静默重建会话**（`if (!entry) await createSession(...)`）。
+      // 前端 closeTab/deleteSession 会先发 close_session/delete_session，若此时前端有个
+      // 异步前奏（create_session / read_attachment / vision_describe）还在飞行，它随后发出的
+      // prompt 就会命中这里，把一个已关闭的会话重新造出来并真跑模型 —— 而前端此时早已
+      // 删掉标签与运行槽，用户看不到、也停不掉这个运行（无人可管的僵尸运行）。
+      // 正确语义：prompt 不负责创建会话，找不到就明确报错，让前端的 .catch 给出反馈。
+      // 会话的创建只走显式的 create_session（新建会话）与 open_session（打开已有）。
+      if (!entry) throw new Error('会话不存在或已关闭，请重新打开该会话后再发送。')
       // Do not await the whole turn: the UI must remain available for steering and abort.
       const attachments = Array.isArray(payload.attachments) ? payload.attachments : []
       const images = attachments.filter((a) => a.kind === 'image').map((a) => ({ type: 'image', data: a.data, mimeType: a.mimeType }))
@@ -1691,7 +1741,7 @@ async function handle(request) {
       entry.running = true
       void entry.session
         .prompt(text, options)
-        .catch((error) => send({ type: 'event', sessionId: payload.sessionId, event: { type: 'error', message: error.message } }))
+        .catch((error) => send({ type: 'event', sessionId: payload.sessionId, event: { type: 'error', message: error.message, turnId: payload.turnId } }))
         .finally(() => { entry.running = false })
       reply(id, { accepted: true })
       return
@@ -1716,10 +1766,8 @@ async function handle(request) {
     if (type === 'confirm_response') {
       const resolve = pendingConfirms.get(payload.confirmId)
       pendingConfirms.delete(payload.confirmId)
-      // 1-6：同步清理会话级索引
-      pendingConfirmsBySession.forEach((meta, sid) => {
-        if (meta.dialogId === payload.confirmId) pendingConfirmsBySession.delete(sid)
-      })
+      // 1-6：同步清理会话级索引（数组形式，见 pendingConfirmsBySession 的声明）
+      forgetConfirm(pendingConfirmsBySession, payload.confirmId)
       resolve?.(!!payload.ok)
       reply(id, { delivered: !!resolve })
       return
@@ -1758,16 +1806,16 @@ async function handle(request) {
     }
     if (type === 'abort') {
       const entry = sessions.get(payload.sessionId)
-      await entry?.session.abort()
-      for (const [confirmId, resolve] of pendingConfirms) {
-        pendingConfirms.delete(confirmId)
-        resolve(false)
-      }
-      // 1-6：abort 清理会话级确认索引
-      pendingConfirmsBySession.clear()
-      // 扩展对话框也必须一并取消（审查 P0-4）：否则 abort 之后扩展仍在等一个
-      // 永远不会来的回答，sidecar 会继续卡住。
-      drainPendingDialogs('用户中止')
+      // 顺序承重逻辑（放行必须在 abort() 之前，且必须收窄到本会话）抽在
+      // ./session-teardown.mjs —— 那里有 SDK 源码级论证与行为化单测（审查 D1/T1）。
+      // 早期实现用 releaseAllConfirms 会连别的会话正在等待的确认一起取消（缺陷 #5）。
+      await cancelSessionInteractions({
+        sessionId: payload.sessionId,
+        reason: '用户中止',
+        releaseConfirms: releaseSessionConfirms,
+        drainDialogs: drainPendingDialogs,
+        abort: () => entry?.session.abort(),
+      })
       reply(id, { aborted: true })
       return
     }
@@ -1940,7 +1988,7 @@ async function handle(request) {
             id: sid,
             title: sid,
             running: Boolean(entry.running),
-            confirm: pendingConfirmsBySession.get(sid) || null,
+            confirm: lastConfirmOfSession(pendingConfirmsBySession, sid),
             tool: liveInfo.tool || '',
             tail: liveInfo.tail || '',
           }
@@ -1974,7 +2022,14 @@ async function handle(request) {
           stop: async ({ sessionId }) => {
             const entry = sessions.get(String(sessionId || ''))
             if (!entry) return { ok: false, error: '会话不存在' }
-            await entry.session.abort()
+            // 与 handle 的 abort 分支同构（放行先于 abort，见 ./session-teardown.mjs）。
+            await cancelSessionInteractions({
+              sessionId,
+              reason: '局域网中止',
+              releaseConfirms: releaseSessionConfirms,
+              drainDialogs: drainPendingDialogs,
+              abort: () => entry.session.abort(),
+            })
             return { ok: true }
           },
           confirm: async ({ dialogId, confirmed }) => {
@@ -1982,9 +2037,7 @@ async function handle(request) {
             const confirmResolve = pendingConfirms.get(String(dialogId || ''))
             if (confirmResolve) {
               pendingConfirms.delete(String(dialogId))
-              pendingConfirmsBySession.forEach((meta, sid) => {
-                if (meta.dialogId === String(dialogId)) pendingConfirmsBySession.delete(sid)
-              })
+              forgetConfirm(pendingConfirmsBySession, String(dialogId))
               confirmResolve(confirmed === true)
               return { ok: true }
             }
@@ -2047,7 +2100,11 @@ const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity 
 // 修复：改为 rl.on('line') 事件驱动（Node 的 readline 会在后台持续读行并逐条
 // 回调），串行语义由 handle() 的 pending 队列保证；非阻塞类型 fire-and-forget。
 // 这样回答行总能在等待期间被读取并 resolve。
-const NON_BLOCKING_REQUESTS = new Set(['oauth_login', 'ui_dialog_response', 'mcp_test'])
+// confirm_response 必须非阻塞（审查 D1）：权限确认的等待者是 sidecar 里正在跑的
+// 一次工具调用；如果它排在串行链上，而链上恰好有一个卡在确认上的请求（abort 永远
+// 等不到 waitForIdle），用户的回答就会排在卡死的请求后面 —— 实测完全死锁。
+// 它只做几次同步的 Map 操作 + 调用一个已保存的 resolve，不进 handle 的 await 路径。
+const NON_BLOCKING_REQUESTS = new Set(['oauth_login', 'ui_dialog_response', 'mcp_test', 'confirm_response'])
 /** 串行执行链：保证同一时刻只有一个 handle 在跑（顺序语义不变） */
 let serialChain = Promise.resolve()
 
@@ -2075,6 +2132,11 @@ rl.on('line', (line) => {
   serialChain = serialChain.then(run, run)
 })
 rl.on('close', () => {
+  // 进程级 teardown：把所有会话挂着的确认/对话框一并放行，避免扩展侧留下永不
+  // resolve 的 await（审查要求核对所有清理路径：process exit / sessions 清空 / SDK reload）。
+  for (const sid of [...sessions.keys()]) releaseSessionConfirms(sid)
+  releaseAllConfirms(pendingConfirms, pendingConfirmsBySession)
+  drainPendingDialogs('sidecar 退出')
   log('stdin 已关闭，sidecar 退出')
   process.exit(0)
 })

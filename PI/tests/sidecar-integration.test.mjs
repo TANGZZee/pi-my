@@ -208,6 +208,37 @@ test('sidecar 集成：会话不存在时 set_mode 返回错误而非伪成功',
   })
 })
 
+// ── 缺陷 4（外部审计 P1）：prompt 不得静默重建已关闭的会话 ────────────────
+// 前端 closeTab/deleteSession 会先发 close_session，若此时还有异步前奏在飞行，
+// 随后发出的 prompt 会命中 sidecar —— 旧实现里 `if (!entry) await createSession(...)`
+// 会把会话重新造出来并真跑模型，而前端早已删掉标签与运行槽：
+// 用户看不到、也停不掉这个运行。正确语义是报错，让前端 .catch 给出反馈。
+test('sidecar 集成：已关闭会话收到 prompt 必须报错，且不得被静默重建（缺陷 4）', async () => {
+  await withSidecar(async (req) => {
+    const created = await req('create_session', { sessionId: 's-prompt-gone', cwd: projectRoot, mode: 'ask' })
+    assert.equal(created.ok, true, `create_session 失败: ${created.error}`)
+    const closed = await req('close_session', { sessionId: 's-prompt-gone' })
+    assert.equal(closed.ok, true, `close_session 失败: ${closed.error}`)
+
+    const prompted = await req('prompt', { sessionId: 's-prompt-gone', text: '你好', behavior: 'followUp' })
+    assert.equal(
+      prompted.ok,
+      false,
+      '对已关闭会话的 prompt 必须失败：静默重建会在前端已删除标签的情况下真跑模型，造出无人可管的僵尸运行',
+    )
+    assert.match(
+      String(prompted.error),
+      /不存在|已关闭/,
+      `错误信息必须说明会话不可用，实际是：${prompted.error}`,
+    )
+
+    // 关键反证：报错之后该会话**仍然**不存在（不能"先报错再偷偷建好"）。
+    const still = await req('set_mode', { sessionId: 's-prompt-gone', mode: 'ask' })
+    assert.equal(still.ok, false, 'prompt 失败后会话被静默重建了：set_mode 竟然成功')
+    assert.match(String(still.error), /会话不存在/)
+  })
+})
+
 test('sidecar 集成：open_session 回传 mode（防止 UI 与 sidecar 失同步）', async () => {
   await withSidecar(async (req) => {
     const created = await req('create_session', { sessionId: 's4', cwd: projectRoot, mode: 'ask' })
