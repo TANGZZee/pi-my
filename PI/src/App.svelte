@@ -8,10 +8,11 @@
   import Settings from './Settings.svelte'
   import Atom from './Atom.svelte'
   import ThinkingOrb from './ThinkingOrb.svelte'
-  import VirtualFile from './VirtualFile.svelte'
   import { t as tt } from './i18n.ts'
-  import PluginCard from './PluginCard.svelte'
+  import PluginHost from './PluginHost.svelte'
   import { normalizePluginMessage, type PluginMessage } from './ui-plugins'
+  // 批次③信任门控：前端缓存 sidecar 下发的项目信任态（iframe 沙箱渲染器用）
+  import { isProjectTrusted, setProjectTrusted, subscribeProjectTrust } from './ui-registry'
 
   /** 2-11：把 liveLabel 的英文标签翻译成本地语言（缺 key 回退英文原文）。 */
   function liveLabelKey(slot: RunSlot): string {
@@ -29,33 +30,29 @@
   import { applyPrefsChrome, loadPrefs, patchPrefs } from './prefs'
   import { findAgent, loadAgents, wrapTask, type AgentDef } from './agents'
   import { requestTimeoutMs, partitionPendingOnRestart, timeoutMessage } from './rpc-policy'
-  import { SLASH_COMMANDS, filterSlashCommands, findSlashCommand, slashTriggerQuery } from './slash-commands'
+  import { findSlashCommand } from './slash-commands'
   import type { AgentEnvelope } from './protocol'
   import { activeBranchSiblingsOf, buildSessionRows, sessionRootId as sessionRootIdOf } from './session-tree'
-  import {
-    appendThinkToSteps,
-    assistantErrorFrom,
-    brief,
-    closeOpenSteps,
-    endToolStep as endToolStepIn,
-    ensureThinkingStep,
-    formatReplyTime,
-    historyToTimeline,
-    isCancellationText,
-    lastAssistantReply,
-    liveLabel,
-    mergeHistoryIntoTimeline,
-    processSummary as processSummaryOf,
-    removeProviderError,
-    sentFromTimeline,
-    stashProviderError,
-    takeProviderError,
-  } from './run-slot'
-  import { stateSummary, type StateSnapshot } from './session-state'
-  import { withResetEstimate, formatResetCountdown } from './quota-reset'
+  import { appendThinkToSteps, assistantErrorFrom, brief, closeOpenSteps, describeProviderError, endToolStep as endToolStepIn, ensureThinkingStep, formatReplyTime, historyToTimeline, isCancellationText, type HistoryEntry, type TimelineHistoryEntry, type TimelineMessage, type SubRun, lastAssistantReply, liveLabel, mergeHistoryIntoTimeline, pluginReplayPayload, processSummary as processSummaryOf, removeProviderError, sentFromTimeline, settleStepsForFinish, shouldSurfaceProviderError, splitPluginHistory, stashProviderError, takeProviderError, toolResultBrief } from './run-slot'
+
   import { casRemove, casReorder } from './queue-cas'
   import { collectSubRunUpdates, createEpochGuard, createRunEpoch, createTurnIdFactory, isTurnAlive, isTurnCurrent, planDrain } from './session-run'
-  import { cycleTodoStatus, loadTodos, newTodo, saveTodos, todoTree, type TodoItem, type TodoStatus } from './todos'
+  import { cycleTodoStatus, loadTodos, newTodo, saveTodos, todoTree, type TodoItem } from './todos'
+  import { createSettleArbiter, SETTLE_FALLBACK_TEXT } from './run-settle'
+  // 0-5 批次 A：模型/思考与文件树纯逻辑抽到独立模块（可单测），组件只留接线
+  import { MODEL_SEPARATOR, THINKING_LEVELS, sessionMode } from './app-models'
+  import { fileName, projectName, workspaceBase } from './app-files'
+  // 0-5 批次 B：面板组件（变更/待办/子代理三块从 App.svelte 抽出）。
+  // 注意：拆分/检视 overlay 与文档面板虽也抽出，但挂载点不同——overlay 是全局模态
+  // （/split、/scout 空参、待办拆分、子会话点击都可能发生在任意面板下），文档面板
+  // 在 panel==='文档' 分支内挂载。
+  import GitPanel from './GitPanel.svelte'
+  import TodoPanel from './TodoPanel.svelte'
+  import SubRunsPanel from './SubRunsPanel.svelte'
+  import SplitDialog from './SplitDialog.svelte'
+  import SubRunOverlay from './SubRunOverlay.svelte'
+  import FilePanel from './FilePanel.svelte'
+  import Composer from './Composer.svelte'
 
   type PanelTab = '文档' | '变更' | '终端' | '运行' | '待办'
   type Session = { id: string; title: string; time: string; file?: string; cwd?: string; branch?: string; parentFile?: string; state?: 'active' | 'done'; model?: string; thinking?: string; mode?: string; pinned?: boolean; archived?: boolean; parentId?: string; branchParentId?: string; forkedFrom?: string; createdAt?: number; modifiedAt?: number; readOnly?: boolean }
@@ -63,20 +60,16 @@
   type GitChange = { code: string; path: string }
   type SidecarResponse = { type: 'response'; id: number; ok: boolean; result: unknown; error?: string }
   type SentMessage = { text: string; at: string }
-  type TimelineMessage = { id: string; role: 'user' | 'assistant'; text: string; at: string; timestamp: number; userIndex: number; entryId?: string }
-  type SubRun = { id: string; agent: string; task: string; status: 'running' | 'done' | 'error'; reply: string }
+  // TimelineMessage/SubRun 现在从 run-slot.ts 导入（1-5 批次② / 0-5 批次 B），不再本地重复声明
   type Phase = 'idle' | 'thinking' | 'working' | 'writing' | 'waiting'
   type ProcessStep = { id: string; kind: 'think' | 'tool'; title: string; body: string; done: boolean }
   type QueuedMessage = { id: string; text: string }
-  type RunSlot = { reply: string; thinking: string; tool: string; phase: Phase; running: boolean; error?: string; queue: QueuedMessage[]; queueRevision: number; steer: string[]; sent: SentMessage[]; timeline: TimelineMessage[]; subRuns: SubRun[]; process: ProcessStep[]; processOpen: boolean; replyAt?: number; historyLoaded?: boolean; activeTurnId?: string; confirm?: { confirmId: string; toolName: string; summary: string }; images?: Array<{ id: string; src: string; name: string }>; retry?: { attempt: number; reason: string }; compacting?: boolean; pluginMessages?: PluginMessage[] }
+  type RunSlot = { reply: string; thinking: string; tool: string; phase: Phase; running: boolean; error?: string; queue: QueuedMessage[]; queueRevision: number; steer: string[]; sent: SentMessage[]; timeline: TimelineMessage[]; subRuns: SubRun[]; process: ProcessStep[]; processOpen: boolean; replyAt?: number; historyLoaded?: boolean; activeTurnId?: string; confirm?: { confirmId: string; toolName: string; summary: string }; images?: Array<{ id: string; src: string; name: string }>; retry?: { attempt: number; reason: string }; compacting?: boolean; pluginMessages?: PluginMessage[]; pluginTitle?: string }
   type SettingsInfo = { node: string; sdk: string; agentDir: string; sessionDir: string; authProviders: string[]; providers?: Array<{ provider: string; modelCount: number; configured: boolean }> }
-  type CtxStats = { currentContext: number; window: number; totals: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number }; costUsd: number; cacheHitRate: number }
   type UsageStats = { sessions: number; turns: number; activeDays: number; totals: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number }; costUsd: number; costKnown: boolean; byModel: Array<{ model: string; tokens: number; turns: number }>; byProject?: Array<{ project: string; tokens: number; turns: number }>; byDay?: Record<string, number> }
   type ImageGenConfig = { baseUrl: string; apiKey: string; model: string; size: string }
   type AgentUpdateInfo = { current: string; latest: string; installedVersion?: string; updateAvailable: boolean; url: string; repoUrl?: string; source?: string; sourceLabel?: string; updated?: boolean; restartRequired?: boolean; message?: string; checkedAt?: number }
   type WorkspaceProject = { path: string; name: string; addedAt: number }
-  const CTX_CIRC = 2 * Math.PI * 7
-  const EMPTY_CTX: CtxStats = { currentContext: 0, window: 0, totals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, costUsd: 0, cacheHitRate: 0 }
 
   let sessions: Session[] = []
 
@@ -127,10 +120,9 @@
   // 2-12：大文件走分块 + 虚拟化预览（read_file 对 >512KB 会报错，捕获后切此路径）
   let largeFile: { path: string } | null = null
   let editingFile = false
+  // git 面板状态已移入 GitPanel.svelte（0-5 批次 B-1），经 bind: 双向绑定
   let gitChanges: GitChange[] = []
   let diffContent = ''
-  let staged: Record<string, boolean> = {}
-  let commitMessage = ''
   let gitError = ''
   let inputText = ''
   let query = ''
@@ -148,81 +140,84 @@
   // 修法：把这类 id 记下来，patchSlot 直接拒绝写入；重新打开同一个 id 时移除。
   const closedIds = new Set<string>()
 
+  /**
+   * F4 终态兜底仲裁器（语义在 run-settle.ts 的纯模块里，可单测）。
+   *
+   * 为什么必须有它：agent_end / agent_settled 是前端把 running 打回 false 的**唯一**途径，
+   * 而它们是 sidecar → Rust stdout 读取线程 → Tauri emit → webview 这条链上的普通事件。
+   * 在这条链的任何一环丢失（读取线程异常退出、某行 JSON 无法解析、emit 失败、webview
+   * 丢帧），running 就永远停在 true：界面显示永久 Thinking、没有错误条、没有任何反馈 ——
+   * 正是用户报障（0.3.3 报障：用不可用模型发消息后一直显示 Thinking）的形态。
+   * 「扩展钩子在 agent_end 里悬挂」这一假设已被全机穷举否掉（6 个注册点全 bounded/inert），
+   * 因此不能靠"终态事件一定会到"来兜底，必须有一条不依赖它自己的防线。
+   *
+   * 时机取舍：只有**已经看到 provider 错误**（assistant 终态消息带 stopReason:'error'）
+   * 才武装计时器，8 秒内没等到任何新事件就按失败收尾。理由：
+   *   1. 正常重试路径上 SDK 先发 auto_retry_start 再睡退避延迟（agent-session.js:2961
+   *      先 emit、:2973 后 sleep；两行都在 0.99.1 的 _prepareRetry 里），事件毫秒级到达 ⇒ 计时器被撤销，绝不误报；
+   *   2. 8 秒远短于 180 秒看门狗，用户不必等三分钟才知道失败了；
+   *   3. 正常但慢的模型不会武装（没看到错误就不挂表），也不会误报。
+   */
+  const settleArbiter = createSettleArbiter({
+    onFire: (id, raw) => {
+      // 已经收尾的槽位绝不复活：计时器回调可能与真正的终态事件在同一轮事件循环里排队，
+      // 撤销调用已经来不及了，靠 running 判定谁先到。（finishRun 自身也有早退判据，
+      // 且 F1 之后早退分支会把 errorMessage 写回槽位，不会把这条提示吞掉。）
+      if (!slotFor(id).running) return
+      finishRun(id, `${describeProviderError(raw)}\n${SETTLE_FALLBACK_TEXT}`)
+    }
+  })
+
   // 因"会话正在运行"而被跳过的磁盘历史（缺陷 10）：先存这里，finishRun 时合并。
-  let pendingHistory: Record<string, Array<{ id?: string; role: 'user' | 'assistant'; text: string; timestamp?: number; userIndex?: number; entryId?: string }>> = {}
+  let pendingHistory: Record<string, HistoryEntry[]> = {}
   let sidecarReady = false
+  // 批次③信任门控：registry 里的前端信任缓存 → 响应式镜像（三个 PluginHost 宿主用）。
+  let pluginTrusted = isProjectTrusted()
+  onMount(() => subscribeProjectTrust(() => { pluginTrusted = isProjectTrusted() }))
   let models: ModelInfo[] = []
-  let composerInput: HTMLTextAreaElement
-  let modelOpen = false
-  let modelMenuUp = false
-  let modelQuery = ''
-  let hiddenProviders: string[] = []
-  let collapsedModelProviders: Record<string, boolean> = {}
+  let composerRef: Composer
+  let settingsInfo: SettingsInfo | null = null
+  let usageStats: UsageStats | null = null
   let providers: Array<{ provider: string; modelCount: number; configured: boolean }> = []
   let agentUpdate: AgentUpdateInfo | null = null
   let dismissedAgentUpdate = ''
   let agentUpdateBusy = false
   let agentUpdateTimer: number | undefined
 
-  function loadHiddenProviders() {
-    try { hiddenProviders = JSON.parse(localStorage.getItem('pdn.hidden-providers') ?? '[]') as string[] } catch { hiddenProviders = [] }
-  }
-  function loadCollapsedModelProviders() {
-    try { collapsedModelProviders = JSON.parse(localStorage.getItem('pdn.collapsed-model-providers') ?? '{}') as Record<string, boolean> } catch { collapsedModelProviders = {} }
-  }
-  function toggleModelProvider(provider: string) {
-    collapsedModelProviders = { ...collapsedModelProviders, [provider]: !collapsedModelProviders[provider] }
-    try { localStorage.setItem('pdn.collapsed-model-providers', JSON.stringify(collapsedModelProviders)) } catch { /* ignore */ }
-  }
-  function providerCollapsed(provider: string) {
-    return !modelQuery.trim() && Boolean(collapsedModelProviders[provider])
-  }
   function refreshPrefs() {
     uiPrefs = loadPrefs()
     applyPrefsChrome()
-    loadHiddenProviders()
-    loadCollapsedModelProviders()
+    composerRef?.reloadPrefs()
     void refreshPetStatus()
   }
   function desktopNotify(title: string, body: string) {
     if (!('Notification' in window) || Notification.permission !== 'granted') return
     try { new Notification(title, { body }) } catch { /* ignore */ }
   }
-  let modelSearchInput: HTMLInputElement
-  let modelButtonRef: HTMLButtonElement
-  let settingsInfo: SettingsInfo | null = null
-  let usageStats: UsageStats | null = null
-  let ctxStats: CtxStats = EMPTY_CTX
-  let ctxOpen = false
-  let ctxMenuUp = false
-  let ctxButtonRef: HTMLButtonElement
-  let thinkingOpen = false
-  let thinkingMenuUp = false
-  let thinkingDraft = ''
-  let thinkingHelp = false
-  let thinkingButtonRef: HTMLButtonElement
-  let modeOpen = false
-  let modeMenuUp = false
-  let modeButtonRef: HTMLButtonElement
-  let kindOpen = false
-  let kindButtonRef: HTMLButtonElement
   let moreOpen = false
   let uiPrefs = loadPrefs()
+  // 0-5 批次 B-2：todos 移入 TodoPanel.svelte 后经 bind: 双向同步——
+  // App 保留权威副本（todo-chip 计数、/todo 斜杠命令直写 localStorage 后要刷新面板）。
   let todos: TodoItem[] = []
   let todoDraft = ''
   let todoParentId = ''
+  let todoPanelRef: TodoPanel
+  let gitPanelRef: GitPanel
   let agentDefs: AgentDef[] = loadAgents()
+  // 0-5 批次 B-4：拆分/检视 overlay 抽到 SplitDialog/SubRunOverlay，状态回到 App 自持
+  // （经 bind: 双向同步；runSplit/finishSubRun 同步、/split 命令仍在父组件）。
   let splitOpen = false
   let splitRows: Array<{ agent: string; task: string }> = [{ agent: 'scout', task: '' }]
   let viewingSub: SubRun | null = null
   let attachments: Array<{ kind: 'image' | 'text'; name: string; mimeType?: string; data?: string; content?: string }> = []
-  let imageGenMode = false
-  let imageGenBusy = false
   let imageGenError = ''
   let imageGenResult: { src: string; prompt: string } | null = null
   let imageGenConfig: ImageGenConfig = { baseUrl: '', apiKey: '', model: '', size: '1024x1024' }
   let copiedReplyId = ''
   let forkBusy = false
+  let ctxEditBusyId = ''
+  let ctxEdits: Array<{ entryId: string; targetId: string; removed: boolean; text: string; timestamp: number }> = []
+  let ctxPanelOpen = false
   let branchOpen = false
   let attachError = ''
   let rightWidth = 280
@@ -230,18 +225,7 @@
   let dragging: 'left' | 'right' | null = null
   let dragStartX = 0
   let dragStartWidth = 0
-  // 与 SDK 保持一致：THINKING_LEVEL_OPTIONS / DEFAULT_THINKING_LEVEL
-  const MODEL_SEPARATOR = '\u0000'
-  const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
-  const THINKING_LABELS: Record<string, string> = { off: '关', minimal: '极低', low: '低', medium: '中', high: '高', xhigh: '超高', max: '最大' }
-  const THINKING_HELP: Record<string, string> = { off: '不做额外思考', minimal: '最少推理，响应最快', low: '轻度推理，适合简单任务', medium: '均衡推理深度', high: '深入推理，适合复杂任务', xhigh: '更充分的推理与校验', max: '最深推理，耗时最长' }
-  const DEFAULT_THINKING = 'medium'
-  const MODE_LABELS: Record<string, string> = { plan: '计划', ask: '默认', full: '完全访问' }
-  const MODE_OPTIONS: Array<{ value: string; label: string; desc: string }> = [
-    { value: 'plan', label: '计划', desc: '只读探索，不改任何文件' },
-    { value: 'ask', label: '默认', desc: '写与命令逐次确认' },
-    { value: 'full', label: '完全访问', desc: '不拦截，仅建议可信项目' }
-  ]
+  // 常量（MODEL_SEPARATOR/THINKING_*/DEFAULT_THINKING/MODE_*）已抽到 app-models.ts（0-5 批次 A）
   const pending = new Map<number, (value: SidecarResponse) => void>()
   let requestSequence = 0
 
@@ -264,41 +248,14 @@
   }))
 
   $: filteredFiles = files.filter((item) => item.path.toLowerCase().includes(query.toLowerCase()))
-  let openDirs: Record<string, boolean> = {}
-  function fileName(path: string) {
-    return path.split('/').pop() || path
-  }
-  function treeChildren(prefix: string) {
-    const base = prefix ? `${prefix}/` : ''
-    return filteredFiles.filter((item) => {
-      const rest = prefix ? (item.path.startsWith(base) ? item.path.slice(base.length) : '') : item.path
-      return rest !== '' && !rest.includes('/')
-    })
-  }
-  function toggleDir(path: string) {
-    openDirs = { ...openDirs, [path]: !openDirs[path] }
-  }
-  $: currentModelKey = modelChoice(models, sessions, activeSessionId)
-  $: currentModel = models.find((item) => modelKey(item) === currentModelKey)
-  $: currentModelLabel = currentModel ? currentModel.name : '选择模型'
-  $: modelFilter = modelQuery.trim().toLowerCase()
-  $: modelMatches = (modelFilter ? models.filter((item) => item.name.toLowerCase().includes(modelFilter) || item.provider.toLowerCase().includes(modelFilter)) : models).filter((item) => !hiddenProviders.includes(item.provider))
-  // 修复：让模型分组订阅折叠状态，点击后菜单会立即重绘。
-  $: modelDropdownGroups = modelGroups(modelMatches).map((group) => ({
-    ...group,
-    collapsed: !modelQuery.trim() && Boolean(collapsedModelProviders[group.provider])
-  }))
+  // 0-5 批次 B-5：文件树/预览移入 FilePanel.svelte；filteredFiles 留在这里
+  // （侧栏搜索框 query 与 @ 补全共享）。openDirs 是面板本地展开态，随组件走。
   // 修复：此前空白页判断藏在函数里，异步载入历史后不会自动刷新。
   $: activeSessionIdle = (() => {
     const slot = runState[activeSessionId]
     return !slot?.timeline.length && !slot?.reply && !slot?.running && !slot?.queue.length && !slot?.process.length
   })()
-  $: currentThinking = thinkingChoice(sessions, activeSessionId)
   $: currentMode = sessionMode(sessions, activeSessionId)
-  $: thinkingLevel = thinkingDraft || currentThinking
-  $: thinkingIndex = Math.max(0, THINKING_LEVELS.indexOf(thinkingLevel))
-  $: thinkingLabel = THINKING_LABELS[thinkingLevel] ?? thinkingLevel
-  $: thinkingPercent = THINKING_LEVELS.length > 1 ? thinkingIndex / (THINKING_LEVELS.length - 1) : 0
   $: if (typeof document !== 'undefined') document.body.classList.toggle('resizing', dragging !== null)
   // D-B（外部审计 P1）：权限确认原先只渲染 active 槽（模板 `runState[activeSessionId].confirm`），
   // 也只由 active 槽回答（answerConfirm 取 activeSessionId）。后台会话的确认因此**完全不可见**，
@@ -393,25 +350,49 @@
     })
   }
 
-  function applySessionHistory(id: string, history: Array<{ id?: string; role: 'user' | 'assistant'; text: string; timestamp?: number; userIndex?: number; entryId?: string }> = []) {
+  function applySessionHistory(id: string, history: HistoryEntry[] = []) {
     const current = slotFor(id)
-    if (current.running) {
+    // 1-5 批次②（对抗审查缺口 #1/#8 根治）：分流抽成纯函数 splitPluginHistory ——
+    // 谓词方向由 tests/run-slot.test.mjs 行为测试锁定（chatHistory 谓词反转变异
+    // 曾在形状断言下存活，普通聊天历史被清空而测试全绿）。
+    // 插件条目经 pluginReplayPayload 透传 display（缺口 #1：display:{} 变异曾致
+    // 重放卡片丢 slot/component/title/fields），再规范化成 PluginMessage 进插件槽。
+    const { plugin: pluginHistory, chat: chatHistory } = splitPluginHistory(history)
+    if (pluginHistory.length) {
+      const replayed: PluginMessage[] = []
+      for (const item of pluginHistory) {
+        const payload = pluginReplayPayload(item as TimelineHistoryEntry)
+        const normalized = normalizePluginMessage({
+          customType: payload.customType,
+          content: payload.content,
+          display: payload.display,
+        })
+        if (normalized) {
+          normalized.entryId = payload.entryId
+          if (payload.timestamp) normalized.timestamp = payload.timestamp
+          replayed.push(normalized)
+        }
+      }
+      if (replayed.length) patchSlot(id, { pluginMessages: replayed })
+    }
+    const nextCurrent = slotFor(id)
+    if (nextCurrent.running) {
       // 缺陷 10（外部审计 P2）：这里原先是**直接 return 丢掉**。运行中打开一个
       // 有历史的会话时（或重启重绑时该会话正在跑），磁盘历史就此永久消失 —— 此后
       // 没有任何重试点，finishRun 不回头补加载，用户看到的时间线只有当前这一轮。
       // 改为记下来，在 finishRun 收尾时合并到时间线**前面**（当前轮的条目保留）。
-      if (history.length) pendingHistory = { ...pendingHistory, [id]: history }
+      if (chatHistory.length) pendingHistory = { ...pendingHistory, [id]: chatHistory }
       return
     }
     if (current.historyLoaded) {
       // 界面已经有时间线（例如 dispatchTurn 在 prompt 尚未 ack 时就置了
       // historyLoaded，随后重启重绑又读到同一份磁盘历史）。此时**合并**而不是
       // 覆盖：既补回被跳过的历史，又不会抹掉正在显示的内容。
-      const merged = mergeHistoryIntoTimeline(history, current.timeline)
+      const merged = mergeHistoryIntoTimeline(chatHistory, current.timeline)
       patchSlot(id, { timeline: merged, sent: sentFromTimeline(merged) })
       return
     }
-    const timeline = historyToTimeline(history)
+    const timeline = historyToTimeline(chatHistory)
     const lastReply = lastAssistantReply(timeline)
     patchSlot(id, {
       timeline,
@@ -487,9 +468,16 @@
    */
   function setProviderError(id: string, raw: string) {
     providerErrors = stashProviderError(providerErrors, id, raw)
+    // F4（终态兜底）：看到 provider 错误就武装兜底计时器。raw 为空串（正常结束 / 主动清理）
+    // 时 arm 内部直接返回，所以正常但很慢的模型绝不会被误收尾。
+    // 放在这个唯一漏斗里而不是散在分支上：任何一条新的错误来源都自动获得兜底。
+    settleArbiter.arm(id, raw)
   }
 
   function clearProviderError(id: string) {
+    // F4：清暂存的同时撤销兜底计时器 —— 所有收尾路径（finishRun / stop / teardownRun /
+    // abortRunningRuns / type:'error' 分支）都会走到这里，撤销点因此天然完整。
+    settleArbiter.cancel(id)
     providerErrors = removeProviderError(providerErrors, id)
   }
 
@@ -513,6 +501,7 @@
       if (!runState[id]?.running) continue
       clearRunWatchdog(id)
       clearProviderError(id)
+      const slot = slotFor(id)
       patchSlot(id, {
         running: false,
         phase: 'idle',
@@ -522,6 +511,8 @@
         retry: undefined,
         compacting: false,
         error: message,
+        // 侧车崩溃等不到任何终态事件：等待思考占位同样要收束成明确结束语。
+        process: settleStepsForFinish(slot.process),
         // 必须清掉 activeTurnId：finishRun 的早退条件是
         // `!running && !activeTurnId`，留着它会让之后任何一次 `finishRun(id, '')`
         // 走进写入分支，用空串把这条"侧车已停止"的提示抹掉。
@@ -595,11 +586,32 @@
     // 守卫必须在清理动作之前：否则陈旧事件会把新回合的看门狗与暂存错误一起清掉。
     if (!isTurnCurrent(current.activeTurnId, expectedTurnId)) return
     clearRunWatchdog(id)
+    if (!current.running && !current.activeTurnId) {
+      // 早退分支（外部对抗性审查 F1）：槽位已经收过一次尾，但这次调用**带着错误文本**。
+      // 调用方是在拿到终态事件时先 consumeProviderError 把暂存取走再传进来的，若这里
+      // 直接 return，那段文本就凭空消失了 —— 用户看到的就是"永久 Thinking 且不报错"。
+      // 真实可达路径：上一轮被 Stop 之后迟到的 agent_settled 以空错误先收尾一次
+      //（running/activeTurnId 双双归零），紧接着本轮真正的失败终态带着 402/404 到达；
+      // 或 F4 兜底仲裁器与迟到的 agent_end 竞争，谁后到谁就在早退分支上。
+      // 因此：早退也要把错误写进槽位（只写 error，不动 timeline/process —— 那些已经
+      // 由第一次收尾定稿了），并且照常清掉暂存，避免污染下一个回合。
+      clearProviderError(id)
+      // 但"用户自己按了停止"这一轮例外：此时弹"请求失败"是把取消说成故障。
+      // stop()/closeTab/deleteSession/archiveSession 都已在 runEpoch 上打了 markAborted，
+      // isAborted 判的正是"当前世代就是被中止的那一代、且之后没有新派发"（新一轮 dispatch
+      // 会让它变假），它与上游文案无关，比 isCancellationText 的正则可靠。
+      // ⚠️ 不能用 isSuperseded：那不是"被用户中止"，新一轮一 dispatch 就为真，会把
+      // 新一轮自己的真实失败静默吞掉 —— 那正是本文件 F1 要修的"永久 Thinking 且不报错"。
+      if (shouldSurfaceProviderError(errorMessage, runEpoch.isAborted(id))) patchSlot(id, { error: errorMessage })
+      return
+    }
     // 运行已收尾，暂存的 provider 错误必须一并清掉，否则下一次正常结束的会话
     // 可能被上一次残留的错误文本污染（误报"请求失败"）。
     clearProviderError(id)
-    if (!current.running && !current.activeTurnId) return
-    const process = closeOpenSteps(current.process)
+    // 终态收束：把没等到内容的"等待思考"占位改成明确结束语 —— 失败终态下思考内容
+    // 永远不会来，只 closeOpenSteps 会留着一个"正在等待模型返回思考内容…"的已完成
+    // 步骤，看起来像还在思考（用户实测 402 后思考框不消失）。
+    const process = settleStepsForFinish(current.process)
     const replyAt = current.reply && !current.replyAt ? Date.now() : current.replyAt
     const assistantId = `assistant-${current.activeTurnId || Date.now()}`
     const timeline = current.reply.trim() && !current.timeline.some((item) => item.id === assistantId)
@@ -634,7 +646,7 @@
     // 的时间线做合并。
     flushPendingHistory(id)
     finishSubRun(id, errorMessage ? 'error' : 'done')
-    void refreshCtxStats()
+    void composerRef?.refreshCtx()
     if (!errorMessage && loadPrefs().notifyDone && !sessions.find((item) => item.id === id)?.parentId) desktopNotify('Pi-My', '任务已完成')
     if (!errorMessage) scheduleDrain(id)
   }
@@ -647,21 +659,9 @@
     saveTodos(activeSessionId, next)
   }
 
-  function addTodo(parentId?: string) {
-    const content = todoDraft.trim()
-    if (!content) return
-    persistTodos([...todos, newTodo(content, parentId || undefined)])
-    todoDraft = ''
-    todoParentId = ''
-  }
+  // setTodoStatus/removeTodo/addTodo 已随面板抽到 TodoPanel.svelte（bind:todos 直接赋值同步）；
+  // App 侧只保留 persistTodos：/todo 斜杠命令与 todo-chip 计数仍需要它。
 
-  function setTodoStatus(id: string, status: TodoStatus) {
-    persistTodos(todos.map((item) => item.id === id ? { ...item, status } : item))
-  }
-
-  function removeTodo(id: string) {
-    persistTodos(todos.filter((item) => item.id !== id && item.parentId !== id))
-  }
 
   function finishSubRun(id: string, status: SubRun['status']) {
     const reply = slotFor(id).reply
@@ -692,7 +692,7 @@
     // 但取的仍是**同一个 id** 的槽。
     const current = slotFor(idAtEntry)
     inputText = message.text
-    mention = null
+    composerRef?.clearMention()
     const cutIndex = current.timeline.findIndex((item) => item.role === 'user' && item.userIndex === index)
     const timeline = cutIndex >= 0 ? current.timeline.slice(0, cutIndex) : current.timeline
     const previousReply = [...timeline].reverse().find((item) => item.role === 'assistant')
@@ -710,7 +710,47 @@
       activeTurnId: undefined,
       phase: 'idle'
     })
-    window.setTimeout(() => composerInput?.focus(), 0)
+    window.setTimeout(() => composerRef?.focusInput(), 0)
+  }
+
+  // T2⑦ 上下文编辑（SDK ContextEditEntry 原生化）：对单条模型可见条目追加分支局部编辑。
+  // replacement=null = 从模型上下文剔除该条目（UI 只开放这一种，替换文本留待后续按需开放）。
+  // 承重语义：entryId 必须来自 list_context 的真实条目（磁盘上的 append-only 操作，不可逆）。
+  async function removeContextEntry(entryId: string) {
+    const idAtEntry = activeSessionId
+    if (!idAtEntry || !sidecarReady || ctxEditBusyId) return
+    if (slotFor(idAtEntry).running) return
+    if (!window.confirm('确定从模型上下文中剔除这条消息？此操作写入会话文件且不可撤销（时间线显示不受影响）。')) return
+    ctxEditBusyId = entryId
+    try {
+      await requestOk('apply_context_edit', { sessionId: idAtEntry, targetId: entryId, replacement: null })
+      await refreshCtxEdits(idAtEntry)
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : String(error))
+    } finally {
+      ctxEditBusyId = ''
+    }
+  }
+
+  // 拉取当前会话的模型可见条目 + 已生效编辑清单（list_context）。
+  async function refreshCtxEdits(sessionId: string = activeSessionId) {
+    if (!sidecarReady || !sessionId) return
+    // 会话守卫（与 Composer.refreshCtx 同款）：list_context 在途期间用户可能切走会话，
+    // 晚到的响应绝不能把旧会话的编辑清单写进新会话视图。
+    const idAtEntry = activeSessionId
+    try {
+      const result = await requestOk('list_context', { sessionId }) as { edits?: typeof ctxEdits }
+      if (activeSessionId !== idAtEntry) return
+      ctxEdits = result?.edits ?? []
+    } catch {
+      // 失败静默清空 —— 但仅限仍停留在发起时的会话：切走后新会话自己的
+      // refreshCtxEdits 接管清单，旧请求的失败不得抹掉它。
+      if (activeSessionId === idAtEntry) ctxEdits = []
+    }
+  }
+
+  function editedEntryIds(): Set<string> {
+    return new Set(ctxEdits.map((item) => item.targetId))
   }
 
   async function spawnSubagent(agentName: string, task: string) {
@@ -728,7 +768,10 @@
     try {
       // U5：思考档位可被 per-agent 定义覆盖（默认 low —— 子代理要快）。
       // 模型覆盖同理：def.model 是 `provider${MODEL_SEPARATOR}modelId` 键。
-      const created = await request('create_session', { sessionId: childId, cwd: workspacePath, mode: def.mode, thinking: def.thinking ?? 'low' }) as { id: string; file?: string }
+      // requestOk：create_session 失败（sidecar 拒绝/超时）必须抛进下面的 catch，
+      // 让 finishSubRun(childId,'error') 真正发生 —— 旧 request() 吞成 null 后
+      // `created.file` 会先抛一个无文案的 TypeError，用户看到的是莫名的子代理失败。
+      const created = await requestOk('create_session', { sessionId: childId, cwd: workspacePath, mode: def.mode, thinking: def.thinking ?? 'low' }) as { id: string; file?: string }
       remember(childId, { file: created.file, mode: def.mode, readOnly: true, parentId, thinking: def.thinking })
       if (def.model) {
         const [provider, modelId] = def.model.split(MODEL_SEPARATOR)
@@ -747,7 +790,11 @@
       // "旧轮错误收尾新回合"的场景。这里的 request 已被 await 且在 try/catch 内，
       // 也无需补 .catch。
       await request('prompt', { sessionId: childId, text: wrapTask(def, task), cwd: workspacePath, behavior: 'steer', mode: def.mode })
-    } catch {
+    } catch (error) {
+      // 创建会话的失败原因（requestOk 抛出的 sidecar 文案）先写进子代理自己的槽，
+      // finishSubRun 会把 slotFor(childId).reply 汇总进父槽的 subRuns ——
+      // 否则用户只知道"失败了"，不知道为什么。
+      patchSlot(childId, { reply: error instanceof Error ? error.message : '子代理启动失败' })
       finishSubRun(childId, 'error')
     }
   }
@@ -787,39 +834,7 @@
     return activeSessionId
   }
 
-  function modelKey(model: ModelInfo) {
-    return `${model.provider}${MODEL_SEPARATOR}${model.id}`
-  }
-
-  function modelGroups(list: ModelInfo[]) {
-    const groups: Array<{ provider: string; items: ModelInfo[] }> = []
-    for (const model of list) {
-      const group = groups.find((item) => item.provider === model.provider)
-      if (group) group.items.push(model)
-      else groups.push({ provider: model.provider, items: [model] })
-    }
-    return groups
-  }
-
-  // 无会话记忆时回退到模型列表第一项
-  function modelChoice(list: ModelInfo[], records: Session[], id: string) {
-    const remembered = records.find((item) => item.id === id)?.model
-    if (remembered && list.some((model) => modelKey(model) === remembered)) return remembered
-    return list.length ? modelKey(list[0]) : ''
-  }
-
-  function thinkingChoice(records: Session[], id: string) {
-    return records.find((item) => item.id === id)?.thinking ?? DEFAULT_THINKING
-  }
-
-  function sessionMode(records: Session[], id: string) {
-    return records.find((item) => item.id === id)?.mode ?? 'ask'
-  }
-
-  function workspaceBase() {
-    if (workspacePath === '.') return '当前目录'
-    return workspacePath.split(/[\\/]/).pop() || workspacePath
-  }
+  // modelKey/modelGroups/modelChoice/thinkingChoice/sessionMode 已抽到 app-models.ts（0-5 批次 A）
 
   function loadProjects() {
     try {
@@ -834,9 +849,7 @@
     try { localStorage.setItem('pdn.projects', JSON.stringify(projects)) } catch { /* ignore */ }
   }
 
-  function projectName(path: string) {
-    return path.split(/[\\/]/).filter(Boolean).pop() || path
-  }
+  // projectName 已抽到 app-files.ts（0-5 批次 A）
 
   function addProjectPath(path: string) {
     if (!path || path === '.') return
@@ -890,7 +903,7 @@
   }
 
   function workspaceLabel() {
-    return workspacePath === '.' ? '选择工作区' : workspaceBase()
+    return workspacePath === '.' ? '选择工作区' : workspaceBase(workspacePath)
   }
 
   function statusDotTitle(session: Session) {
@@ -1053,7 +1066,7 @@
 
   function chooseSessionModel(session: Session) {
     sessionMenu = null
-    void selectSession(session).then(() => { modelOpen = true })
+    void selectSession(session).then(() => { composerRef?.openModelMenu() })
   }
 
   function copySessionValue(value: string) {
@@ -1078,98 +1091,6 @@
     sessionMenu = null
   }
 
-  function documentStats() {
-    if (!selectedFile) return ''
-    const lines = fileContent ? fileContent.split('\n').length : 0
-    const kb = Math.max(1, Math.ceil(new TextEncoder().encode(fileContent).length / 1024))
-    return `${lines} 行 · ${kb} KB`
-  }
-
-  function clickOutside(node: HTMLElement) {
-    function onMouseDown(event: MouseEvent) {
-      if (!node.contains(event.target as Node)) modelOpen = false
-    }
-    function onKeydown(event: KeyboardEvent) {
-      if (event.key === 'Escape') modelOpen = false
-    }
-    window.addEventListener('mousedown', onMouseDown)
-    window.addEventListener('keydown', onKeydown)
-    return {
-      destroy() {
-        window.removeEventListener('mousedown', onMouseDown)
-        window.removeEventListener('keydown', onKeydown)
-      }
-    }
-  }
-
-  function clickOutsideCtx(node: HTMLElement) {
-    function onMouseDown(event: MouseEvent) {
-      if (!node.contains(event.target as Node)) ctxOpen = false
-    }
-    function onKeydown(event: KeyboardEvent) {
-      if (event.key === 'Escape') ctxOpen = false
-    }
-    window.addEventListener('mousedown', onMouseDown)
-    window.addEventListener('keydown', onKeydown)
-    return {
-      destroy() {
-        window.removeEventListener('mousedown', onMouseDown)
-        window.removeEventListener('keydown', onKeydown)
-      }
-    }
-  }
-
-  function clickOutsideThinking(node: HTMLElement) {
-    function onMouseDown(event: MouseEvent) {
-      if (!node.contains(event.target as Node)) thinkingOpen = false
-    }
-    function onKeydown(event: KeyboardEvent) {
-      if (event.key === 'Escape') thinkingOpen = false
-    }
-    window.addEventListener('mousedown', onMouseDown)
-    window.addEventListener('keydown', onKeydown)
-    return {
-      destroy() {
-        window.removeEventListener('mousedown', onMouseDown)
-        window.removeEventListener('keydown', onKeydown)
-      }
-    }
-  }
-
-  function clickOutsideMode(node: HTMLElement) {
-    function onMouseDown(event: MouseEvent) {
-      if (!node.contains(event.target as Node)) modeOpen = false
-    }
-    function onKeydown(event: KeyboardEvent) {
-      if (event.key === 'Escape') modeOpen = false
-    }
-    window.addEventListener('mousedown', onMouseDown)
-    window.addEventListener('keydown', onKeydown)
-    return {
-      destroy() {
-        window.removeEventListener('mousedown', onMouseDown)
-        window.removeEventListener('keydown', onKeydown)
-      }
-    }
-  }
-
-  function clickOutsideKind(node: HTMLElement) {
-    function onMouseDown(event: MouseEvent) {
-      if (!node.contains(event.target as Node)) kindOpen = false
-    }
-    function onKeydown(event: KeyboardEvent) {
-      if (event.key === 'Escape') kindOpen = false
-    }
-    window.addEventListener('mousedown', onMouseDown)
-    window.addEventListener('keydown', onKeydown)
-    return {
-      destroy() {
-        window.removeEventListener('mousedown', onMouseDown)
-        window.removeEventListener('keydown', onKeydown)
-      }
-    }
-  }
-
   function clickOutsideBranch(node: HTMLElement) {
     function onMouseDown(event: MouseEvent) {
       if (!node.contains(event.target as Node)) branchOpen = false
@@ -1187,19 +1108,10 @@
     }
   }
 
-  function toggleKind() {
-    kindOpen = !kindOpen
-    if (kindOpen) {
-      modeOpen = false
-      modelOpen = false
-      thinkingOpen = false
-      ctxOpen = false
-    }
-  }
-
   function toggleMore() {
     moreOpen = !moreOpen
-    if (moreOpen) { kindOpen = false; modeOpen = false; modelOpen = false; thinkingOpen = false; ctxOpen = false }
+    // 0-5 批次 C：composer 五菜单随组件走，经 ref 关闭。
+    if (moreOpen) composerRef?.closeMenus()
   }
 
   function clickOutsideMore(node: HTMLElement) {
@@ -1219,45 +1131,13 @@
     }
   }
 
-  function setAgentKind(next: boolean) {
-    imageGenMode = next
-    imageGenError = ''
-    kindOpen = false
-  }
-
-  function toggleMode() {
-    modeOpen = !modeOpen
-    if (modeOpen) {
-      kindOpen = false
-      modelOpen = false
-      thinkingOpen = false
-      ctxOpen = false
-      const rect = modeButtonRef?.getBoundingClientRect()
-      if (rect) modeMenuUp = window.innerHeight - rect.bottom < 220
-    }
-  }
-
   async function setMode(mode: string) {
-    modeOpen = false
+    // 0-5 批次 C：菜单态随 Composer 组件走；这里只保留分派桥（runSlashCommand /set-mode-plan 用）。
     if (!mode) return
     const id = ensureActiveId()
     remember(id, { mode })
     if (!sidecarReady || !sessions.some((item) => item.id === id && item.file)) return
     await request('set_mode', { sessionId: id, mode })
-  }
-
-  function toggleThinking() {
-    thinkingOpen = !thinkingOpen
-    thinkingDraft = ''
-    if (thinkingOpen) {
-      thinkingHelp = false
-      modelOpen = false
-      modeOpen = false
-      ctxOpen = false
-      kindOpen = false
-      const rect = thinkingButtonRef?.getBoundingClientRect()
-      if (rect) thinkingMenuUp = window.innerHeight - rect.bottom < 220
-    }
   }
 
   function clampWidth(value: number, min: number, max: number) {
@@ -1306,156 +1186,14 @@
   onDestroy(() => {
     stopDrag()
     if (agentUpdateTimer) window.clearInterval(agentUpdateTimer)
+    // F4（终态兜底）：组件销毁时必须撤销所有兜底计时器。撤销路径原先只挂在
+    // clearProviderError 上（关标签/收尾/中止都会走到），但组件销毁时这些都不必然发生 ——
+    // 遗留的 window.setTimeout 回调会在已销毁的组件上跑 finishRun，往 runState 里写回
+    // 一个永远不会被渲染的槽位，并可能触发一次 desktopNotify。
+    settleArbiter.cancelAll()
     window.removeEventListener('resize', clampToViewport)
     if (typeof document !== 'undefined') document.body.classList.remove('resizing')
   })
-
-  function toggleCtx() {
-    ctxOpen = !ctxOpen
-    if (ctxOpen) {
-      modelOpen = false
-      thinkingOpen = false
-      modeOpen = false
-      kindOpen = false
-      const rect = ctxButtonRef?.getBoundingClientRect()
-      if (rect) ctxMenuUp = window.innerHeight - rect.bottom < 320
-      void refreshCtxStats()
-      void refreshQuotas()
-    }
-  }
-
-  // 2-8/U4：provider 额度 + 重置时间（打开面板时拉一次，不自动轮询——probe 有网络开销）
-  type QuotaRow = { provider: string; ok?: boolean; message?: string; value?: unknown } & { nextResetAt: string | null; msUntilReset: number | null; cycleElapsedPercent: number | null }
-  let quotas: QuotaRow[] = []
-  let quotasBusy = false
-  let quotasQueriedAt = 0
-
-  async function refreshQuotas() {
-    if (!sidecarReady || quotasBusy) return
-    quotasBusy = true
-    try {
-      const response = await requestRaw('provider_quotas', {})
-      if (response.ok && activeSessionId) {
-        const result = response.result as { quotas?: Array<{ provider: string; ok?: boolean; message?: string; value?: unknown }>; queriedAt?: number } | null
-        const cycles = loadPrefs().quotaCycles ?? {}
-        quotas = (result?.quotas ?? []).map((quota) => withResetEstimate({ ...quota, cycle: cycles[quota.provider] ?? 'monthly' }))
-        quotasQueriedAt = result?.queriedAt ?? Date.now()
-      }
-    } finally {
-      quotasBusy = false
-    }
-  }
-
-  function formatCountdown(ms: number | null): string {
-    return formatResetCountdown(ms)
-  }
-
-  // U4 状态栏面板：get_state 的完整快照（ctxOpen 面板里展示）
-  let sessionState: StateSnapshot | null = null
-  $: stateSummaryView = sessionState ? stateSummary(sessionState) : null
-
-  async function refreshCtxStats() {
-    if (!sidecarReady || !activeSessionId) return
-    const id = activeSessionId
-    try {
-      // 1-8：改用 get_state 单一快照（含 session_stats 的全部字段 + U4 需要的额外状态）。
-      // peekState 语义：只读，不重置任何会话生命周期。
-      const response = await requestRaw('get_state', { sessionId: id })
-      if (!response.ok || activeSessionId !== id) {
-        if (activeSessionId === id) ctxStats = { ...EMPTY_CTX }
-        return
-      }
-      const snapshot = response.result as StateSnapshot | null
-      if (!snapshot) { ctxStats = { ...EMPTY_CTX }; return }
-      // 既有上下文环继续用本地口径字段（get_state 已透传 currentContext/window/costUsd/cacheHitRate）
-      ctxStats = {
-        currentContext: Number(snapshot.currentContext) || 0,
-        window: Number(snapshot.window) || 0,
-        totals: (snapshot.stats?.tokens ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }) as CtxStats['totals'],
-        costUsd: Number(snapshot.stats?.cost ?? snapshot.costUsd) || 0,
-        cacheHitRate: Number(snapshot.cacheHitRate) || 0,
-      }
-      // U4 状态栏面板的完整快照
-      sessionState = snapshot
-    } catch {
-      if (activeSessionId === id) {
-        ctxStats = { ...EMPTY_CTX }
-        sessionState = null
-      }
-    }
-  }
-
-  function ctxProgress() {
-    if (!ctxStats?.window) return 0
-    return Math.max(0, Math.min(100, Math.round((ctxStats.currentContext / ctxStats.window) * 100)))
-  }
-
-  function ctxDash() {
-    const length = (CTX_CIRC * ctxProgress()) / 100
-    return `${length.toFixed(2)} ${CTX_CIRC.toFixed(2)}`
-  }
-
-  function fmtWan(value: number) {
-    if (!Number.isFinite(value) || value < 10000) return String(value)
-    return `${(value / 10000).toFixed(0)}万`
-  }
-
-  function toggleModel() {
-    modelOpen = !modelOpen
-    if (modelOpen) {
-      thinkingOpen = false
-      modeOpen = false
-      ctxOpen = false
-      kindOpen = false
-      modelQuery = ''
-      const rect = modelButtonRef?.getBoundingClientRect()
-      if (rect) modelMenuUp = window.innerHeight - rect.bottom < 360
-      window.setTimeout(() => modelSearchInput?.focus(), 0)
-    }
-  }
-
-  async function setModel(value: string) {
-    if (!value || !sidecarReady) return
-    const id = ensureActiveId()
-    remember(id, { model: value })
-    if (!sessions.some((item) => item.id === id && item.file)) return
-    const [provider, modelId] = value.split(MODEL_SEPARATOR)
-    const result = await request('set_model', { sessionId: id, provider, modelId }) as { provider: string; id: string; thinkingLevel?: string } | null
-    if (result) remember(id, { model: `${result.provider}${MODEL_SEPARATOR}${result.id}`, thinking: result.thinkingLevel ?? thinkingChoice(sessions, id) })
-    else remember(id, { model: undefined })
-  }
-
-  function pickModel(model: ModelInfo) {
-    modelOpen = false
-    modelQuery = ''
-    void setModel(modelKey(model))
-  }
-
-  async function setThinking(level: string) {
-    if (!level || !sidecarReady) return
-    const id = ensureActiveId()
-    remember(id, { thinking: level })
-    if (!sessions.some((item) => item.id === id && item.file)) return
-    const result = await request('set_thinking', { sessionId: id, level }) as { level?: string } | null
-    // setThinkingLevel 会按模型能力 clamp，以 sidecar 回传的实际档位为准
-    remember(id, { thinking: result?.level })
-  }
-
-  // 拖动中只更新本地 draft，松手（change）才提交，避免频繁请求 sidecar
-  function onThinkingInput(event: Event) {
-    const level = THINKING_LEVELS[Number((event.currentTarget as HTMLInputElement).value)]
-    if (level) thinkingDraft = level
-  }
-
-  function onThinkingChange(event: Event) {
-    const level = THINKING_LEVELS[Number((event.currentTarget as HTMLInputElement).value)]
-    thinkingDraft = ''
-    if (level) void setThinking(level)
-  }
-
-  function toggleThinkingHelp() {
-    thinkingHelp = !thinkingHelp
-  }
 
   // 统一的请求发送：挂 pending、按类型设超时、失败/超时都清理并 settle。
   // 修复点：旧实现没有超时——sidecar 若挂住或悄悄死掉，pending 会永久泄漏且
@@ -1494,6 +1232,17 @@
     return sendRequest(type, payload)
   }
 
+  // 与 request() 的唯一差别：ok:false 不再被吞成 null，而是把 sidecar 的错误文案抛出。
+  // 背景（「永久 Thinking」根因）：request() 把失败折叠成 null 且永不 reject，
+  // dispatchTurn 前奏（create_session/set_model/prompt）外层的 .catch 因此不可达 ——
+  // sidecar 报「会话不存在或已关闭」时槽位卡死在 running/Thinking，只能等看门狗兜底。
+  // 凡是"失败必须让用户看见"的调用链都改用本函数，让 catch 拿到真实文案交给 finishRun。
+  async function requestOk(type: string, payload = {}) {
+    const response = await sendRequest(type, payload)
+    if (!response.ok) throw new Error(response.error || `请求「${type}」失败`)
+    return response.result
+  }
+
   // sidecar 重启后，旧请求的响应永远不会到达；必须清空 pending 并明确告知用户，
   // 否则界面会停在"运行中"且后续交互静默失效。
   // `keepId` 是 Rust 侧重启后已经重新发起的那个请求——它仍然有效，不能一起丢掉。
@@ -1512,7 +1261,7 @@
     for (const [id, settle] of survivors) pending.set(id, settle)
     abortRunningRuns('Pi Agent 侧车已重启，本次运行被中止。会话文件仍在，可继续对话。')
     sidecarReady = true
-    void refreshCtxStats()
+    void composerRef?.refreshCtx()
     // sidecar 重启后其内存态 sessions 为空，而前端仍持有会话 id → 文件路径的映射。
     // 若不重新绑定，下次 prompt 会让 sidecar 按同一 id 新建一个会话文件，
     // **静默丢掉原会话历史**（用户看不到任何错误，只是"接着聊"变成了新会话）。
@@ -1657,7 +1406,45 @@
       // 扩展要求把文本放进输入框（pasteToEditor / setEditorText）
       if (payload.type === 'ext_editor_text') {
         inputText = String(payload.text ?? '')
-        composerInput?.focus()
+        composerRef?.focusInput()
+      }
+      // 1-5 批次②：扩展运行错误（bindExtensions onError 通道）——之前扩展崩了用户毫无感知。
+      // 用现有 extToasts 展示，danger 色；不中断会话（ext_error 是非致命事件）。
+      if (payload.type === 'ext_error') {
+        const extName = String(payload.extensionPath ?? '').split(/[\\/]/).pop() || '未知扩展'
+        const text = `扩展出错（${extName}）：${String(payload.error ?? '未知错误')}`
+        extToasts = [...extToasts, { id: `t${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, text, type: 'error' }].slice(-3)
+        window.setTimeout(() => { extToasts = extToasts.slice(1) }, 8000)
+      }
+      // 1-5 批次②：扩展 setStatus 桥接 —— 转成一条 slot:'status' 的插件消息进状态槽。
+      // 同一 key 覆盖旧值；text 为空 = 清除该键。会话隔离：只更新发起会话自己的状态。
+      if (payload.type === 'plugin_status') {
+        const sessionId = String(payload.sessionId ?? activeSessionId)
+        const statusKey = String(payload.key ?? '')
+        if (statusKey) {
+          const slot = runState[sessionId]
+          const base = slot?.pluginMessages ?? []
+          const kept = base.filter((m) => !(m.slot === 'status' && m.title === statusKey))
+          if (String(payload.text ?? '') !== '') {
+            const normalized = normalizePluginMessage({
+              customType: 'ui.plugin',
+              display: { slot: 'status', component: 'text', title: statusKey, body: String(payload.text ?? ''), tone: 'accent' },
+            })
+            if (normalized) {
+              normalized.entryId = `status-${sessionId}-${statusKey}`
+              normalized.timestamp = Date.now()
+              patchSlot(sessionId, { pluginMessages: [...kept, normalized] })
+            }
+          } else {
+            patchSlot(sessionId, { pluginMessages: kept })
+          }
+        }
+      }
+      // 1-5 批次②：扩展 setTitle 桥接 —— 暂存到会话槽位，标题栏/标签展示用。
+      if (payload.type === 'plugin_title') {
+        const sessionId = String(payload.sessionId ?? activeSessionId)
+        const title = String(payload.title ?? '').slice(0, 200)
+        if (title) patchSlot(sessionId, { pluginTitle: title })
       }
       if (payload.type === 'login_event') {
         const ev = payload.event
@@ -1688,7 +1475,19 @@
         const event = payload.event
         if (!event) return
         const id = payload.sessionId || activeSessionId
-        if (!id) return
+        if (!id) {
+          // Rust 读线程的会话无关诊断（"输出流结束"/"sidecar 已退出"）在从未见过任何
+          // sessionId 时会落到这里。没有会话就没有槽位可写，但不能**静默**吞掉——
+          // 这正是用户报障时"界面毫无反应"的那类信息。
+          //
+          // 刻意**不**在这里写 `event.type === 'error'` 形式的筛选：那与归约器分支同形，
+          // 会让 source-assert 的 eventConditionTypesOf / eventBlockOf("error") 把这个
+          // 入口兜底当成"第一处带花括号的 error 主分支"，从而在错误的块上求值（诱饵分支
+          // 防线正是为此存在）。到达这里的只有读线程诊断本身——sidecar 正常事件都带
+          // sessionId——所以按类型筛选既无必要，也会牺牲可观测性。
+          console.warn('[pi-my] sidecar 诊断（无会话可归属）：', String(event.message ?? event.type ?? ''))
+          return
+        }
         // 已关闭/已删除的会话不再接受任何事件（缺陷 3 的入口防线）。patchSlot 本身
         // 也会拒绝，但事件涟漪还会调 touchRunWatchdog / markSession / startToolStep，
         // 那些不走 patchSlot，必须在入口就拦掉，否则会重新武装一个无人能停的看门狗。
@@ -1704,9 +1503,9 @@
         // 被误当成当前轮的收尾，缺陷照旧。
         // D-A（外部审计 P1）：preflight 阶段（模型校验/鉴权/自动压缩/扩展钩子）点"停止"
         // 是**无效**的 —— SDK 的 `agent.abort()` 只对已建立的 activeRun 生效
-        //（pi-agent-core/dist/agent.js:202 `this.activeRun?.abortController.abort()`），
+        //（pi-agent-core/dist/agent.js:218-220 `this.activeRun?.abortController.abort()`），
         // 而那时 activeRun 还不存在；这一轮随后照常进入 loop，并无条件发 `agent_start`
-        //（agent-loop.js:49 之前没有任何 signal 检查）。旧代码在下面 agent_start 分支
+        //（agent-loop.js:50 是 runAgentLoop 的第一条 emit，之前没有任何 signal 检查）。旧代码在下面 agent_start 分支
         // 里无条件 `patchSlot({running:true})`，把用户刚按下的停止原样撤销；而
         // activeTurnId 已被 stop() 清空 ⇒ 此后所有回合判据恒真，用户只能等 180s
         // 看门狗超时，还被归因成"模型超过 3 分钟没有返回"。
@@ -1738,7 +1537,22 @@
         }
         // 自动重试的心跳不算"有进展"：否则 auto_retry_start/end 会不断续期看门狗，
         // 一个反复失败又反复重试的模型可以让界面永远停在 Thinking。
+        //
+        // 「退避 sleep 期间兜底与看门狗同时失效」这台账已核过（第六轮审查提出）：
+        // 跳过 touchRunWatchdog **不等于**撤销看门狗 —— touch 是先清后设，跳过只是不续期，
+        // 此前 agent_end（willRetry 分支）刚设下的那把 180 s 计时器仍然活着，且那时
+        // running 仍为真，到点必然收尾。同时事件入口的 settleArbiter.cancel 只取消 8 s 兜底，
+        // 而下一个 message_end/turn_end 一旦再带错误就立刻重新武装。故缺口上界是
+        // min(退避时长, 上一次真实事件起算的 180 s)：默认 maxRetries=3 ⇒ 退避 2/4/8 s，
+        // 远小于看门狗。真要让退避超过 180 s，需要用户把 maxRetries 调到 6 次以上
+        // （retryDelayMs 的 60 s 上限），那已属显式配置而非默认路径，不另设防线。
         if (event.type !== 'auto_retry_start' && event.type !== 'auto_retry_end') touchRunWatchdog(id)
+        // F4（终态兜底）：任何一条真实事件都说明事件链还活着，撤销兜底计时器。
+        // 放在这里而非事件分派之后是刻意的：紧随其后的 message_end/turn_end 若带 provider
+        // 错误，setProviderError 会立刻重新武装；若不带（正常结束）则保持撤销状态。
+        // 这样 auto_retry_start（SDK 先发事件再睡退避）与 compaction_start（压缩期间的长静默）
+        // 都会自动解除兜底，不会误判成"终态事件丢了"。
+        settleArbiter.cancel(id)
         // provider 失败时 SDK 不发 type:'error'，只给一条 stopReason:'error' 的 assistant
         // 终态消息。这里先暂存，等**真正的终态**（agent_end 且不重试 / agent_settled）再报。
         // 正常结束时 assistantErrorFrom 返回空串，会顺手清掉上一次的暂存，避免误报。
@@ -1784,7 +1598,7 @@
           })
         }
         if (event.type === 'tool_execution_end') {
-          endToolStep(id, String(event.toolName || '工具'), String(event.toolCallId || ''), event.result, Boolean(event.isError))
+          endToolStep(id, String(event.toolName || '工具'), String(event.toolCallId || ''), toolResultBrief(event.result, String(event.toolName || '')), Boolean(event.isError))
           // show_image 工具（1-3）：details.images 是发图数据源（模型不可见，仅供 UI）
           const details = (event.result as { details?: { images?: Array<{ data: string; mimeType: string }>; paths?: string[] } } | null | undefined)?.details
           if (details?.images?.length) {
@@ -1800,7 +1614,7 @@
         if (event.type === 'agent_start') {
           // D-A：这一轮在 preflight 阶段就被用户停过（上面的 startedButAborted）。
           // 停止必须作数：此刻 agent_start 已到达，说明 `agent.activeRun` 已经建立
-          //（agent.js:330-343 在跑 executor 之前就赋了 activeRun），**补发一次 abort
+          //（agent.js:341-350 在 `:355 await executor(signal)` 之前就赋了 activeRun），**补发一次 abort
           // 是有效的** —— 这正好补上 preflight 期那次空操作。然后不 markThinking、
           // 不把 running 打回 true、不 markSession。
           // D2（外部对抗性审查确证回归）：这里**不能** clearRunWatchdog 把它拆掉。
@@ -1840,11 +1654,21 @@
           // 失败原因，比从消息里翻更可靠；同时它标志着该次运行即将收尾。
           // 但用户主动 Stop 会打断退避 sleep，SDK 随即发
           // `auto_retry_end{success:false, finalError:"Retry cancelled"}`
-          //（agent-session.js:2315-2326）—— 那是"用户自己按了停止"，不是 provider 故障，
+          //（agent-session.js:2942 `finalError: "Retry cancelled"`，定义在 :2933-2944，唯一触发点在
+          //  :2977 的 _prepareRetry catch —— 用户点 Stop 打断退避 sleep 时触发）—— 那是"用户自己按了停止"，不是 provider 故障，
           // 记下来就会在收尾时弹出莫名其妙的"请求失败"。故此处必须过滤掉。
           if (event.success === false) {
             const finalError = String(event.finalError ?? '')
-            if (!isCancellationText(finalError)) setProviderError(id, finalError)
+            // 双重闸门：① 文案过滤（SDK 0.99.1 的 _finishCancelledRetry 在
+            // agent-session.js:2933-2944 硬编码 finalError: "Retry cancelled"，所以现在必然命中），
+            // ② 回合被用户中止过（stop() / closeTab / deleteSession / archiveSession 里的
+            // runEpoch.markAborted）。只靠 ① 是一条"依赖上游文案字面量"的隐性契约：上游哪天改措辞，
+            // 取消就会被当成 provider 故障，经 arm 武装兜底，8 秒后在已经 idle 的槽位上炸出一条
+            // 假"请求失败"。② 与措辞无关，永远成立。
+            // 注意不要把 ② 换成 isSuperseded：后者判的是"已派发更新的世代"，新一轮刚 dispatch
+            // 就会为真 —— 那会连带把**新一轮自己的真实失败**也吞掉。isAborted 只认"当前世代就是
+            // 被中止的那一代、且之后再没派发"，所以新一轮的真实错误照常显示。
+            if (!isCancellationText(finalError) && shouldSurfaceProviderError(finalError, runEpoch.isAborted(id))) setProviderError(id, finalError)
           }
         }
         // 1-2 上下文蒸发：SDK 自动/手动压缩事件（此前透传但被忽略，用户只见"卡住"）
@@ -1861,7 +1685,9 @@
           if (event.willRetry) patchSlot(id, { running: true, phase: 'thinking', processOpen: true })
           else finishRun(id, consumeProviderError(id))
         }
-        // agent_settled 是 SDK 保证到达的**唯一终态信号**（agent-session.js:347）。
+        // agent_settled 是 SDK 保证到达的**唯一终态信号**（0.99.1 的
+        // `_emitAgentSettled()` 在 agent-session.js:662-672，由 `_runAgentPrompt` 的
+        // finally 于 :1344 调用；agent_end 则可能因 willRetry 被跳过）。
         // 它一定会发，因此是兜底：即使前面 agent_end 因 willRetry 被跳过、或压缩
         // 触发了一次 continue，这里也能把 running 收回并显示真正的失败原因。
         if (event.type === 'agent_settled') finishRun(id, consumeProviderError(id))
@@ -1888,6 +1714,12 @@
       sidecarReady = true
       void refreshPetStatus()
       void checkAgentUpdate()
+      // 批次③：拉取一次项目信任态（含扩展声明的沙箱渲染器数量），失败不阻塞启动。
+      // 信任真值在 sidecar（resolveProjectTrust），这里只缓存给渲染门控用。
+      try {
+        const trust = await request('list_ui_renderers', {}) as { trusted?: boolean } | null
+        setProjectTrusted(trust?.trusted !== false)
+      } catch { setProjectTrusted(true) }
       agentUpdateTimer = window.setInterval(() => void checkAgentUpdate(true), 6 * 60 * 60 * 1000)
       models = (await request('list_models') as ModelInfo[]) ?? []
       await loadFiles()
@@ -1908,7 +1740,7 @@
         const firstOpen = sessions.find((item) => !item.archived && !item.parentId)
         if (firstOpen) await selectSession(firstOpen)
       }
-      void refreshCtxStats()
+      void composerRef?.refreshCtx()
 
     } catch {
       // Browser preview mode remains useful without the native sidecar.
@@ -1946,105 +1778,16 @@
     await activateProject(selected)
   }
 
+  // git 面板逻辑已抽到 GitPanel.svelte（0-5 批次 B-1）：gitChanges/diffContent/staged/
+  // commitMessage/gitError 状态与 git_status/git_diff/git_add/git_commit/git_push 操作
+  // 全部在组件内自持，经 bind: 双向同步；这里只保留父组件侧的驱动入口。
   async function refreshGit(cwd = workspacePath) {
-    if (!sidecarReady) return
-    const target = cwd
-    const changes = await request('git_status', { cwd: target }) as GitChange[]
-    if (workspacePath === target) gitChanges = changes
+    await gitPanelRef?.refresh(cwd)
   }
 
-  async function loadDiff(file: string) {
-    if (!sidecarReady) return
-    diffContent = await request('git_diff', { cwd: workspacePath, path: file }) as string
-    panel = '变更'
-  }
-
-  function isStaged(code: string) {
-    return code[0] !== ' ' && code[0] !== '?'
-  }
-
-  async function runGit(type: string, payload: Record<string, unknown>) {
-    gitError = ''
-    const res = await requestRaw(type, payload)
-    if (!res.ok) {
-      gitError = res.error || '操作失败'
-      return false
-    }
-    commitMessage = ''
-    staged = {}
-    await refreshGit()
-    return true
-  }
-
-  async function stageFiles() {
-    const paths = gitChanges.filter((change) => (staged[change.path] ?? false) && !isStaged(change.code)).map((change) => change.path)
-    if (!paths.length) return
-    const ok = await confirm(`确认暂存勾选的 ${paths.length} 个文件？`, { title: '暂存更改', kind: 'warning' })
-    if (!ok) return
-    await runGit('git_add', { cwd: workspacePath, paths })
-  }
-
-  async function commitChanges() {
-    const message = commitMessage.trim() || loadPrefs().gitTemplate.trim()
-    if (!message) return
-    const stagedCount = gitChanges.filter((change) => isStaged(change.code)).length
-    const ok = await confirm(`确认提交「${message}」？将提交当前全部已暂存的 ${stagedCount} 个文件。`, { title: '提交更改', kind: 'warning' })
-    if (!ok) return
-    await runGit('git_commit', { cwd: workspacePath, message })
-  }
-
-  async function pushChanges() {
-    const ok = await confirm('确认将本地提交推送到远程仓库？', { title: '推送', kind: 'warning' })
-    if (!ok) return
-    await runGit('git_push', { cwd: workspacePath })
-  }
-
-  async function saveFile() {
-    if (!selectedFile || !sidecarReady) return
-    await request('write_file', { cwd: workspacePath, path: selectedFile, content: fileContent })
-    editingFile = false
-    await refreshGit()
-  }
-  async function previewFile(file: string) {
-    selectedFile = file
-    editingFile = false
-    if (sidecarReady) {
-      // request() 对失败返回 undefined（ok:false 不 reject），所以判 result 而不是 catch
-      const response = await requestRaw('read_file', { cwd: workspacePath, path: file })
-      const result = response.ok ? response.result as { content: string } | null : null
-      if (result?.content !== undefined) {
-        fileContent = result.content
-        largeFile = null
-        panel = '文档'
-        return
-      }
-      // 2-12：超过 512KB 的文件 → 虚拟化分块预览（此前直接报错打不开）
-      const message = String(response.error || '')
-      if (message.includes('512 KB') || message.includes('超过')) {
-        await previewLargeFile(file)
-        return
-      }
-      fileContent = ''
-      selectedFile = ''
-      patchSlot(ensureActiveId(), { error: `读取文件失败: ${message || '未知错误'}` })
-    }
-  }
-
-  /** 2-12：大文件分块读取（虚拟化预览路径）。 */
-  async function readFileChunk(offset: number, limit: number): Promise<{ totalLines: number; lines: string[]; offset: number }> {
-    const response = await requestRaw('read_file_chunk', { cwd: workspacePath, path: selectedFile, offset, limit })
-    if (!response.ok) throw new Error(response.error || '读取失败')
-    return response.result as { totalLines: number; lines: string[]; offset: number }
-  }
-
-  /** 大文件入口：read_file 会拒绝 >512KB，捕获后切虚拟化预览。 */
-  async function previewLargeFile(file: string) {
-    selectedFile = file
-    editingFile = false
-    fileContent = ''
-    largeFile = { path: file }
-    panel = '文档'
-  }
+  // 0-5 批次 B-5：文档面板逻辑（saveFile/previewFile/readFileChunk/previewLargeFile/
+  // documentStats/文件树）已抽到 FilePanel.svelte（状态经 bind: 双向同步，保存成功
+  // 经 onSaved 回调驱动 refreshGit，读取失败经 onReadError 写当前会话槽位）。
   async function selectSession(session: Session) {
     if (session.parentId) {
       const run = slotFor(session.parentId).subRuns.find((item) => item.id === session.id)
@@ -2052,6 +1795,10 @@
       return
     }
     branchOpen = false
+    // T2⑦ 重置必须前置到一切提前 return 之前（子会话分流/open_session 失败/epoch 作废）：
+    // 否则上一个会话的编辑清单会残留到新视图，直到晚到的 refreshCtxEdits 才被覆盖。
+    ctxEdits = []
+    ctxPanelOpen = false
     // 用户显式打开一个会话 = 该 id 重新活跃，必须解除 closedIds 封禁。
     // 缺口背景：markSlotOpen 原先只在 dispatchTurn 里调用，而关闭标签/删除会话后
     // 同一 id 完全可能重新出现在侧栏（remember() 是那 13 个调用点唯一的入口，
@@ -2067,6 +1814,8 @@
     activeSessionId = session.id
     activeSession = session.title
     todos = loadTodos(session.id)
+    todoDraft = ''
+    todoParentId = ''
     if (sidecarReady && session.file) {
       // 传当前会话记录的模式，并以 sidecar 回传的实际模式为准校正 UI。
       // 修复：旧实现不传也不回读 mode，导致"UI 显示计划模式、sidecar 实际是 ask"的失同步。
@@ -2082,7 +1831,8 @@
         patchSlot(session.id, { error: opened.error || '读取历史会话失败', historyLoaded: false })
       }
     }
-    void refreshCtxStats()
+    void composerRef?.refreshCtx()
+    void refreshCtxEdits(session.id)
   }
 
   function openDir(path: string) {
@@ -2125,64 +1875,6 @@
     return petModelUrl(pet)
   }
 
-  async function addAttachments() {
-    if (!sidecarReady) return
-    attachError = ''
-    const selected = await open({ multiple: true, title: '添加附件' })
-    if (!selected) return
-    const paths = Array.isArray(selected) ? selected : [selected]
-    for (const path of paths) {
-      const res = await requestRaw('read_attachment', { cwd: workspacePath, path })
-      if (!res.ok) {
-        attachError = res.error || '附件读取失败'
-        continue
-      }
-      attachments = [...attachments, res.result as { kind: 'image' | 'text'; name: string; mimeType?: string; data?: string; content?: string }]
-    }
-  }
-
-  async function handleClipboardPaste(event: ClipboardEvent) {
-    const clipboard = event.clipboardData
-    if (!clipboard) return
-    const itemFiles = Array.from(clipboard.items || [])
-      .filter((item) => item.kind === 'file')
-      .map((item) => item.getAsFile())
-      .filter((file): file is File => Boolean(file))
-    const files = itemFiles.length ? itemFiles : Array.from(clipboard.files || [])
-    const images = files.filter((file) => file.type.startsWith('image/'))
-    if (!images.length) return
-    event.preventDefault()
-    attachError = ''
-    for (const file of images) {
-      if (file.size > 20 * 1024 * 1024) {
-        attachError = `${file.name || '剪贴板图片'} 超过 20 MB，未添加`
-        continue
-      }
-      try {
-        const dataUrl = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader()
-          reader.onload = () => resolve(String(reader.result || ''))
-          reader.onerror = () => reject(reader.error || new Error('读取剪贴板图片失败'))
-          reader.readAsDataURL(file)
-        })
-        const data = dataUrl.includes(',') ? dataUrl.slice(dataUrl.indexOf(',') + 1) : ''
-        if (!data) throw new Error('剪贴板图片为空')
-        attachments = [...attachments, {
-          kind: 'image',
-          name: file.name || `screenshot-${new Date().toISOString().replace(/[:.]/g, '-')}.png`,
-          mimeType: file.type || 'image/png',
-          data,
-        }]
-      } catch (error) {
-        attachError = error instanceof Error ? error.message : '读取剪贴板图片失败'
-      }
-    }
-  }
-
-  function removeAttachment(index: number) {
-    attachments = attachments.filter((_, itemIndex) => itemIndex !== index)
-  }
-
   function loadImageGenConfig() {
     try { imageGenConfig = { ...imageGenConfig, ...JSON.parse(localStorage.getItem('pdn.imagegen') ?? '{}') } } catch { /* 使用空配置 */ }
   }
@@ -2190,21 +1882,6 @@
   function saveImageGenConfig(next: ImageGenConfig) {
     imageGenConfig = next
     localStorage.setItem('pdn.imagegen', JSON.stringify(next))
-  }
-
-  async function generateImage() {
-    const prompt = inputText.trim()
-    if (!prompt || imageGenBusy) return
-    imageGenError = ''
-    imageGenBusy = true
-    try {
-      const result = await request('generate_image', { ...imageGenConfig, prompt }) as { data?: string; mimeType?: string; url?: string }
-      const src = result.data ? `data:${result.mimeType || 'image/png'};base64,${result.data}` : result.url
-      if (!src) throw new Error('生图服务未返回图片')
-      imageGenResult = { src, prompt }
-      inputText = ''
-    } catch (error) { imageGenError = error instanceof Error ? error.message : String(error) }
-    finally { imageGenBusy = false }
   }
 
 
@@ -2282,7 +1959,7 @@
     const scout = text.match(/^\/scout(?:\s+|$)(.*)$/i)
     if (scout) {
       inputText = ''
-      mention = null
+      composerRef?.clearMention()
       if (scout[1].trim()) void spawnSubagent('scout', scout[1])
       else { splitOpen = true; agentDefs = loadAgents(); splitRows = [{ agent: 'scout', task: '' }] }
       return
@@ -2290,14 +1967,14 @@
     const agentCmd = text.match(/^\/agent\s+(\S+)\s+(.+)$/i)
     if (agentCmd) {
       inputText = ''
-      mention = null
+      composerRef?.clearMention()
       void spawnSubagent(agentCmd[1], agentCmd[2])
       return
     }
     const todoCmd = text.match(/^\/todo(?:\s+|$)(.*)$/i)
     if (todoCmd) {
       inputText = ''
-      mention = null
+      composerRef?.clearMention()
       if (todoCmd[1].trim()) {
         persistTodos([...loadTodos(ensureActiveId()), newTodo(todoCmd[1])])
         panel = '待办'
@@ -2307,7 +1984,7 @@
     }
     if (text === '/split') {
       inputText = ''
-      mention = null
+      composerRef?.clearMention()
       splitOpen = true
       agentDefs = loadAgents()
       return
@@ -2315,7 +1992,7 @@
     const slash = findSlashCommand(text)
     if (slash) {
       inputText = ''
-      mention = null
+      composerRef?.clearMention()
       // 2-5：取命令词后面的参数（如 /export md 的 "md"）
       const args = text.replace(/^\s*\/\S+/, '').trim()
       runSlashCommand(slash, args)
@@ -2324,7 +2001,7 @@
     const id = ensureActiveId()
     const slot = slotFor(id)
     inputText = ''
-    mention = null
+    composerRef?.clearMention()
     if (slot.running && behavior === 'followUp') {
       // 2-4：队列项带稳定 id（CAS 重排/移除的键）
       patchSlot(id, { queue: [...slot.queue, { id: `q-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, text }], queueRevision: slot.queueRevision + 1 })
@@ -2339,6 +2016,11 @@
         // 与 dispatchTurn 同理：同一毫秒内连发两条插话会撞出重复 key（timeline 以 message.id 为 key）。
         timeline: [...slot.timeline, { id: `user-${nextTurnId()}`, role: 'user', text, at, timestamp: Date.now(), userIndex }]
       })
+      // F2（外部对抗性审查）：插话是**新一轮模型调用**，但这条分支既不走 dispatchTurn
+      //（那里才会武装看门狗）也不碰 running，于是整条插话路径上没有任何超时兜底 ——
+      // 若这次 prompt 的终态事件丢失，界面会带着 running:true 无限停在 Thinking。
+      // 这里补一次 touchRunWatchdog，与其它事件一样以 180s 为界。
+      touchRunWatchdog(id)
       // S-1 发送侧（外部审计确证缺陷 1）：插话同样是 prompt，同样会在 sidecar 里产生
       // `type:'error'`。不带上 turnId 时 sidecar 回显的就是 undefined，而
       // `isTurnCurrent(X, undefined)` 恒放行 —— 一旦这条 error 晚到（prompt 处理器整轮
@@ -2409,13 +2091,13 @@
           const rawThinking = rec?.thinking ?? defaults.thinking
           const payload: Record<string, unknown> = { sessionId: id, cwd: workspacePath, mode: rec?.mode ?? defaults.mode }
           if (rawThinking && THINKING_LEVELS.includes(rawThinking)) payload.thinking = rawThinking
-          const created = await request('create_session', payload) as { id: string; file?: string } | null
+          const created = await requestOk('create_session', payload) as { id: string; file?: string }
           if (!stillMine()) return
           if (created?.file) remember(id, { file: created.file })
           const model = sessions.find((item) => item.id === id)?.model
           if (model) {
             const [provider, modelId] = model.split(MODEL_SEPARATOR)
-            await request('set_model', { sessionId: id, provider, modelId })
+            await requestOk('set_model', { sessionId: id, provider, modelId })
             if (!stillMine()) return
           }
         }
@@ -2445,7 +2127,10 @@
         // type:'error' 事件上（sidecar 的 prompt 处理器整轮不被 await，这条 error 可以
         // 晚到）。事件入口据此传给 finishRun 当 expectedTurnId，避免把上一轮的错误
         // 写到新回合上。旧 sidecar 不带该字段 ⇒ 事件上没有 turnId ⇒ 退回旧语义。
-        await request('prompt', { sessionId: id, text, cwd: workspacePath, behavior, attachments: bridged, turnId: activeTurnId })
+        // requestOk：prompt 被 sidecar 拒绝（会话不存在/已关闭、模式不可用等）时
+        // 必须抛错，让下面的 .catch 把文案交给 finishRun —— 旧 request() 把 ok:false
+        // 吞成 null，这里 await 永远"成功"，槽位卡在 Thinking 直到看门狗兜底（根因）。
+        await requestOk('prompt', { sessionId: id, text, cwd: workspacePath, behavior, attachments: bridged, turnId: activeTurnId })
       })()
         .then(() => { if (newTitle) void request('rename_session', { sessionId: id, name: newTitle }) })
         .catch((error) => {
@@ -2464,7 +2149,9 @@
       window.setTimeout(() => {
         clearRunWatchdog(id)
         if (slotFor(id).activeTurnId !== activeTurnId) return
-        patchSlot(id, { running: false, phase: 'idle', activeTurnId: undefined })
+        // 不仅要收运行态，还要给出可见原因：这一轮根本没有发出去（sidecar 未就绪），
+        // 静默回到 idle 会让用户以为消息已送达、对方"读了不回"。
+        patchSlot(id, { running: false, phase: 'idle', activeTurnId: undefined, error: 'Pi Agent 尚未就绪，这条消息没有发出。请等待连接恢复后重试。' })
       }, 1400)
     }
   }
@@ -2670,7 +2357,7 @@
         patchSlot(created.id, { sent: previousMessages })
         applySessionHistory(created.id, created.history)
         inputText = created.selectedText || ''
-        window.setTimeout(() => composerInput?.focus(), 0)
+        window.setTimeout(() => composerRef?.focusInput(), 0)
       }
     } catch (error) {
       // 写回发起分叉的那个会话，不是"此刻用户可能已经切到的"会话。
@@ -2697,15 +2384,19 @@
     clearDrainTimer(id)
     // 标记"本轮已被中止"：从这一刻起到达的终态事件属于被打断的那一轮，若期间又
     // 派发过新一轮（runEpoch.dispatch），事件入口会靠它把旧轮终态丢掉（缺陷 1）。
-    runEpoch.markAborted(id)
+    // 前面加 running 守卫与 closeTab/deleteSession/archiveSession 三处对齐：对已经
+    // 收尾的槽位按 Stop（重复点击、按钮与事件竞态）会给**当代**凭空打上中止标记，
+    // 此后到下一轮 dispatch 之前，这一代任何经 shouldSurfaceProviderError 的真实
+    // provider 错误都会被静默吞掉 —— 那正是本次修复要根除的"没有反馈"。
+    if (slotFor(id).running) runEpoch.markAborted(id)
     // D1（外部对抗性审查确证回归）：停止必须**立刻**反映到界面上。此前这里只记世代
     // 标记、不动 running，于是 abort 回执落地前（SDK 的 abort() 要 `await
-    // waitForIdle()`，见 agent-session.js:1222-1228，回执必然很晚）用户在同一个会话
-    // 再回车，submit() 会命中 :2324 的 steer 分支：它只发 prompt、**不调用
+    // waitForIdle()`，见 agent-session.js:1841-1858 的 abort()/waitForIdle()，回执必然很晚）用户在同一个会话
+    // 再回车，submit() 会命中 :2487 的 steer 分支：它只发 prompt、**不调用
     // dispatchTurn**，因此世代不推进（仍停在被中止的世代）。等 SDK 因
     // `hasQueuedMessages()` 为真而 `continue()` 去服务那条插话时
-    //（agent-loop.js:67 无条件发 agent_start），事件入口的 `startedButAborted` 判为真
-    // ⇒ 走 :1811 早退，把**用户刚发的那一轮**补发 abort 杀掉：消息丢了、没有回复。
+    //（agent-loop.js:68 是 runAgentLoopContinue 的第一条 emit），事件入口的 `startedButAborted` 判为真
+    // ⇒ 走 :1957 早退，把**用户刚发的那一轮**补发 abort 杀掉：消息丢了、没有回复。
     // 乐观清空 running/activeTurnId 后，下一次提交会走 dispatchTurn 推进世代，
     // 被停掉的旧轮终态由 isSuperseded 拦下，新轮的 agent_start 正常流动。
     patchSlot(id, { running: false, phase: 'idle', activeTurnId: undefined, steer: [] })
@@ -2730,13 +2421,13 @@
       // 再清一遍，并显式把 error 写空：patchSlot 是浅合并，漏掉这个字段会保留旧值，
       // 让"请求失败"红条留在界面上。
       clearProviderError(id)
-      patchSlot(id, { running: false, phase: 'idle', tool: '', processOpen: false, confirm: undefined, error: '', activeTurnId: undefined, steer: [] })
+      patchSlot(id, { running: false, phase: 'idle', tool: '', processOpen: false, confirm: undefined, error: '', activeTurnId: undefined, steer: [], process: settleStepsForFinish(slotFor(id).process) })
     })
   }
 
   function quickPrompt(text: string) {
     inputText = text
-    composerInput?.focus()
+    composerRef?.focusInput()
   }
 
   async function newSession() {
@@ -2759,7 +2450,16 @@
     // 回来时确认用户还停在我们发起时的那个会话上。
     const epoch = sessionEpoch.current()
     const startedFrom = activeSessionId
-    const created = await request('create_session', payload) as { id: string; file?: string }
+    let created: { id: string; file?: string }
+    try {
+      // requestOk：create_session 被拒（会话目录不可写/sidecar 异常/超时）必须让
+      // 用户看见 —— 旧 request() 吞成 null 后 `created.id` 抛 TypeError，
+      // 变成一个无人处理的 rejection，界面上什么都不发生。
+      created = await requestOk('create_session', payload) as { id: string; file?: string }
+    } catch (error) {
+      patchSlot(activeSessionId, { error: error instanceof Error ? error.message : '新建会话失败' })
+      return
+    }
     const now = Date.now()
     if (!sessionEpoch.check(epoch) || activeSessionId !== startedFrom) {
       // 用户已经走开了：会话仍然建好并入列表（否则它会在磁盘上但没有标签），
@@ -2771,14 +2471,6 @@
     activeSession = '新会话'
     sessions = [{ id: created.id, title: '新会话', time: '刚刚', thinking, mode: defaults.mode, file: created.file, createdAt: now, modifiedAt: now }, ...sessions]
     leftTab = 'Chats'
-  }
-
-  let mention: { kind: 'file' | 'cmd'; query: string; index: number } | null = null
-  $: mentionItems = mentionList(mention, files)
-  function mentionList(current: typeof mention, list: typeof files) {
-    if (!current) return []
-    if (current.kind === 'cmd') return filterSlashCommands(current.query)
-    return list.filter((item) => item.kind === 'file' && item.path.toLowerCase().includes(current.query.toLowerCase())).slice(0, 8)
   }
 
   // 斜杠命令的统一分派。每个 kind 都必须有分支——tests/slash-commands.test.mjs
@@ -2863,55 +2555,6 @@
     link.download = result?.name || `${session.title || session.id}.${isMd ? 'md' : 'html'}`
     link.click()
     URL.revokeObjectURL(link.href)
-  }
-
-  function refreshMention() {
-    const queryText = slashTriggerQuery(inputText)
-    const at = inputText.match(/(^|\s)@([^\s]*)$/)
-    if (queryText !== null) mention = { kind: 'cmd', query: queryText, index: 0 }
-    else if (at) {
-      mention = { kind: 'file', query: at[2], index: 0 }
-      if (!files.length) void loadFiles()
-    } else mention = null
-  }
-
-  function applyMention(index = mention?.index ?? 0) {
-    if (!mention || !mentionItems[index]) return
-    const item = mentionItems[index]
-    if (mention.kind === 'cmd') {
-      // 走同一个分派表，避免"补全菜单里能选、但选了没反应/做别的事"。
-      const command = SLASH_COMMANDS.find((entry) => entry.id === (item as { id: string }).id)
-      inputText = ''
-      mention = null
-      if (!command) return
-      // scout 需要参数，预填而不是直接执行
-      if (command.id === 'scout') { inputText = '/scout '; return }
-      // 2-5：/export 带格式参数，预填让用户选择 md/json/html
-      if (command.id === 'export') { inputText = '/export '; return }
-      runSlashCommand(command)
-      return
-    }
-    const path = (item as { path: string }).path
-    inputText = inputText.replace(/@[^\s]*$/, `@${path} `)
-    mention = null
-  }
-
-  function handleKeydown(event: KeyboardEvent) {
-    if (mention && mentionItems.length) {
-      if (event.key === 'ArrowDown') { event.preventDefault(); mention = { ...mention, index: (mention.index + 1) % mentionItems.length }; return }
-      if (event.key === 'ArrowUp') { event.preventDefault(); mention = { ...mention, index: (mention.index - 1 + mentionItems.length) % mentionItems.length }; return }
-      if (event.key === 'Tab' || (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.metaKey)) { event.preventDefault(); applyMention(); return }
-      if (event.key === 'Escape') { event.preventDefault(); mention = null; return }
-    }
-    if (event.key !== 'Enter' || event.shiftKey) return
-    const prefs = loadPrefs()
-    const mod = event.ctrlKey || event.metaKey
-    const shouldSend = prefs.sendShortcut === 'ctrl-enter' ? mod : !mod
-    if (!shouldSend) return
-    event.preventDefault()
-    if (imageGenMode) { void generateImage(); return }
-    const running = Boolean(runState[activeSessionId]?.running)
-    submit(event.altKey ? 'followUp' : running ? prefs.busySend : 'steer')
   }
 
   function handleGlobalKey(event: KeyboardEvent) {
@@ -3044,7 +2687,7 @@
 
       <main class="chat">
         <div class="chat-header" class:empty={activeSessionIdle}>
-          <div class="chat-title"><h1>{activeSession}</h1><p><span class="online-dot" class:offline={!sidecarReady}></span> Pi Agent · {workspaceBase()}</p></div>
+          <div class="chat-title"><h1>{runState[activeSessionId]?.pluginTitle || activeSession}</h1><p><span class="online-dot" class:offline={!sidecarReady}></span> Pi Agent · {workspaceBase(workspacePath)}</p></div>
           {#if activeBranchSiblings.length > 1 || (sessions.find((item) => item.id === activeSessionId)?.parentFile)}
             <div class="branch-dropdown" use:clickOutsideBranch>
               <button class="branch-button" type="button" aria-haspopup="menu" aria-expanded={branchOpen} title="切换分支" on:click={() => (branchOpen = !branchOpen)}>
@@ -3078,13 +2721,13 @@
           {/if}
         </div>
 
-        <div class="messages" class:centered={activeSessionIdle}>
+        <div class="messages" class:centered={activeSessionIdle} data-diagerr={String(slotFor(activeSessionId).error ?? '<nil>').slice(0, 50)} data-diagact={activeSessionId.slice(0, 8)} data-diagmap={Object.entries(runState).map(([k, v]) => `${k.slice(0, 8)}:${v.error ? 'E' + v.error.length : '-'}:${v.running ? 'R' : '-'}`).join(',')} data-diagtl={String((runState[activeSessionId]?.timeline ?? []).length)} data-diaglast={String((runState[activeSessionId]?.timeline ?? []).slice(-1)[0]?.text ?? '-').slice(0, 20)} data-diagidle={String(activeSessionIdle)}>
           {#if imageGenError}<div class="imagegen-error">{imageGenError}</div>{/if}
           {#if imageGenResult}<div class="image-result"><img src={imageGenResult.src} alt={imageGenResult.prompt} /><small>{imageGenResult.prompt}</small></div>{/if}
           {#if activeSessionIdle}
             <div class="empty-state">
               <div class="empty-mark"><img src={logoUrl} alt="Pi-My" /></div>
-              <button class="start-project" type="button" on:click={() => void chooseWorkspace()}><Icon name="home" size={13} /><span>{workspaceBase()}</span><Icon name="chevron-down" size={11} /></button>
+              <button class="start-project" type="button" on:click={() => void chooseWorkspace()}><Icon name="home" size={13} /><span>{workspaceBase(workspacePath)}</span><Icon name="chevron-down" size={11} /></button>
               <div class="quick-chips" class:show={uiPrefs.showQuickChips}>
                 <button on:click={() => quickPrompt('请分析当前项目的目录结构，梳理主要模块、入口文件和各部分职责，并给出简要说明。')}>分析当前项目结构</button>
                 <button on:click={() => quickPrompt('请检查当前工作区的 Git 变更，总结改动内容、涉及的文件以及可能的风险点。')}>检查工作区变更</button>
@@ -3099,7 +2742,7 @@
               {#if message.role === 'user'}
                 <div class="message user-message">
                   <div class="user-bubble">{message.text}</div>
-                  <div class="user-meta"><time>{message.at}</time><button class="recall" type="button" on:click={() => void copyText(message.text)}>复制</button><button class="recall" type="button" on:click={() => recallMessage(message.userIndex)}>撤回重发</button></div>
+                  <div class="user-meta"><time>{message.at}</time><button class="recall" type="button" on:click={() => void copyText(message.text)}>复制</button><button class="recall" type="button" on:click={() => recallMessage(message.userIndex)}>撤回重发</button>{#if message.entryId}<button class="recall ctx-remove" type="button" disabled={!!ctxEditBusyId || slotFor(activeSessionId).running} title={editedEntryIds().has(message.entryId) ? '该条目已有上下文编辑（再剔一次以最新编辑为准）' : '从模型上下文中剔除这条消息'} on:click={() => void removeContextEntry(message.entryId!)}>{ctxEditBusyId === message.entryId ? '处理中…' : editedEntryIds().has(message.entryId) ? '已剔除' : '剔除上下文'}</button>{/if}</div>
                 </div>
               {:else}
                 <div class="message assistant-message">
@@ -3112,11 +2755,30 @@
                     <button class="assistant-action" type="button" title="从此回复创建分支" aria-label="从此回复创建分支" disabled={forkBusy || !sidecarReady} on:click={() => void forkAtUserIndex(message.userIndex)}>
                       <Icon name="fork" size={14} />
                     </button>
+                    {#if message.entryId}
+                      <button class="assistant-action" class:ctx-edited={editedEntryIds().has(message.entryId)} type="button" title={editedEntryIds().has(message.entryId) ? '该条目已被剔除出模型上下文' : '从模型上下文中剔除这条回复'} aria-label={editedEntryIds().has(message.entryId) ? '该条目已被剔除出模型上下文' : '从模型上下文中剔除这条回复'} disabled={!!ctxEditBusyId || slotFor(activeSessionId).running} on:click={() => void removeContextEntry(message.entryId!)}>
+                        <Icon name={editedEntryIds().has(message.entryId) ? 'x' : 'minus'} size={14} />
+                      </button>
+                    {/if}
                     <time class="assistant-time" datetime={new Date(message.timestamp).toISOString()}><Icon name="clock" size={12} />{message.at}</time>
                   </div>
                 </div>
               {/if}
             {/each}
+            {#if ctxPanelOpen || ctxEdits.length}
+              <div class="ctx-edits-panel">
+                <button class="ctx-edits-toggle" type="button" on:click={() => (ctxPanelOpen = !ctxPanelOpen)}>上下文编辑 {ctxEdits.length} 条 {ctxPanelOpen ? '▾' : '▸'}</button>
+                {#if ctxPanelOpen}
+                  {#each ctxEdits as edit (`${edit.timestamp}:${edit.entryId}`)}
+                    <div class="ctx-edit-row">
+                      <span class="ctx-edit-kind">{edit.removed ? '剔除' : '替换'}</span>
+                      <code>{edit.targetId}</code>
+                      {#if !edit.removed}<span class="ctx-edit-text">{edit.text.slice(0, 80)}{edit.text.length > 80 ? '…' : ''}</span>{/if}
+                    </div>
+                  {/each}
+                {/if}
+              </div>
+            {/if}
             {#if liveLabel(slotFor(activeSessionId))}
               <div class="message assistant-status">
                 <div class="live-status" data-phase={slotFor(activeSessionId).phase}>
@@ -3139,14 +2801,8 @@
                 </div>
               </div>
             {/if}
-            {#if (runState[activeSessionId]?.pluginMessages ?? []).filter((m) => m.slot === 'timeline').length}
-              <!-- 1-5 UI 插件：timeline 槽位的插件卡片 -->
-              {#each (runState[activeSessionId].pluginMessages ?? []).filter((m) => m.slot === 'timeline') as plugin (plugin.timestamp + plugin.customType)}
-                <div class="message plugin-message">
-                  <PluginCard message={plugin} />
-                </div>
-              {/each}
-            {/if}
+            <!-- 1-5 UI 插件：timeline 槽位（注册表按 slot 分发） -->
+            <PluginHost slot="timeline" hostId="timeline" messages={runState[activeSessionId]?.pluginMessages ?? []} itemClass="message plugin-message" trusted={pluginTrusted} />
             {#if slotFor(activeSessionId).error}
               <div class="message assistant-status">
                 <div class="agent-error" role="alert">
@@ -3250,13 +2906,17 @@
             </div>
           {/if}
           {#if currentMode === 'plan'}<div class="plan-hint">计划模式：Agent 只能读和搜索，不会修改文件</div>{/if}
-          <div class="composer">
-            {#if attachError}<div class="git-error attach-error">{attachError}</div>{/if}
-            {#if attachments.length}<div class="attach-chips">{#each attachments as attachment, index (index)}<span class="attach-chip" class:image={attachment.kind === 'image'}>{#if attachment.kind === 'image'}<i></i>{/if}<span class="attach-name">{attachment.name}</span><button aria-label="移除附件" on:click={() => removeAttachment(index)}>×</button></span>{/each}</div>{/if}
-            {#if mention && mentionItems.length}<div class="mention-menu">{#each mentionItems as item, i}<button class:on={i === mention.index} on:mousedown|preventDefault={() => applyMention(i)}>{mention.kind === 'cmd' ? `/${(item as { id: string }).id}  ${(item as { label: string }).label}${(item as { desc?: string }).desc ? `  ${(item as { desc?: string }).desc}` : ''}` : (item as { path: string }).path}</button>{/each}</div>{/if}
-            <textarea bind:this={composerInput} bind:value={inputText} on:input={refreshMention} on:paste={handleClipboardPaste} on:keydown={handleKeydown} placeholder={imageGenMode ? '描述要生成的图片…' : '输入消息，@ 引用文件，/ 运行命令'} rows="2"></textarea>
-            <div class="composer-toolbar"><div class="composer-controls"><div class="kind-dropdown" use:clickOutsideKind><button class="kind-button" bind:this={kindButtonRef} aria-haspopup="true" aria-expanded={kindOpen} aria-label="输入模式" on:click={toggleKind}><img src={logoUrl} alt="" /><span>{imageGenMode ? '生图' : 'Pi'}</span><svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true"><path d="M1.5 2.5 4 5l2.5-2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>{#if kindOpen}<div class="kind-menu"><button class:selected={!imageGenMode} on:click={() => setAgentKind(false)}><img src={logoUrl} alt="" /><span>Pi</span></button><button class:selected={imageGenMode} on:click={() => setAgentKind(true)}><span>生图</span></button></div>{/if}</div><button class="attach-button" disabled={!sidecarReady} aria-label="添加附件" on:click={() => void addAttachments()}><Icon name="paperclip" size={13} /></button><div class="mode-dropdown" use:clickOutsideMode><button class="mode-button" class:plan={currentMode === 'plan'} bind:this={modeButtonRef} aria-haspopup="true" aria-expanded={modeOpen} aria-label="权限模式" on:click={toggleMode}><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.8 13.5 3.6v4.1c0 3.2-2.2 5.6-5.5 6.6-3.3-1-5.5-3.4-5.5-6.6V3.6L8 1.8Z"/></svg><span>{MODE_LABELS[currentMode] ?? currentMode}</span></button>{#if modeOpen}<div class="mode-menu" class:up={modeMenuUp}>{#each MODE_OPTIONS as option (option.value)}<button class="mode-option" class:selected={option.value === currentMode} on:click={() => void setMode(option.value)}><span class="mode-dot"></span><span class="mode-copy"><strong>{option.label}</strong><small>{option.desc}</small></span></button>{/each}</div>{/if}</div></div><div class="composer-model"><div class="model-dropdown" use:clickOutside><button class="model-button" bind:this={modelButtonRef} disabled={!models.length} aria-haspopup="listbox" aria-expanded={modelOpen} aria-label="模型" on:click={toggleModel}><span>{currentModelLabel}</span><svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true"><path d="M1.5 2.5 4 5l2.5-2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>{#if modelOpen}<div class="model-menu" class:up={modelMenuUp}><div class="model-search"><Icon name="search" size={12} /><input bind:this={modelSearchInput} bind:value={modelQuery} placeholder="搜索模型…" aria-label="搜索模型" /></div><div class="model-list">{#each modelDropdownGroups as group (group.provider)}<button class="model-group-title" type="button" aria-expanded={!providerCollapsed(group.provider)} on:click={() => toggleModelProvider(group.provider)}><span>{group.provider}{#if group.items[0]?.source === "extension"}<span class="ext-badge" title="由本机 Pi 扩展动态注册">扩展</span>{/if}</span><span class="model-group-count">{group.items.length}</span><Icon name={providerCollapsed(group.provider) ? 'chevron-right' : 'chevron-down'} size={10} /></button>{#if !providerCollapsed(group.provider)}<div class="model-group-items">{#each group.items as model (modelKey(model))}<button class="model-option" class:selected={modelKey(model) === currentModelKey} on:click={() => pickModel(model)}><span class="model-dot"></span><span class="model-name">{model.name}</span></button>{/each}</div>{/if}{:else}<div class="model-empty">没有匹配的模型</div>{/each}</div></div>{/if}</div><div class="thinking-dropdown" use:clickOutsideThinking><button class="thinking-button" bind:this={thinkingButtonRef} disabled={!sidecarReady} aria-haspopup="true" aria-expanded={thinkingOpen} aria-label="思考深度" on:click={toggleThinking}><span class="thinking-label">思考：</span><span class="thinking-value">{thinkingLabel}</span><svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true"><path d="M1.5 2.5 4 5l2.5-2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>{#if thinkingOpen}<div class="thinking-menu"><div class="thinking-head"><strong>思考深度</strong><span>{thinkingLabel}</span><button class="thinking-help-button" class:on={thinkingHelp} aria-label="档位说明" aria-expanded={thinkingHelp} on:click={toggleThinkingHelp}>?</button></div><div class="thinking-ends"><span>更快</span><span>更聪明</span></div><div class="thinking-slider" style={`--p:${thinkingPercent}`}><div class="thinking-track"></div><div class="thinking-fill"></div><input class="thinking-range" type="range" min="0" max={THINKING_LEVELS.length - 1} step="1" value={thinkingIndex} disabled={!sidecarReady} aria-label="思考档位" on:input={onThinkingInput} on:change={onThinkingChange} /></div>{#if thinkingHelp}<ul class="thinking-help">{#each THINKING_LEVELS as level (level)}<li class:on={level === thinkingLevel}><b>{THINKING_LABELS[level]}</b><span>{THINKING_HELP[level]}</span></li>{/each}</ul>{/if}</div>{/if}</div></div><div class="composer-right"><div class="ctx-dropdown" use:clickOutsideCtx><button class="ctx-button" class:empty={!activeSessionId || !ctxStats?.window} bind:this={ctxButtonRef} disabled={!sidecarReady} aria-label="上下文用量" aria-haspopup="true" aria-expanded={ctxOpen} on:click={toggleCtx}><svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><circle cx="9" cy="9" r="7" fill="none" stroke="currentColor" stroke-width="2"/>{#if ctxStats?.window}<circle cx="9" cy="9" r="7" fill="none" stroke="#333" stroke-width="2" stroke-linecap="round" stroke-dasharray={ctxDash()} transform="rotate(-90 9 9)"/>{/if}</svg></button>{#if ctxOpen}<div class="ctx-menu" class:up={ctxMenuUp}>{#if !activeSessionId}<div class="ctx-empty"><strong>本会话尚未开始</strong><small>发送第一条消息后显示用量</small></div>{:else if !ctxStats?.window}<div class="ctx-empty"><strong>暂无用量数据</strong><small>发送消息后显示上下文占用</small></div>{:else}<div class="ctx-head"><strong>上下文容量（估算）</strong><span>{ctxProgress()}%</span></div><div class="ctx-row"><span>当前上下文</span><span>{fmtWan(ctxStats.currentContext)}</span></div><div class="ctx-row"><span>可用容量</span><span>{fmtWan(Math.max(0, ctxStats.window - ctxStats.currentContext))}</span></div><div class="ctx-row"><span>上下文窗口</span><span>{fmtWan(ctxStats.window)}</span></div><div class="ctx-bar"><i style="width:{ctxProgress()}%"></i></div><div class="ctx-divider"></div><div class="ctx-sub">本会话累计</div><div class="ctx-row"><span>总 Token</span><span>{fmtWan(ctxStats.totals.total)}</span></div><div class="ctx-row"><span>输入</span><span>{fmtWan(ctxStats.totals.input)}</span></div><div class="ctx-row"><span>输出</span><span>{fmtWan(ctxStats.totals.output)}</span></div><div class="ctx-row"><span>缓存读取</span><span>{fmtWan(ctxStats.totals.cacheRead)}</span></div><div class="ctx-row"><span>缓存写入</span><span>{fmtWan(ctxStats.totals.cacheWrite)}</span></div><div class="ctx-divider"></div><div class="ctx-row"><span>本地费率估算</span><span>${ctxStats.costUsd.toFixed(2)}</span></div><div class="ctx-row"><span>平均缓存命中率</span><span>{(ctxStats.cacheHitRate * 100).toFixed(1)}%</span></div><div class="ctx-note">按本地模型费率估算，未提供费率则为 0</div>{#if stateSummaryView}<div class="ctx-divider"></div><div class="ctx-sub">运行状态（1-8 get_state）</div><div class="ctx-row"><span>权限模式</span><span>{stateSummaryView.mode}</span></div>{#if stateSummaryView.model}<div class="ctx-row"><span>模型</span><span>{stateSummaryView.model}</span></div>{/if}{#if stateSummaryView.thinking}<div class="ctx-row"><span>思考档位</span><span>{stateSummaryView.thinking}</span></div>{/if}<div class="ctx-row"><span>消息数</span><span>{Number(sessionState?.stats?.totalMessages ?? 0)}</span></div><div class="ctx-row"><span>排队消息</span><span>{stateSummaryView.queued}</span></div>{/if}{#if quotas.length}<div class="ctx-divider"></div><div class="ctx-sub">Provider 额度（2-8）{quotasBusy ? " · 查询中" : ""}</div>{#each quotas as q (q.provider)}<div class="ctx-row"><span>{q.provider}</span><span>{q.message || "—"}{#if q.nextResetAt} · {formatCountdown(q.msUntilReset)}{/if}</span></div>{/each}<div class="ctx-note">重置时间为按周期估算（设置页可为每个 provider 配置）；接口提供真实重置时间时优先展示</div>{/if}<div class="ctx-note">按本地模型费率估算，未提供费率则为 0</div>{/if}</div>{/if}</div><!-- END-CTX --><button class:imagegen-busy={imageGenBusy} class:stop={runState[activeSessionId]?.running} class="send" aria-label={imageGenMode ? '生成图片' : runState[activeSessionId]?.running ? '停止当前任务' : '发送消息'} title={imageGenMode ? '生成图片' : runState[activeSessionId]?.running ? '停止当前任务' : '发送消息'} on:click={imageGenMode ? generateImage : runState[activeSessionId]?.running ? stop : () => submit('steer')}>{#if imageGenBusy}<span class="send-dot"></span>{:else if runState[activeSessionId]?.running}<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><rect x="1.5" y="1.5" width="7" height="7" rx="1" fill="currentColor"/></svg>{:else}<Icon name="send" size={14} strokeWidth={1.9} />{/if}</button></div></div>
-          </div>
+          <!-- 1-5 UI 插件：status 槽位（composer 上方的胶囊状态条） -->
+          <PluginHost
+            slot="status"
+            hostId="composer"
+            variant="inline"
+            limit={3}
+            containerClass="plugin-status-bar"
+            messages={runState[activeSessionId]?.pluginMessages ?? []}
+            trusted={pluginTrusted}
+          />
+          <Composer bind:this={composerRef} bind:inputText bind:attachments bind:attachError bind:imageGenError bind:imageGenResult imageGenConfig={imageGenConfig} models={models} sessions={sessions} activeSessionId={activeSessionId} runState={runState} sidecarReady={sidecarReady} workspacePath={workspacePath} files={files} request={request} requestRaw={requestRaw} remember={remember} ensureActiveId={ensureActiveId} loadPrefs={loadPrefs} loadFiles={loadFiles} submit={submit} stop={stop} runSlashCommand={runSlashCommand} />
         </div>
       </main>
 
@@ -3270,101 +2930,54 @@
         </div>
         <div class="workspace-content">
         {#if panel === '文档'}
-          <div class="resource-head"><span>{workspaceBase()}</span><button aria-label="刷新文件" disabled={filesLoading || projectBusy !== ''} on:click={() => void loadFiles()}><Icon name="refresh" size={13} /></button></div>
-          <div class="resource-tree">
-            {#snippet treeRows(prefix: string, depth: number)}
-              {#each treeChildren(prefix) as file}
-                <button class:file-directory={file.kind === 'directory'} class:file-selected={selectedFile === file.path} class:open={openDirs[file.path]} style={`padding-left:${6 + depth * 12}px`} on:click={() => file.kind === 'file' ? void previewFile(file.path) : toggleDir(file.path)}>
-                  <span class="resource-chevron">{#if file.kind === 'directory'}<Icon name={openDirs[file.path] ? 'chevron-down' : 'chevron-right'} size={10} strokeWidth={1.9} />{/if}</span><span class="resource-icon">{#if file.kind === 'file'}<Icon name="file" size={11} strokeWidth={1.6} />{/if}</span><span>{fileName(file.path)}</span>
-                </button>
-                {#if file.kind === 'directory' && openDirs[file.path]}
-                  {@render treeRows(file.path, depth + 1)}
-                {/if}
-              {:else}
-                {#if depth === 0}<div class="resource-empty">{filesLoading || projectBusy ? '正在加载项目文件…' : '选择工作区后显示文件'}</div>{/if}
-              {/each}
-            {/snippet}
-            {@render treeRows('', 0)}
-          </div>
-          {#if selectedFile}
-            <div class="resource-preview-head"><span class="doc-name">{selectedFile}</span><span class="doc-stats">{largeFile ? '大文件 · 虚拟化预览' : documentStats()}</span>{#if !largeFile}{#if !editingFile}<button on:click={() => (editingFile = true)}>编辑</button>{:else}<button on:click={() => void saveFile()}>保存</button><button on:click={() => (editingFile = false)}>取消</button>{/if}{/if}</div>
-            {#if largeFile}
-              <!-- 2-12：大文件虚拟化预览（只读；编辑仍限 512KB 内文件） -->
-              <VirtualFile path={largeFile.path} readFileChunk={readFileChunk} height={480} />
-            {:else}
-              <article class="resource-preview">{#if editingFile}<textarea class="file-editor" bind:value={fileContent}></textarea>{:else}<pre class="file-preview">{fileContent}</pre>{/if}</article>
-            {/if}
-          {/if}
+          <!-- 0-5 批次 B-5：文档面板整块抽到 FilePanel.svelte（状态 bind 同步 + 薄桥回调） -->
+          <FilePanel
+            bind:filesLoading
+            bind:selectedFile
+            bind:fileContent
+            bind:largeFile
+            bind:editingFile
+            {filteredFiles}
+            {projectBusy}
+            {sidecarReady}
+            {workspacePath}
+            request={(type, payload) => request(type, payload)}
+            requestRaw={(type, payload) => requestRaw(type, payload)}
+            onSaved={() => void refreshGit()}
+            onRefresh={() => void loadFiles()}
+            onReadError={(message) => patchSlot(ensureActiveId(), { error: `读取文件失败: ${message}` })}
+          />
         {:else if panel === '变更'}
-          <div class="git-panel">
-            <div class="panel-content">
-              <div class="panel-title"><div><strong>工作区变更</strong><small>{gitChanges.length} 个文件已修改</small></div><button class="primary-small" on:click={() => void refreshGit()}>刷新</button></div>
-              <div class="git-changes">
-                {#each gitChanges as change}
-                  <div class="change-item" role="button" tabindex="0" on:click={() => void loadDiff(change.path)} on:keydown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); void loadDiff(change.path) } }}>
-                    <input class="change-check" type="checkbox" checked={staged[change.path] ?? false} on:click={(event) => event.stopPropagation()} on:change={() => (staged = { ...staged, [change.path]: !(staged[change.path] ?? false) })} />
-                    <span class="file-dot" class:modified={change.code.includes('M')} class:added={change.code.includes('A') || change.code.includes('?')}>{change.code.includes('A') || change.code.includes('?') ? 'A' : 'M'}</span>
-                    <div class="change-meta"><strong>{change.path}</strong><small>{change.code}</small></div>
-                  </div>
-                {:else}
-                  <div class="diff-placeholder">当前工作区没有未提交变更</div>
-                {/each}
-                {#if diffContent}<pre class="diff-content">{diffContent}</pre>{/if}
-              </div>
-            </div>
-            <div class="git-actions">
-              {#if gitError}<div class="git-error">{gitError}</div>{/if}
-              <input class="commit-input" bind:value={commitMessage} placeholder={uiPrefs.gitTemplate || '提交信息…'} />
-              <div class="git-actions-row">
-                <button disabled={!sidecarReady} on:click={() => void stageFiles()}>暂存</button>
-                <button disabled={!sidecarReady} on:click={() => void commitChanges()}>提交</button>
-                <button disabled={!sidecarReady} on:click={() => void pushChanges()}>推送</button>
-              </div>
-            </div>
-          </div>
+          <!-- 0-5 批次 B-1：git 面板整块抽到 GitPanel.svelte（状态自持 + bind 同步） -->
+          <GitPanel
+            bind:this={gitPanelRef}
+            bind:gitChanges
+            bind:diffContent
+            bind:gitError
+            {sidecarReady}
+            {workspacePath}
+            request={(type, payload) => request(type, payload)}
+            requestRaw={(type, payload) => requestRaw(type, payload)}
+            gitTemplate={uiPrefs.gitTemplate}
+          />
         {:else if panel === '终端'}
           <!-- 终端组件常驻在下方（见 {:else} 之后），此处仅留位。 -->
         {:else if panel === '待办'}
-          <div class="todo-panel">
-            <div class="resource-head"><span>任务清单</span><button type="button" on:click={() => { splitOpen = true; agentDefs = loadAgents() }}>拆分</button></div>
-            <div class="todo-add"><input bind:value={todoDraft} placeholder={todoParentId ? '子任务…' : '添加任务，Enter'} on:keydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); addTodo(todoParentId || undefined) } }} /><button type="button" aria-label="添加任务" on:click={() => addTodo(todoParentId || undefined)}><Icon name="plus" size={12} strokeWidth={1.9} /></button></div>
-            {#if todoParentId}<div class="todo-hint">正在给「{todos.find((item) => item.id === todoParentId)?.content ?? ''}」添加子任务 <button type="button" on:click={() => (todoParentId = '')}>取消</button></div>{/if}
-            <div class="todo-list">
-              {#each todoView.roots as item (item.id)}
-                <div class="todo-item" class:done={item.status === 'completed'} class:doing={item.status === 'in_progress'}>
-                  <button class="todo-check" type="button" on:click={() => setTodoStatus(item.id, cycleTodoStatus(item.status))}>{item.status === 'completed' ? '✓' : item.status === 'in_progress' ? '◐' : '○'}</button>
-                  <span>{item.content}</span>
-                  <button type="button" class="todo-mini" on:click={() => (todoParentId = item.id)}>子项</button>
-                  <button type="button" class="todo-mini" on:click={() => removeTodo(item.id)}>×</button>
-                </div>
-                {#each todoView.children(item.id) as child (child.id)}
-                  <div class="todo-item child" class:done={child.status === 'completed'} class:doing={child.status === 'in_progress'}>
-                    <button class="todo-check" type="button" on:click={() => setTodoStatus(child.id, cycleTodoStatus(child.status))}>{child.status === 'completed' ? '✓' : child.status === 'in_progress' ? '◐' : '○'}</button>
-                    <span>{child.content}</span>
-                    <button type="button" class="todo-mini" on:click={() => removeTodo(child.id)}>×</button>
-                  </div>
-                {/each}
-              {:else}
-                <div class="resource-empty">还没有任务。用右侧添加，或发送 /todo 某件事。</div>
-              {/each}
-            </div>
-          </div>
+          <!-- 0-5 批次 B-2：待办面板模板抽到 TodoPanel.svelte（状态经 bind: 双向同步，权威源仍在 App） -->
+          <TodoPanel
+            bind:this={todoPanelRef}
+            bind:todos
+            bind:todoDraft
+            bind:todoParentId
+            on:split={() => { splitOpen = true; agentDefs = loadAgents() }}
+          />
         {:else}
-          <div class="panel-content">
-            <div class="panel-title"><div><strong>子代理</strong><small>{(runState[activeSessionId]?.subRuns ?? []).length} 个任务</small></div><button class="primary-small" on:click={() => { splitOpen = true; agentDefs = loadAgents() }}>并行拆分</button></div>
-            {#if (runState[activeSessionId]?.subRuns ?? []).length}
-              {#each runState[activeSessionId].subRuns as run (run.id)}
-                <button class="sub-row block" type="button" on:click={() => (viewingSub = { ...run, reply: slotFor(run.id).reply || run.reply })}>
-                  <i class:run={run.status === 'running'} class:bad={run.status === 'error'}></i>
-                  <strong>{run.agent}</strong>
-                  <span class="sub-task">{run.task}</span>
-                  <em>{run.status === 'running' ? '运行中' : run.status === 'error' ? '失败' : '完成'}</em>
-                </button>
-              {/each}
-            {:else}
-              <div class="empty-panel"><span>◌</span><strong>暂无子代理</strong><small>/scout 任务 或点「并行拆分」</small></div>
-            {/if}
-          </div>
+          <!-- 0-5 批次 B-3：子代理列表抽到 SubRunsPanel.svelte（纯展示；onView/onOpenSplit 回父组件开 overlay） -->
+          <SubRunsPanel
+            subRuns={runState[activeSessionId]?.subRuns ?? []}
+            onView={(run) => (viewingSub = { ...run, reply: slotFor(run.id).reply || run.reply })}
+            onOpenSplit={() => { splitOpen = true; agentDefs = loadAgents() }}
+          />
         {/if}
           <!-- 终端常驻挂载（不随面板切换销毁重建）。
                旧写法把它放在 {:else if} 分支里，每切一次面板就销毁并重建 Terminal：
@@ -3382,61 +2995,23 @@
         <div class="drag-handle" class:dragging={dragging === 'right'} role="separator" aria-label="调整右侧栏宽度" on:mousedown={(event) => startDrag(event, 'right')} on:dblclick={() => resetDrag('right')}></div>
       {/if}
   </div>
-  {#if splitOpen}
-    <div class="overlay" role="presentation" on:click={(event) => { if (event.target === event.currentTarget) splitOpen = false }}>
-      <div class="split-card" role="dialog" aria-label="并行拆分子代理">
-        <header><strong>并行拆分</strong><button type="button" on:click={() => (splitOpen = false)}>×</button></header>
-        <p>内置 scout 只读侦察；也可选自定义 agent。最多一次发多条。</p>
-        {#each splitRows as row, index (index)}
-          <div class="split-row">
-            <select bind:value={row.agent}>{#each agentDefs as def (def.name)}<option value={def.name}>{def.name}</option>{/each}</select>
-            <input bind:value={row.task} placeholder="独立任务…" />
-            <button type="button" on:click={() => (splitRows = splitRows.filter((_, i) => i !== index))}>×</button>
-          </div>
-        {/each}
-        <div class="split-actions">
-          <button type="button" on:click={() => (splitRows = [...splitRows, { agent: 'scout', task: '' }])}>＋ 任务</button>
-          <button class="primary" type="button" on:click={runSplit}>开始</button>
-        </div>
-      </div>
-    </div>
-  {/if}
-  {#if viewingSub}
-    <div class="overlay" role="presentation" on:click={(event) => { if (event.target === event.currentTarget) viewingSub = null }}>
-      <div class="sub-view" role="dialog" aria-label="子会话">
-        <header>
-          <div><strong>{viewingSub.agent}</strong><small>{viewingSub.task}</small></div>
-          <span class="chip">{viewingSub.status === 'running' ? '运行中' : viewingSub.status === 'error' ? '失败' : '完成'}</span>
-          <button type="button" on:click={() => (viewingSub = null)}>关闭</button>
-        </header>
-        <div class="sub-body">
-          {#each slotFor(viewingSub.id).sent as message}<div class="message user-message"><div class="user-bubble">{message.text}</div></div>{/each}
-          {#if slotFor(viewingSub.id).reply || viewingSub.reply}<div class="message assistant-message"><div class="message-meta"><strong>{viewingSub.agent}</strong><span>只读</span></div><MarkdownView text={slotFor(viewingSub.id).reply || viewingSub.reply} copyable={false} /></div>{/if}
-          {#if visibleProcess(slotFor(viewingSub.id)).length}
-            <div class="process-card open">
-              <div class="process-head"><span class="process-head-main"><span>{processSummary(slotFor(viewingSub.id))}</span></span></div>
-              <div class="process-body">
-                {#each visibleProcess(slotFor(viewingSub.id)) as step (step.id)}
-                  <div class="process-step" class:run={!step.done} class:tool={step.kind === 'tool'}><span class="process-step-mark"><i class:live={!step.done}></i>{#if step.done}<Icon name="check" size={11} />{/if}</span><span class="process-step-copy"><strong>{step.kind === 'think' ? '思考' : step.title}</strong>{#if step.body}<span class="process-preview" title={step.body}>{step.body}</span>{/if}</span></div>
-                {/each}
-              </div>
-            </div>
-          {/if}
-          {#if slotFor(viewingSub.id).running}
-            <div class="live-status">
-              {#if uiPrefs.thinkingOrb === 'liquid'}
-                <ThinkingOrb size={56} />
-              {:else}
-                <Atom size={56} />
-              {/if}
-              <strong>{liveLabelKey(slotFor(viewingSub.id)) || tt('live.working')}</strong>
-            </div>
-          {/if}
-        </div>
-        <footer>只读检视，请在父会话继续对话。</footer>
-      </div>
-    </div>
-  {/if}
+  <!-- 0-5 批次 B-4：拆分/检视 overlay 抽到 SplitDialog/SubRunOverlay（全局模态挂根级，状态 bind 回 App） -->
+  <SplitDialog bind:open={splitOpen} bind:rows={splitRows} {agentDefs} onRun={runSplit} />
+  <SubRunOverlay
+    bind:run={viewingSub}
+    runProp={viewingSub ? slotFor(viewingSub.id) : null}
+    showThinking={uiPrefs.showThinking !== false}
+    orb={uiPrefs.thinkingOrb}
+  />
+  <!-- 1-5 UI 插件：float 槽位（右下角可堆叠的非阻塞浮层，与 ext-toasts 错开） -->
+  <PluginHost
+    slot="float"
+    hostId="float"
+    limit={2}
+    containerClass="plugin-float-stack"
+    messages={runState[activeSessionId]?.pluginMessages ?? []}
+    trusted={pluginTrusted}
+  />
   {#if extToasts.length}
     <div class="ext-toasts" role="status" aria-live="polite">
       {#each extToasts as toast (toast.id)}
@@ -3515,5 +3090,5 @@
       {/if}
     {/key}
   {/if}
-  <Settings open={showSettings} connected={sidecarReady} info={settingsInfo} usageStats={usageStats} imageGenConfig={imageGenConfig} onSaveImageGenConfig={saveImageGenConfig} onclose={() => { showSettings = false; settingsInitialTab = undefined; refreshPrefs() }} openDir={openDir} workspacePath={workspacePath} onChooseWorkspace={chooseWorkspace} onOpenRepo={() => void request('open_url', { url: 'https://github.com/TANGZZee/pi-my' })} providers={providers} onRefreshProviders={refreshProviders} onRefreshUsage={refreshUsage} onPrefsChange={refreshPrefs} onRestoreArchived={(session) => unarchiveSession(session)} onDeleteArchived={(session) => deleteSession(session, true)} agentUpdate={agentUpdate} agentUpdateBusy={agentUpdateBusy} onCheckAgentUpdate={() => void checkAgentUpdate(true)} onUpdateAgent={() => void updatePiSdk()} onOpenAgentUpdate={openAgentUpdate} onOpenAgentRepo={openAgentRepo} initialTab={settingsInitialTab} rpc={request} />
+  <Settings open={showSettings} connected={sidecarReady} info={settingsInfo} usageStats={usageStats} imageGenConfig={imageGenConfig} onSaveImageGenConfig={saveImageGenConfig} onclose={() => { showSettings = false; settingsInitialTab = undefined; refreshPrefs() }} openDir={openDir} workspacePath={workspacePath} onChooseWorkspace={chooseWorkspace} onOpenRepo={() => void request('open_url', { url: 'https://github.com/TANGZZee/pi-my' })} providers={providers} onRefreshProviders={refreshProviders} onRefreshUsage={refreshUsage} onPrefsChange={refreshPrefs} onRestoreArchived={(session) => unarchiveSession(session)} onDeleteArchived={(session) => deleteSession(session, true)} agentUpdate={agentUpdate} agentUpdateBusy={agentUpdateBusy} onCheckAgentUpdate={() => void checkAgentUpdate(true)} onUpdateAgent={() => void updatePiSdk()} onOpenAgentUpdate={openAgentUpdate} onOpenAgentRepo={openAgentRepo} initialTab={settingsInitialTab} rpc={request} activeSessionId={activeSessionId} pluginMessages={runState[activeSessionId]?.pluginMessages ?? []} />
 </div>

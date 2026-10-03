@@ -692,11 +692,20 @@ test('接线 4：dispatchTurn 的异步前奏必须在每个 await 之后复检�
   // 搬到 prompt 之后（变异 w1b）测试依然全绿。改成用**同一个视图**断言"最后一道守卫与
   // prompt 直接相邻"：这比比较两个索引更强 —— 搬迁、插入、包裹都会破坏相邻性，而
   // prompt 的实参是被屏蔽的字符串字面量，只能在未屏蔽视图里定位。
-  const promptAt = body.indexOf("awaitrequest('prompt'")
-  assert.notEqual(promptAt, -1, '找不到 dispatchTurn 里真正发出 prompt 的调用点')
+  // 「永久 Thinking」根因修复后：prompt 必须经 requestOk 发出 —— request() 把 ok:false
+  // 吞成 null 且永不 reject，外层 .catch（S1）就永远不可达，sidecar 拒绝时槽位卡死
+  // 在 Thinking。同步断言（结构改动须同步，本文件规约）。
+  const promptAt = body.indexOf("awaitrequestOk('prompt'")
+  assert.notEqual(promptAt, -1, '找不到 dispatchTurn 里真正发出 prompt 的调用点（必须经 requestOk：request() 吞 ok:false 会让 .catch 不可达）')
   assert.ok(
-    body.includes("if(!stillMine())returnawaitrequest('prompt'"),
-    '最后一次 stillMine 复检没有与 await request(\'prompt\') 直接相邻：await 与守卫之间不得插入任何代码，否则守卫可能被搬到 prompt 之后（D4 变异 w1b）',
+    body.includes("if(!stillMine())returnawaitrequestOk('prompt'"),
+    '最后一次 stillMine 复检没有与 await requestOk(\'prompt\') 直接相邻：await 与守卫之间不得插入任何代码，否则守卫可能被搬到 prompt 之后（D4 变异 w1b）',
+  )
+  // 退化守卫：prompt 不许再退回吞错的 request()（一旦回退，「永久 Thinking」原样复发）。
+  assert.equal(
+    (body.match(/awaitrequest\('prompt'/g) ?? []).length,
+    0,
+    'dispatchTurn 的 prompt 又改回 request() 发出了：ok:false 被吞成 null、外层 .catch 不可达，sidecar 拒绝时重新变成永久 Thinking',
   )
   // 发送侧回合身份（外部审计 S-1 的**前半**，变异 M11 实测 SURVIVED）：
   //   接线 15 只断言了 error 分支**读取** `(event as {turnId?: string}).turnId`，
@@ -739,6 +748,71 @@ test('接线 4：dispatchTurn 的异步前奏必须在每个 await 之后复检�
     -1,
     'spawnSubagent 的 prompt 形状变了：它每个 childId 只跑一轮，不需要 turnId；'
     + '若给子代理补上 turnId，反而会把 undefined 判据换成可能失配的严格比较',
+  )
+})
+
+// ── 永久 Thinking 根因：RPC 三层封装的契约 ─────────────────────────────────
+//
+//   request()  把 ok:false 吞成 null 且永不 reject —— 对"发了就必须有终态"的调用
+//   （create_session / set_model / prompt）是致命的：sidecar 拒绝时（会话不存在、
+//   模型不可用、超时），外层 .catch 不可达，槽位永远停在 Thinking。
+//   requestOk() 抛出带 sidecar 文案的 Error，让既有的 .catch → finishRun(id, 文案,
+//   activeTurnId)（S1）成为真正的承载者。这组断言钉住：封装本身、三个调用点、
+//   以及 sidecar 未就绪分支的可见错误 —— 任何一处回退都会让「永久 Thinking」复发。
+test('接线 P0：关键请求必须经 requestOk 发出，且未就绪分支必须写可见错误', () => {
+  // 封装本身：定义唯一（计数走屏蔽字面量视图，字符串副本不算），语义完整。
+  assert.equal(
+    (codeFlat.match(/asyncfunctionrequestOk\(/g) ?? []).length,
+    1,
+    'requestOk 定义缺失或重复：ok:false 必须 throw，否则调用方 .catch 不可达（永久 Thinking 根因）',
+  )
+  const requestOkBody = functionBody('requestOk')
+  assert.match(
+    requestOkBody,
+    /if\(!response\.ok\)thrownewError\(response\.error\|\|/,
+    'requestOk 不再抛出 sidecar 的错误文案：失败会退化为静默 null',
+  )
+  assert.match(requestOkBody, /returnresponse\.result/, 'requestOk 成功路径必须返回 response.result')
+
+  // dispatchTurn：前奏三步（create_session / set_model / prompt）全部经 requestOk，
+  // 且一个吞错的 request() 都不许留。
+  const body = functionBody('dispatchTurn')
+  for (const type of ['create_session', 'set_model', 'prompt']) {
+    assert.ok(
+      body.includes(`awaitrequestOk('${type}'`),
+      `dispatchTurn 的 ${type} 又改回吞错的 request() 发出了：sidecar 拒绝时槽位卡死在 Thinking`,
+    )
+    assert.equal(
+      (body.match(new RegExp(`awaitrequest\\('${type}'`, 'g')) ?? []).length,
+      0,
+      `dispatchTurn 里仍有裸 request('${type}')：ok:false 被吞成 null，外层 .catch 永不可达`,
+    )
+  }
+  // sidecar 未就绪分支：收起运行态的同时必须写用户可见的 error 条（否则表现为"点了没反应"）。
+  assert.match(
+    body,
+    /running:false,phase:'idle',activeTurnId:undefined,error:/,
+    "未就绪分支只收起运行态不写 error：用户点发送后界面毫无反馈（次级缺陷回归）",
+  )
+
+  // newSession：create_session 失败必须可见（旧 request() 吞成 null → created.id TypeError
+  // → 未处理 rejection，界面上什么都不发生）。
+  const newSessionBody = functionBody('newSession')
+  assert.ok(newSessionBody.includes("awaitrequestOk('create_session'"), 'newSession 的 create_session 又改回吞错的 request()')
+  assert.match(
+    newSessionBody,
+    /catch\(error\)\{patchSlot\(activeSessionId,\{error:/,
+    'newSession 丢失了失败兜底：create_session 被拒时重新变成未处理 rejection',
+  )
+
+  // spawnSubagent：失败文案先进子槽再 finishSubRun（finishSubRun 读 slotFor(id).reply
+  // 汇总进父槽 —— 直接改父槽 subRuns 会被两段式更新覆盖）。
+  const spawnBody = functionBody('spawnSubagent')
+  assert.ok(spawnBody.includes("awaitrequestOk('create_session'"), 'spawnSubagent 的 create_session 又改回吞错的 request()')
+  assert.match(
+    spawnBody,
+    /patchSlot\(childId,\{reply:[\s\S]*?finishSubRun\(childId,'error'\)/,
+    "spawnSubagent 的 catch 必须先写子槽 reply 再 finishSubRun(childId,'error')，否则失败原因丢失",
   )
 })
 
@@ -840,14 +914,16 @@ test('接线 7：archiveSession 必须对称（作废在飞响应 + 清运行侧
 
 test('接线 10：applySessionHistory 运行中必须暂存历史，并在收尾后合并回填', () => {
   const apply = functionBody('applySessionHistory')
+  // 1-5 批次②：函数现在先把插件历史拆出来（pluginHistory → pluginMessages），
+  // 聊天历史改名 chatHistory 继续走缺陷 10 的暂存/合并路径 —— 语义不变，名字变了。
   assert.match(
     apply,
-    /if\(current\.running\)\{if\(history\.length\)pendingHistory=\{\.\.\.pendingHistory,\[id\]:history\}return\}/,
+    /if\(chatHistory\.length\)pendingHistory=\{\.\.\.pendingHistory,\[id\]:chatHistory\}return\}/,
     'applySessionHistory 又直接丢弃运行中的历史：用户打开有历史的会话只会看到当前这一轮（缺陷 10）',
   )
   assert.match(
     apply,
-    /constmerged=mergeHistoryIntoTimeline\(history,current\.timeline\)/,
+    /constmerged=mergeHistoryIntoTimeline\(chatHistory,current\.timeline\)/,
     'historyLoaded 分支必须走合并而不是覆盖：覆盖会抹掉正在流式输出的半截回复',
   )
   const flush = functionBody('flushPendingHistory')

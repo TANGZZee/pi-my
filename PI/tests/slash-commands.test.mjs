@@ -12,6 +12,8 @@ import { SLASH_COMMANDS, SLASH_KINDS, filterSlashCommands, findSlashCommand, sla
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const appSource = readFileSync(path.join(here, '..', 'src', 'App.svelte'), 'utf8')
+// 0-5 批次 C：mention/applyMention 随 Composer 组件走，scout 预填断言改读组件源码。
+const composerSource = readFileSync(path.join(here, '..', 'src', 'Composer.svelte'), 'utf8')
 
 /** 从 App.svelte 的 runSlashCommand 里提取所有 `case 'xxx':` 分支 */
 function dispatchedKinds() {
@@ -113,5 +115,5 @@ test('需要参数的命令在注册表里有据可依（scout 预填）', () =>
   // applyMention 对 scout 做预填而非直接执行；这里确认 scout 确实用它自己的 id
   const scout = SLASH_COMMANDS.find((command) => command.id === 'scout')
   assert.ok(scout, 'scout 命令应存在')
-  assert.match(appSource, /command\.id === 'scout'/, 'applyMention 应对 scout 预填参数')
+  assert.match(composerSource, /command\.id === 'scout'/, 'applyMention 应对 scout 预填参数')
 })

@@ -7,13 +7,16 @@
   import { SKINS, type SkinId } from './skins'
   import { PETS, petPreviewUrl, type PetModel } from './pets'
   import ConfigPane from './ConfigPane.svelte'
+  import PluginHost from './PluginHost.svelte'
+  import { listRenderers, registerRenderer, setProjectTrusted, subscribeRenderers, unregisterRenderer } from './ui-registry'
+  import type { PluginMessage } from './ui-plugins'
 
   type ProviderInfo = { provider: string; modelCount: number; configured: boolean }
   type UsageStats = { sessions: number; turns: number; activeDays: number; totals: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number }; costUsd: number; costKnown: boolean; byModel: Array<{ model: string; tokens: number; turns: number }>; byProject?: Array<{ project: string; tokens: number; turns: number }>; byDay?: Record<string, number> }
   type ImageGenConfig = { baseUrl: string; apiKey: string; model: string; size: string }
   type SettingsInfo = { node: string; sdk: string; agentDir: string; sessionDir: string; authProviders: string[]; providers?: ProviderInfo[] }
   type ArchivedSession = { id: string; title: string; file?: string; cwd?: string; modifiedAt?: number; archived?: boolean }
-  type Tab = 'general' | 'appearance' | 'notify' | 'keys' | 'proxy' | 'agents' | 'imagegen' | 'git' | 'skills' | 'extensions' | 'mcp' | 'store' | 'vision' | 'usage' | 'archived' | 'storage' | 'lan' | 'pet' | 'logs' | 'about'
+  type Tab = 'general' | 'appearance' | 'notify' | 'keys' | 'proxy' | 'agents' | 'imagegen' | 'git' | 'skills' | 'extensions' | 'plugins' | 'mcp' | 'context' | 'failover' | 'store' | 'vision' | 'usage' | 'archived' | 'storage' | 'lan' | 'pet' | 'logs' | 'about'
   type AgentUpdateInfo = { current: string; latest: string; installedVersion?: string; updateAvailable: boolean; url: string; repoUrl?: string; source?: string; sourceLabel?: string; updated?: boolean; restartRequired?: boolean; message?: string; checkedAt?: number }
 
   export let open = false
@@ -41,11 +44,14 @@
   export let onOpenAgentRepo: (() => void) | undefined = undefined
   export let initialTab: Tab | undefined = undefined
   export let rpc: ((type: string, payload?: Record<string, unknown>) => Promise<unknown>) | undefined = undefined
+  export let activeSessionId = ''
+  /** 1-5：当前会话累计的插件消息（「插件 UI」页按 slot 分发渲染）。 */
+  export let pluginMessages: PluginMessage[] = []
 
   const NAV: Array<{ group: string; items: Array<[Tab, string]> }> = [
     { group: '基础', items: [['general', '通用'], ['appearance', '外观'], ['notify', '通知'], ['keys', '快捷键'], ['proxy', '代理']] },
-    { group: '能力', items: [['agents', '子代理'], ['imagegen', '生图'], ['git', 'Git']] },
-    { group: '生态', items: [['skills', '技能'], ['extensions', '扩展'], ['mcp', 'MCP'], ['store', '商店'], ['vision', '视觉桥'], ['pet', '桌宠'], ['lan', '局域网']] },
+    { group: '能力', items: [['agents', '子代理'], ['imagegen', '生图'], ['context', '上下文'], ['failover', '故障转移'], ['git', 'Git']] },
+    { group: '生态', items: [['skills', '技能'], ['extensions', '扩展'], ['plugins', '插件 UI'], ['mcp', 'MCP'], ['store', '商店'], ['vision', '视觉桥'], ['pet', '桌宠'], ['lan', '局域网']] },
     { group: '维护', items: [['usage', '用量'], ['archived', '已归档的聊天'], ['storage', '存储'], ['logs', '日志'], ['about', '关于']] }
   ]
 
@@ -103,23 +109,306 @@
   // U1：关窗最小化到托盘（由 Rust 侧持有真值；前端只在变更时下发）
   let trayMinimize = true
   let trayMinimizeBusy = false
-  // 2-10 MCP 服务器管理状态
-  type McpServer = { name: string; scope: string; command: string; transport: string; args: string[]; disabled: boolean }
+  // 2-10 MCP 服务器管理状态；T2⑥ 原生化：SDK 校验结果（servers/errors）+ 启停/暴露级别编辑
+  type McpServer = { name: string; scope: string; command: string; transport: string; args: string[]; enabled: boolean; exposure: string; source?: string }
+  type McpListResult = { servers?: McpServer[]; errors?: string[]; projectTrusted?: boolean; globalPath?: string; projectPath?: string; global?: McpServer[]; project?: McpServer[] }
   let mcpServers: McpServer[] = []
+  let mcpErrors: string[] = []
+  let mcpProjectTrusted = true
   let mcpGlobalPath = ''
   let mcpBusy = false
+  let mcpNotice = ''
   let mcpTestStatus: Record<string, { busy?: boolean; ok?: boolean; message?: string }> = {}
+  // T2⑥ 暴露级别选项（与 SDK McpExposure 一致；codemode 为默认）
+  const MCP_EXPOSURES: Array<['codemode' | 'deferred' | 'direct' | 'hidden', string]> = [
+    ['codemode', 'codemode（脚本调用）'],
+    ['deferred', 'deferred（搜索加载）'],
+    ['direct', 'direct（直接声明）'],
+    ['hidden', 'hidden（隐藏）'],
+  ]
+  // 1-5 完整版：插件 UI 页状态 —— 注册表快照 + 扩展 UI 诊断（ext_ui_diagnostics）
+  let pluginDiagnostics: { unsupported: Array<{ message?: string; count?: number }>; count?: number } = { unsupported: [] }
+  let pluginDiagBusy = false
+  let pluginDiagNotice = ''
+  let pluginRenderers: ReturnType<typeof listRenderers> = []
+  let pluginSettingsMessages: PluginMessage[] = []
+  // 批次③：iframe 沙箱渲染器声明（sidecar 从扩展 pi-ui.json 扫出）+ 项目信任态
+  let pluginDeclarations: Array<{ customType: string; slot: string; kind: string; target: string; title?: string; source: string }> = []
+  let pluginTrusted = true
+  let pluginTrustBusy = false
+  // T1-①/T1-②：缓存预热 + 压缩预算（新「上下文」页）
+  type CacheWarmingInfo = { mode?: string; status: string; reason: string; nextWarmAt: number | null; warmCost: number | null; missCost: number | null; action: string; expectedSavings: number | null }
+  let cacheWarming: CacheWarmingInfo | null = null
+  let cacheWarmingBusy = false
+  let cacheWarmingNotice = ''
+  const CACHE_WARMING_MODES: Array<['off' | 'streaming' | 'idle', string]> = [['off', '关闭'], ['streaming', '流式中预热（默认）'], ['idle', '空闲也预热']]
+  let compactionOverrides: Record<string, { reserveTokens?: number; keepRecentTokens?: number }> = {}
+  let budgetModelKey = ''
+  let budgetReserve = ''
+  let budgetKeep = ''
+  let budgetNotice = ''
+  // T3-2：虚拟模型故障转移链（新「故障转移」页）
+  type FailoverLink = { provider: string; modelId: string; thinkingLevel?: string }
+  type FailoverConfig = { enabled: boolean; chain: FailoverLink[] }
+  let failoverSupported = false
+  let failoverEnabled = false
+  let failoverChain: FailoverLink[] = []
+  let failoverIssues: Array<{ index: number; provider?: string; modelId?: string; error: string }> = []
+  let failoverBusy = false
+  let failoverNotice = ''
+  let failoverDraftProvider = ''
+  let failoverDraftModelId = ''
+  let failoverDraftThinking = ''
+  let failoverModels: Array<{ provider: string; id: string }> = []
+  // 链编辑下拉：提供商去重清单 + 选中提供商下的模型清单（Svelte 派生，模板只读）
+  $: failoverProviders = [...new Set(failoverModels.map((m) => m.provider))]
+  $: failoverDraftModelOptions = failoverModels.filter((m) => m.provider === failoverDraftProvider).map((m) => m.id)
+
+  async function loadPluginDiagnostics() {
+    if (!rpc || !connected) return
+    pluginDiagBusy = true
+    try {
+      pluginDiagnostics = await rpc('ext_ui_diagnostics', {}) as typeof pluginDiagnostics
+      pluginDiagNotice = ''
+    } catch (error) {
+      pluginDiagNotice = error instanceof Error ? error.message : '诊断读取失败'
+    }
+    pluginDiagBusy = false
+    // 批次③：顺带拉取沙箱渲染器声明并登记进前端注册表
+    void loadPluginDeclarations()
+  }
+
+  // T1-①：缓存预热状态/模式；T1-②：压缩预算读写（走会话的 settingsManager）
+  async function loadCacheWarming() {
+    if (!rpc || !connected || !activeSessionId) return
+    cacheWarmingBusy = true
+    try {
+      cacheWarming = await rpc('get_cache_warming', { sessionId: activeSessionId }) as CacheWarmingInfo
+      cacheWarmingNotice = ''
+    } catch (error) {
+      cacheWarmingNotice = error instanceof Error ? error.message : '缓存预热状态读取失败'
+    }
+    cacheWarmingBusy = false
+  }
+
+  async function setCacheWarmingMode(mode: 'off' | 'streaming' | 'idle') {
+    if (!rpc || !connected || !activeSessionId) return
+    cacheWarmingBusy = true
+    try {
+      await rpc('set_cache_warming', { sessionId: activeSessionId, mode })
+      await loadCacheWarming()
+      cacheWarmingNotice = '已切换缓存预热模式。'
+    } catch (error) {
+      cacheWarmingNotice = error instanceof Error ? error.message : '模式切换失败'
+    }
+    cacheWarmingBusy = false
+  }
+
+  async function loadCompactionBudget() {
+    if (!rpc || !connected || !activeSessionId) return
+    try {
+      const result = await rpc('get_compaction_budget', { sessionId: activeSessionId }) as { overrides?: typeof compactionOverrides }
+      compactionOverrides = result?.overrides ?? {}
+      budgetNotice = ''
+    } catch (error) {
+      budgetNotice = error instanceof Error ? error.message : '压缩预算读取失败'
+    }
+  }
+
+  async function saveCompactionBudget() {
+    if (!rpc || !connected || !activeSessionId) return
+    const modelKey = budgetModelKey.trim()
+    if (!modelKey) { budgetNotice = '请填写模型键（如 anthropic/claude-...）。'; return }
+    const reserve = budgetReserve.trim() === '' ? undefined : Number(budgetReserve)
+    const keep = budgetKeep.trim() === '' ? undefined : Number(budgetKeep)
+    if ((reserve !== undefined && (!Number.isFinite(reserve) || reserve <= 0)) || (keep !== undefined && (!Number.isFinite(keep) || keep <= 0))) {
+      budgetNotice = '数值必须为正数；留空表示沿用全局默认。'
+      return
+    }
+    try {
+      await rpc('set_compaction_budget', { sessionId: activeSessionId, modelKey, reserveTokens: reserve, keepRecentTokens: keep })
+      await loadCompactionBudget()
+      budgetModelKey = ''
+      budgetReserve = ''
+      budgetKeep = ''
+      budgetNotice = '已保存（对会话的下一次压缩生效）。'
+    } catch (error) {
+      budgetNotice = error instanceof Error ? error.message : '保存失败'
+    }
+  }
+
+  async function removeCompactionBudget(key: string) {
+    if (!rpc || !connected || !activeSessionId) return
+    try {
+      await rpc('set_compaction_budget', { sessionId: activeSessionId, modelKey: key })
+      await loadCompactionBudget()
+    } catch (error) {
+      budgetNotice = error instanceof Error ? error.message : '删除失败'
+    }
+  }
+
+  // T3-2：故障转移链读写（get_virtual_models / set_virtual_models）
+  async function loadFailover() {
+    if (!rpc || !connected) return
+    failoverBusy = true
+    try {
+      const result = await rpc('get_virtual_models', {}) as { supported?: boolean; config?: FailoverConfig; issues?: typeof failoverIssues }
+      failoverSupported = result?.supported === true
+      failoverEnabled = result?.config?.enabled === true
+      failoverChain = result?.config?.chain ?? []
+      failoverIssues = result?.issues ?? []
+      failoverNotice = ''
+      // 链编辑下拉选项：已配置模型（sidecar 已排除虚拟模型本身）
+      const list = await rpc('list_models', {}) as Array<{ provider: string; id: string }>
+      failoverModels = Array.isArray(list) ? list : []
+    } catch (error) {
+      failoverNotice = error instanceof Error ? error.message : '故障转移配置读取失败'
+    }
+    failoverBusy = false
+  }
+
+  async function saveFailover(next: FailoverConfig) {
+    if (!rpc || !connected) return
+    if (!next.chain.length) { failoverNotice = '链不能为空：请先添加模型，或直接关闭启用开关。'; return }
+    failoverBusy = true
+    try {
+      const result = await rpc('set_virtual_models', next) as { config?: FailoverConfig; issues?: typeof failoverIssues }
+      failoverEnabled = result?.config?.enabled === true
+      failoverChain = result?.config?.chain ?? []
+      failoverIssues = result?.issues ?? []
+      failoverNotice = failoverEnabled ? '已保存并注册（对会话的下一次请求生效）。' : '已保存（当前未启用）。'
+    } catch (error) {
+      failoverNotice = error instanceof Error ? error.message : '保存失败'
+    }
+    failoverBusy = false
+  }
+
+  function addFailoverLink() {
+    const provider = failoverDraftProvider.trim()
+    const modelId = failoverDraftModelId.trim()
+    if (!provider || !modelId) { failoverNotice = '请从下拉选择提供商与模型。'; return }
+    if (failoverChain.some((item) => item.provider === provider && item.modelId === modelId)) {
+      failoverNotice = '该模型已在链中。'
+      return
+    }
+    const thinking = failoverDraftThinking.trim()
+    failoverChain = [...failoverChain, thinking ? { provider, modelId, thinkingLevel: thinking } : { provider, modelId }]
+    failoverDraftProvider = ''
+    failoverDraftModelId = ''
+    failoverDraftThinking = ''
+    failoverNotice = ''
+  }
+
+  function moveFailoverLink(index: number, delta: number) {
+    const target = index + delta
+    if (target < 0 || target >= failoverChain.length) return
+    const next = [...failoverChain]
+    const [link] = next.splice(index, 1)
+    next.splice(target, 0, link)
+    failoverChain = next
+  }
+
+  function removeFailoverLink(index: number) {
+    failoverChain = failoverChain.filter((_, i) => i !== index)
+  }
+
+  async function loadPluginDeclarations() {
+    if (!rpc || !connected) return
+    try {
+      const result = await rpc('list_ui_renderers', { sessionId: undefined }) as {
+        renderers?: Array<{ customType: string; slot: string; kind: string; target: string; title?: string; source: string }>
+        trusted?: boolean
+      } | null
+      pluginDeclarations = result?.renderers ?? []
+      pluginTrusted = result?.trusted !== false
+      // 登记进注册表（同源数据重复登记 = 原子替换；注册表查重会拒绝同 id，
+      // 这里以 customType 生成稳定 id，重复加载时先注销旧来源再注册）。
+      syncRendererRegistrations()
+    } catch {
+      // sidecar 旧版本/未就绪：保持现状，不阻塞诊断页
+    }
+  }
+
+  let syncedDeclarationIds: string[] = []
+  function syncRendererRegistrations() {
+    // 以声明 id = `decl:${customType}`（trim+lower 后）登记；先注销本来源的旧条目
+    for (const id of syncedDeclarationIds) unregisterRenderer(id)
+    syncedDeclarationIds = []
+    if (!pluginTrusted) return // 不可信项目：不登记任何 iframe 渲染器
+    for (const decl of pluginDeclarations) {
+      const key = decl.customType.trim().toLowerCase()
+      const result = registerRenderer({
+        id: `decl:${key}`,
+        source: 'ui-manifest',
+        spec: { kind: 'iframe', target: decl.target },
+        match: { customType: key },
+      })
+      if (result.ok) syncedDeclarationIds.push(`decl:${key}`)
+    }
+  }
+
+  /** 信任门控切换（批次③）：写持久存储 + 立即重登记。 */
+  async function togglePluginTrust(trusted: boolean) {
+    if (!rpc || pluginTrustBusy) return
+    pluginTrustBusy = true
+    try {
+      await rpc('trust_project', { cwd: undefined, trusted })
+      pluginTrusted = trusted
+      // 通知 ui-registry 的信任段（App 的宿主镜像经 subscribeProjectTrust 同步）——
+      // 只改本地变量会让 timeline/status/float 的门控维持旧值直到重启（审查 BUG-1）。
+      setProjectTrusted(trusted)
+      syncRendererRegistrations()
+      if (!trusted) {
+        // 撤销信任：立刻停掉所有 settings 槽的 iframe 渲染（其他槽由宿主重建时自然生效）
+        pluginSettingsMessages = []
+      }
+    } catch (error) {
+      pluginDiagNotice = error instanceof Error ? error.message : '信任状态写入失败'
+    }
+    pluginTrustBusy = false
+  }
 
   async function loadMcpServers() {
     if (!rpc || mcpBusy) return
     mcpBusy = true
     try {
-      const result = await rpc('mcp_list') as { global?: McpServer[]; project?: McpServer[]; globalPath?: string } | null
-      mcpServers = [...(result?.global ?? []), ...(result?.project ?? [])]
+      // T2⑥：SDK 校验版（servers/errors 平铺）；旧 sidecar 降级响应（global/project 数组）兼容合并
+      const result = await rpc('mcp_list') as McpListResult | null
+      if (Array.isArray(result?.servers)) {
+        mcpServers = result.servers
+        mcpErrors = result?.errors ?? []
+        mcpProjectTrusted = result?.projectTrusted !== false
+      } else {
+        mcpServers = [...(result?.global ?? []), ...(result?.project ?? [])]
+        mcpErrors = []
+        mcpProjectTrusted = true
+      }
       mcpGlobalPath = result?.globalPath ?? ''
+      mcpNotice = ''
+    } catch (error) {
+      mcpNotice = error instanceof Error ? error.message : 'MCP 服务器列表读取失败'
     } finally {
       mcpBusy = false
     }
+  }
+
+  /** T2⑥：单个服务器 enabled/exposure 编辑（SDK updateMcpServerConfig 语义）。
+   *  mcpBusy 门闩（对抗审查 A/D）：patch 串行化，防止连续快速点击并发发出多个
+   *  mcp_patch 造成丢失更新；sidecar 侧另有每文件写锁兜底。 */
+  async function patchMcpServer(server: McpServer, patch: { enabled?: boolean; exposure?: string }) {
+    if (!rpc || mcpBusy) return
+    mcpBusy = true
+    const key = server.scope + ':' + server.name
+    try {
+      await rpc('mcp_patch', { scope: server.scope, name: server.name, ...patch })
+      mcpNotice = ''
+    } catch (error) {
+      mcpNotice = error instanceof Error ? error.message : 'MCP 配置写入失败'
+    } finally {
+      mcpBusy = false
+    }
+    await loadMcpServers()
+    void key
   }
 
   async function testMcpServer(server: McpServer) {
@@ -191,6 +480,18 @@
   $: if (open && tab === 'logs') void loadLogs()
   $: if (open && tab === 'archived') void loadArchivedSessions()
   $: if (open && tab === 'store') void refreshStore()
+  $: if (open && tab === 'plugins') void loadPluginDiagnostics()
+  $: if (open && tab === 'context' && activeSessionId) { void loadCacheWarming(); void loadCompactionBudget() }
+  $: if (open && tab === 'failover') void loadFailover()
+  // 渲染器注册表是模块级单例，进入该页时取一次快照（内置三项 + 第三方注册项）；
+  // 批次①对抗审查 D6：注册表变化（扩展注册/注销渲染器）时快照必须跟着刷新，
+  // 否则设置页展示的是陈旧列表。返回的取消订阅随组件销毁自动执行。
+  $: pluginRenderers = tab === 'plugins' ? listRenderers() : []
+  onMount(() => subscribeRenderers(() => {
+    if (tab === 'plugins') pluginRenderers = listRenderers()
+  }))
+  // 只展示当前会话里的 settings 槽消息；timeline/float/status 由各自宿主渲染
+  $: pluginSettingsMessages = pluginMessages.filter((item) => item.slot === 'settings')
   // 修改：从侧栏更新提醒进入设置时，直接定位到“关于”页。
   $: if (open && initialTab && tab !== initialTab) setTab(initialTab)
   $: sortedStoreItems = sortStoreItems(storeItems)
@@ -901,20 +1202,220 @@
                 </div>
               {/each}
             </section>
+          {:else if tab === 'plugins'}
+            <section class="group">
+              <h3>插件 UI</h3>
+              <p class="desc">扩展通过 <code>pi.sendMessage(&#123;customType:'ui.plugin', display:&#123;slot, component, title&#125;&#125;)</code> 投递声明式 UI。四个槽位：timeline / float / status 由主界面宿主渲染，settings 在本页渲染。</p>
+              <p class="desc">插件消息是数据不是代码：前端永不 eval 扩展 JS，HTML 走白名单清洗。</p>
+              <h4>会话插件消息（settings 槽）</h4>
+              {#if pluginSettingsMessages.length}
+                <PluginHost slot="settings" hostId="settings" messages={pluginSettingsMessages} containerClass="plugin-settings-list" />
+              {:else}
+                <p class="desc">当前会话还没有投递到 settings 槽的插件消息。</p>
+              {/if}
+              <h4>已注册的渲染器</h4>
+              <p class="desc">内置三项随应用加载；第三方渲染器来自扩展目录的 pi-ui.json 声明，经注册表白名单登记。</p>
+              <div class="plugin-settings-list">
+                {#each pluginRenderers as item (item.id)}
+                  <div class="p-card">
+                    <div class="p-head">
+                      <span class="p-name">{item.id}</span>
+                      <span class="badge" class:on={item.builtin}>{item.builtin ? '内置' : '第三方'}</span>
+                      <span class="plugin-kind">{item.spec.kind}:{item.spec.target}</span>
+                    </div>
+                    <p class="desc">来源 {item.source} · 匹配 {item.match.customType ? `customType=${item.match.customType}` : `component=${item.match.component}`}</p>
+                  </div>
+                {/each}
+              </div>
+              <h4>项目信任（沙箱渲染器门控）</h4>
+              <p class="desc">第三方渲染器的代码跑在无特权的沙箱 iframe 里（读不到会话数据与令牌）；但渲染本身仍要求项目受信。撤销信任后所有非 timeline 槽的沙箱渲染立即停止。</p>
+              {#if pluginTrustBusy}
+                <p class="desc">写入中…</p>
+              {:else if pluginTrusted}
+                <button class="ghost" on:click={() => void togglePluginTrust(false)}>撤销本项目信任</button>
+              {:else}
+                <p class="desc plugin-trust-denied">当前项目未受信：沙箱渲染器已全部停用（声明仍可在下方查看）。</p>
+                <button class="ghost" on:click={() => void togglePluginTrust(true)}>信任本项目并启用</button>
+              {/if}
+              {#if pluginDeclarations.length}
+                <h4>扩展声明的沙箱渲染器（pi-ui.json）</h4>
+                <div class="plugin-settings-list">
+                  {#each pluginDeclarations as decl (decl.customType + ':' + decl.source)}
+                    <div class="p-card">
+                      <div class="p-head">
+                        <span class="p-name">{decl.title || decl.customType}</span>
+                        <span class="plugin-kind">{decl.kind}:{decl.target}</span>
+                      </div>
+                      <p class="desc">槽位 {decl.slot} · customType {decl.customType} · 来源 {decl.source}</p>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+              <h4>扩展 UI 能力诊断</h4>
+              <p class="desc">这些扩展 UI 调用在桌面端尚未实现，扩展作者会看到对应回退（不是静默失效）。</p>
+              {#if pluginDiagNotice}<p class="desc">{pluginDiagNotice}</p>{/if}
+              {#if pluginDiagBusy}
+                <p class="desc">读取中…</p>
+              {:else if pluginDiagnostics?.unsupported?.length}
+                <ul class="plugin-diagnostics">
+                  {#each pluginDiagnostics.unsupported as diag, index (diag.message || index)}
+                    <li>{diag.message}（{diag.count ?? 0} 次）</li>
+                  {/each}
+                </ul>
+              {:else}
+                <p class="desc">暂无：当前会话没有扩展请求未实现的 UI 能力。</p>
+              {/if}
+              <button class="ghost" disabled={pluginDiagBusy} on:click={() => void loadPluginDiagnostics()}>刷新诊断</button>
+            </section>
+          {:else if tab === 'context'}
+            <!-- T1-① 缓存预热 / T1-② 压缩预算 -->
+            <section class="group">
+              <h3>提示缓存预热</h3>
+              <p class="desc">会话空闲时按需重放最后一条请求（1 token 输出上限），让 provider 的 prompt 缓存不过期。长会话的下一条消息更快、更便宜。预热本身有少量费用，SDK 按期望节省自动决策。</p>
+              {#if !activeSessionId}
+                <p class="desc">没有活动会话，无法读写预热设置。</p>
+              {:else}
+                <div class="choice-row" role="group" aria-label="缓存预热模式">
+                  {#each CACHE_WARMING_MODES as [mode, label] (mode)}
+                    <button class="choice" class:on={cacheWarming?.mode === mode} disabled={cacheWarmingBusy} on:click={() => void setCacheWarmingMode(mode)}>{label}</button>
+                  {/each}
+                </div>
+                {#if cacheWarmingNotice}<p class="desc">{cacheWarmingNotice}</p>{/if}
+                {#if cacheWarming}
+                  <p class="desc">当前状态：{cacheWarming.status === 'refreshing' ? '正在预热' : cacheWarming.status === 'scheduled' ? `已排程（${cacheWarming.nextWarmAt ? new Date(cacheWarming.nextWarmAt).toLocaleTimeString() : '待定'}）` : '未活动'}{cacheWarming.reason ? ` · ${cacheWarming.reason}` : ''}</p>
+                  {#if cacheWarming.warmCost !== null}
+                    <p class="desc">最近决策：{cacheWarming.action === 'warm' ? '预热' : '停止'} · 预热花费 ≈ ${cacheWarming.warmCost.toFixed(4)} · 缓存失效损失 ≈ ${cacheWarming.missCost?.toFixed(4) ?? '—'}</p>
+                  {/if}
+                {/if}
+              {/if}
+            </section>
+            <section class="group">
+              <h3>压缩预算（按模型）</h3>
+              <p class="desc">为特定模型调整自动压缩的 token 预留（reserveTokens）与保留最近上下文量（keepRecentTokens）。留空沿用全局默认；删除条目即恢复默认。对下一次压缩生效。</p>
+              {#if budgetNotice}<p class="desc">{budgetNotice}</p>{/if}
+              {#if Object.keys(compactionOverrides).length}
+                <div class="usage-table">
+                  <div class="usage-table-head"><span>模型</span><span>reserveTokens</span><span>keepRecentTokens</span><span></span></div>
+                  {#each Object.entries(compactionOverrides) as [key, ov] (key)}
+                    <div class="usage-table-row"><span title={key}>{key}</span><span>{ov.reserveTokens ?? '默认'}</span><span>{ov.keepRecentTokens ?? '默认'}</span><span><button class="ghost" on:click={() => void removeCompactionBudget(key)}>删除</button></span></div>
+                  {/each}
+                </div>
+              {:else}
+                <p class="muted">暂无按模型覆盖。</p>
+              {/if}
+              {#if activeSessionId}
+                <div class="choice-row" style="margin-top:10px">
+                  <input style="flex:2;min-width:180px" bind:value={budgetModelKey} placeholder="模型键 provider/modelId" />
+                  <input style="flex:1;min-width:90px" bind:value={budgetReserve} placeholder="reserveTokens" inputmode="numeric" />
+                  <input style="flex:1;min-width:110px" bind:value={budgetKeep} placeholder="keepRecentTokens" inputmode="numeric" />
+                  <button class="choice" on:click={() => void saveCompactionBudget()}>保存</button>
+                </div>
+              {/if}
+            </section>
+          {:else if tab === 'failover'}
+            <!-- T3-2 虚拟模型：有序故障转移链 -->
+            <section class="group">
+              <h3>故障转移链（虚拟模型）</h3>
+              <p class="desc">把若干已配置模型排成一条链：新对话从链首模型开始；某个模型失败（含上下文溢出自动压缩后仍失败）时自动滑到下一个重试，续写保持当前模型。链以「故障转移」虚拟模型形式出现，按链首模型的提供商鉴权。</p>
+              {#if failoverBusy}<p class="desc">加载中…</p>{/if}
+              {#if failoverNotice}<p class="desc" class:error={!failoverChain.length || failoverIssues.length}>{failoverNotice}</p>{/if}
+              {#if !failoverSupported}
+                <p class="desc">当前 SDK 版本不支持虚拟模型（缺少 registerVirtualModel），可编辑配置但不会生效。</p>
+              {/if}
+              <div class="choice-row" role="group" aria-label="故障转移开关">
+                <button class="choice" class:on={failoverEnabled} disabled={failoverBusy || !failoverChain.length} on:click={() => void saveFailover({ enabled: true, chain: failoverChain })}>启用</button>
+                <button class="choice" class:on={!failoverEnabled} disabled={failoverBusy} on:click={() => void saveFailover({ enabled: false, chain: failoverChain })}>停用</button>
+                <button class="ghost" disabled={failoverBusy} on:click={() => void loadFailover()}>刷新</button>
+              </div>
+            </section>
+            <section class="group">
+              <h3>链内模型（按失败顺序）</h3>
+              {#if failoverIssues.length}
+                <div class="p-card">
+                  <div class="p-head"><span class="p-name">目录问题</span></div>
+                  {#each failoverIssues as issue (issue.index + ':' + issue.error)}
+                    <p class="desc error">#{issue.index + 1} {issue.provider}/{issue.modelId}：{issue.error}</p>
+                  {/each}
+                </div>
+              {/if}
+              {#if failoverChain.length}
+                <div class="usage-table">
+                  <div class="usage-table-head"><span>#</span><span>提供商</span><span>模型</span><span>思考档位</span><span></span></div>
+                  {#each failoverChain as link, i (link.provider + '/' + link.modelId)}
+                    <div class="usage-table-row">
+                      <span>{i + 1}</span>
+                      <span title={link.provider}>{link.provider}</span>
+                      <span title={link.modelId}>{link.modelId}</span>
+                      <span>{link.thinkingLevel || '模型默认'}</span>
+                      <span>
+                        <button class="ghost" disabled={i === 0} on:click={() => moveFailoverLink(i, -1)}>上移</button>
+                        <button class="ghost" disabled={i === failoverChain.length - 1} on:click={() => moveFailoverLink(i, 1)}>下移</button>
+                        <button class="ghost" on:click={() => removeFailoverLink(i)}>移除</button>
+                      </span>
+                    </div>
+                  {/each}
+                </div>
+              {:else}
+                <p class="muted">链为空。从下方添加至少一个已配置模型。</p>
+              {/if}
+              <div class="choice-row" style="margin-top:10px">
+                <select bind:value={failoverDraftProvider} aria-label="链模型提供商" style="flex:1;min-width:120px">
+                  <option value="" disabled>提供商…</option>
+                  {#each failoverProviders as p (p)}
+                    <option value={p}>{p}</option>
+                  {/each}
+                </select>
+                <select bind:value={failoverDraftModelId} aria-label="链模型" style="flex:2;min-width:160px">
+                  <option value="" disabled>模型…</option>
+                  {#each failoverDraftModelOptions as m (m)}
+                    <option value={m}>{m}</option>
+                  {/each}
+                </select>
+                <select bind:value={failoverDraftThinking} aria-label="链模型思考档位" style="flex:1;min-width:110px">
+                  <option value="">模型默认</option>
+                  {#each THINKING_LEVELS as level (level)}
+                    <option value={level}>{THINKING_LABELS[level] ?? level}</option>
+                  {/each}
+                </select>
+                <button class="choice" on:click={addFailoverLink}>添加</button>
+              </div>
+              <div class="choice-row" style="margin-top:10px">
+                <button class="choice" disabled={failoverBusy || !failoverChain.length} on:click={() => void saveFailover({ enabled: failoverEnabled, chain: failoverChain })}>保存链</button>
+              </div>
+            </section>
           {:else if tab === 'mcp'}
-            <!-- 2-10 MCP 服务器管理 -->
+            <!-- 2-10 MCP 服务器管理；T2⑥ 原生化：SDK 校验错误 + 启停/暴露级别编辑 -->
             <section class="group">
               <h3>MCP 服务器</h3>
-              <p class="desc">配置在 <code>~/.pi/agent/mcp.json</code>（全局）与 <code>&lt;工作区&gt;/.pi/mcp.json</code>（项目级）。修改后需重启会话生效。</p>
+              <p class="desc">配置在 <code>~/.pi/agent/mcp.json</code>（全局）与 <code>&lt;工作区&gt;/.pi/mcp.json</code>（项目级，仅受信项目读取）。修改后需重启会话生效；启停与暴露级别由 SDK 写回对应文件（保留其余内容与缩进）。</p>
               {#if mcpBusy}<p class="desc">加载中…</p>{/if}
+              {#if mcpNotice}<p class="desc error">{mcpNotice}</p>{/if}
+              {#if !mcpProjectTrusted}
+                <p class="desc">当前项目未被信任：项目级 <code>.pi/mcp.json</code> 不会加载（全局配置不受影响）。</p>
+              {/if}
+              {#if mcpErrors.length}
+                <div class="p-card">
+                  <div class="p-head"><span class="p-name">配置问题</span></div>
+                  {#each mcpErrors as err, i (i + ':' + err)}
+                    <p class="desc error">{err}</p>
+                  {/each}
+                </div>
+              {/if}
               {#each mcpServers as server (server.scope + ':' + server.name)}
                 <div class="p-card">
                   <div class="p-head">
                     <span class="p-name">{server.name}</span>
-                    <span class="badge" class:on={!server.disabled}>{server.scope === 'global' ? '全局' : '项目'}</span>
+                    <span class="badge" class:on={server.enabled && server.scope === 'global'}>{server.scope === 'global' ? '全局' : '项目'}</span>
+                    <button class="ghost" disabled={mcpBusy} on:click={() => void patchMcpServer(server, { enabled: !server.enabled })}>{mcpBusy ? '处理中…' : server.enabled ? '禁用' : '启用'}</button>
                     <button class="ghost" on:click={() => void testMcpServer(server)}>{mcpTestStatus[server.name]?.busy ? '测试中…' : '测试连接'}</button>
                   </div>
                   <p class="desc">{server.transport} · {server.command}{server.args.length ? ' ' + server.args.join(' ') : ''}</p>
+                  <div class="choice-row" role="group" aria-label="{server.name} 暴露级别">
+                    {#each MCP_EXPOSURES as [exposure, label] (exposure)}
+                      <button class="choice" class:on={server.exposure === exposure} disabled={!server.enabled} on:click={() => void patchMcpServer(server, { exposure })}>{label}</button>
+                    {/each}
+                  </div>
+                  <p class="desc">状态：{server.enabled ? '已启用' : '已禁用'} · 暴露级别：{server.exposure}{mcpTestStatus[server.name]?.message ? ` · ${mcpTestStatus[server.name].message}` : ''}</p>
                   {#if mcpTestStatus[server.name]?.message}<p class="desc" class:error={!mcpTestStatus[server.name]?.ok}>{mcpTestStatus[server.name].message}</p>{/if}
                 </div>
               {:else}
