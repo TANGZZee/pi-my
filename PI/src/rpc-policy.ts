@@ -64,6 +64,12 @@ export const TIMEOUT_BY_TYPE: Readonly<Record<string, number>> = Object.freeze({
   // 1-2 上下文蒸发：会话级自动压缩开关
   get_auto_compaction: 10_000,
   set_auto_compaction: 10_000,
+  // T1-① 缓存预热：会话级开关与状态轮询（状态读自 CacheWarmer 内存快照，快）
+  get_cache_warming: 10_000,
+  set_cache_warming: 10_000,
+  // T1-② 压缩预算：读/写全局 settings 的 compaction.modelOverrides（本地 JSON 读改写）
+  get_compaction_budget: 10_000,
+  set_compaction_budget: 10_000,
   // 2-2 长期记忆：SQLite FTS5 查询（本地库，快）
   memory_search: 15_000,
   memory_remember: 10_000,
@@ -74,6 +80,13 @@ export const TIMEOUT_BY_TYPE: Readonly<Record<string, number>> = Object.freeze({
   mcp_list: 15_000,
   mcp_save: 15_000,
   mcp_test: 30_000,
+  // T2⑥ MCP 原生化：单服务器 enabled/exposure 编辑（SDK updateMcpServerConfig，本地 JSON）
+  mcp_patch: 15_000,
+  // T2⑦ 上下文编辑：buildContextEntries 全量列举（大会话可能几千条目）与追加 context_edit（append-only JSONL 写）
+  list_context: 60_000,
+  apply_context_edit: 30_000,
+  // T2⑧ 生图别名层：与 generate_image 同档（转发旧实现，sidecar 侧 180s HTTP 超时）
+  generate_images: 240_000,
   create_session: 120_000,
   open_session: 120_000,
   list_files: 120_000,
@@ -93,6 +106,13 @@ export const TIMEOUT_BY_TYPE: Readonly<Record<string, number>> = Object.freeze({
   refresh_models: 60_000,
   list_models: 60_000,
   list_providers: 30_000,
+  // T1④⑤：提供商认证状态查询（只读快查）与 OAuth 登出（成功后 ensureRuntime(true) 刷新目录）
+  auth_status: 60_000,
+  auth_logout: 60_000,
+  // T3-2 虚拟模型链：读校验/写配置+注册进 runtime（registerVirtualModel 触发目录重组），
+  // 本地 JSON 读改写，给 memory_* 同档的保守超时。
+  get_virtual_models: 10_000,
+  set_virtual_models: 10_000,
   info: 30_000,
 
   // 会话内操作：瞬时返回（prompt 是 fire-and-forget，只回 accepted）
@@ -101,6 +121,10 @@ export const TIMEOUT_BY_TYPE: Readonly<Record<string, number>> = Object.freeze({
   // 扩展 UI 对话框的回答：用户可能慢慢想，但必须有上限（否则又回到"永久挂住"）
   ui_dialog_response: 120_000,
   ext_ui_diagnostics: 15_000,
+  list_ui_renderers: 15_000,
+  read_ui_renderer_asset: 10_000,
+  // 1-5 批次②：运行时重载扩展（session.reload() 重建 runner + 重新发现扩展文件）
+  reload_extensions: 60_000,
   set_mode: 30_000,
   set_model: 30_000,
   set_thinking: 30_000,

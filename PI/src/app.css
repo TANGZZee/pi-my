@@ -318,6 +318,17 @@
   .attach-chips { display: flex; flex-wrap: wrap; gap: 5px; padding: 10px 12px 0; }.attach-chip { display: inline-flex; align-items: center; gap: 5px; max-width: 220px; padding: 4px 6px 4px 8px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg); color: var(--text-2); font-size: 11px; }.attach-chip i { width: 6px; height: 6px; background: var(--text-3); }.attach-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.attach-chip button { width: 18px; height: 18px; border-radius: 4px; background: transparent; color: var(--muted); }.attach-chip button:hover { background: var(--active); color: var(--text-2); }.attach-error { padding: 8px 10px 0; }
   .imagegen-error { width: min(780px, 100%); margin: 0 auto 12px; padding: 10px 12px; border: 1px solid var(--border-3); border-radius: 6px; background: var(--surface-3); color: var(--text-2); font-size: 12px; }.image-result { width: min(580px, 100%); margin: 0 auto 18px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--raised); }.image-result img { display: block; width: 100%; max-height: 460px; object-fit: contain; background: var(--surface-3); }.image-result small { display: block; padding: 8px 2px 0; color: var(--muted); font-size: 11px; }
 
+  /* T2⑦ 上下文编辑：剔除按钮态与编辑清单面板 */
+  .recall.ctx-remove.ctx-remove { color: var(--text-3); }.recall.ctx-remove.ctx-remove:hover:not(:disabled) { color: var(--text); }.recall.ctx-remove:disabled { opacity: .45; }
+  .assistant-action.ctx-edited.ctx-edited { color: var(--muted); }
+  .ctx-edits-panel { width: min(780px, 100%); margin: 0 auto 14px; }
+  .ctx-edits-toggle { padding: 2px 6px; background: transparent; color: var(--muted); font-size: 11px; }
+  .ctx-edits-toggle:hover { color: var(--text-2); }
+  .ctx-edit-row { display: flex; align-items: baseline; gap: 8px; margin-top: 5px; padding: 5px 8px; border: 1px solid var(--border-2); border-radius: 5px; background: var(--surface-2); font-size: 11px; }
+  .ctx-edit-kind { flex: none; color: var(--text-3); font-weight: 600; }
+  .ctx-edit-row code { color: var(--muted); font-size: 10px; }
+  .ctx-edit-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+
   .workspace-rail { display: flex; flex-direction: column; align-items: center; gap: 5px; padding: 9px 6px; border-right: 1px solid var(--border); background: var(--chrome-2); }.workspace-rail button { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 5px; background: transparent; color: var(--text-3); }.workspace-rail button:hover, .workspace-rail button.active { background: var(--active); color: var(--text); }
   .resource-head { display: flex; align-items: center; justify-content: space-between; height: 42px; padding: 0 10px; border-bottom: 1px solid var(--border); color: var(--text); font-size: 12px; font-weight: 650; }.resource-head button { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 4px; background: transparent; color: var(--text-3); }.resource-head button:hover { background: var(--active); color: var(--text); }.resource-tree { min-height: 0; flex: 1; overflow: auto; padding: 7px; }.resource-tree button { display: flex; align-items: center; gap: 6px; width: 100%; min-height: 30px; padding: 0 6px; border-radius: 4px; background: transparent; color: var(--text-2); font-size: 12px; text-align: left; white-space: nowrap; }.resource-tree button:hover, .resource-tree button.file-selected { background: var(--active); color: var(--text); }.resource-tree button span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }.resource-chevron { flex: none; width: 10px; color: var(--muted); }.resource-icon { flex: none; width: 13px; color: var(--text-3); }.resource-empty { padding: 16px 6px; color: var(--muted); font-size: 12px; }.resource-preview-head { display: flex; align-items: center; gap: 6px; min-height: 38px; padding: 6px 9px; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); color: var(--text-3); }.doc-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }.resource-preview-head .doc-name { flex: 1; }.doc-stats { flex: none; color: var(--muted); font-size: 11px; }.resource-preview-head button { min-height: 26px; padding: 0 8px; border-radius: 4px; background: var(--hover-2); color: var(--text-2); font-size: 11px; }.resource-preview-head button:hover { background: var(--active); color: var(--text); }.resource-preview { min-height: 0; flex: 1; overflow: auto; padding: 9px; }.file-preview, .file-editor { width: 100%; margin: 0; border: 1px solid var(--border-2); border-radius: 5px; background: var(--surface); color: var(--text-2); font: 12px/1.6 ui-monospace, "Cascadia Mono", monospace; }.file-preview { padding: 10px; white-space: pre-wrap; }.file-editor { display: block; min-height: 220px; padding: 10px; outline: 0; resize: vertical; }
   .git-panel { display: flex; flex-direction: column; height: 100%; }.panel-content { min-height: 0; padding: 14px; }.git-panel .panel-content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }.panel-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; }.panel-title strong, .panel-title small { display: block; }.panel-title strong { color: var(--text-2); font-size: 12px; }.panel-title small { margin-top: 3px; color: var(--muted); font-size: 10px; }.primary-small { min-height: 28px; padding: 0 8px; border-radius: 3px; background: var(--accent); color: var(--accent-fg); font-size: 10px; }.primary-small:hover { background: var(--accent-hover); }.git-changes { min-height: 0; overflow: auto; }.change-item { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 42px; padding: 6px 4px; border-top: 1px solid var(--active); background: transparent; text-align: left; }.change-item:hover { background: var(--chrome-3); }.change-check { width: 14px; height: 14px; accent-color: var(--text-2); }.file-dot { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 3px; background: var(--active); color: var(--text-2); font: 11px ui-monospace, monospace; }.change-meta { min-width: 0; flex: 1; }.change-meta strong, .change-meta small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.change-meta strong { color: var(--text-2); font-size: 11px; }.change-meta small { margin-top: 2px; color: var(--muted); font-size: 10px; }.diff-content { margin: 10px 0 0; padding: 9px; overflow: auto; border: 1px solid var(--border); border-radius: 3px; background: var(--surface-2); color: var(--text-2); font: 10px/1.5 ui-monospace, monospace; white-space: pre-wrap; }.diff-placeholder, .empty-panel { display: grid; place-items: center; min-height: 180px; color: var(--muted); font-size: 11px; text-align: center; }.empty-panel { align-content: center; gap: 6px; }.empty-panel span { font-size: 24px; }.empty-panel strong { color: var(--text-2); font-size: 12px; }.empty-panel small { max-width: 180px; font-size: 10px; line-height: 1.5; }.git-actions { padding: 12px 14px; border-top: 1px solid var(--border); background: var(--surface-2); }.git-error { color: var(--text-2); font-size: 10px; line-height: 1.5; }.commit-input { width: 100%; height: 32px; padding: 0 8px; border: 1px solid var(--border-3); border-radius: 3px; outline: 0; background: var(--raised); color: var(--text-2); font-size: 11px; }.git-actions-row { display: flex; gap: 5px; margin-top: 8px; }.git-actions-row button { flex: 1; height: 30px; border-radius: 3px; background: var(--hover-2); color: var(--text-2); font-size: 10px; }.git-actions-row button:hover:not(:disabled) { background: var(--hover-2); }.git-actions-row button:disabled { color: var(--muted-2); }
@@ -470,6 +481,45 @@ html[data-theme="dark"] .desktop { background: var(--bg); }
 .ext-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
 .ext-dialog-actions button { padding: 6px 12px; border: 1px solid var(--border-2); border-radius: 5px; background: var(--surface-3); color: var(--text-2); font-size: 12px; }
 .ext-dialog-actions button.primary { border-color: transparent; background: var(--accent); color: var(--accent-fg); }
+
+/* ---- UI 插件四槽（1-5 完整版 · 批次①）----
+ * 注册表把插件消息按 slot 分发到四个宿主；容器样式集中在这里，
+ * 因为宿主组件收到的 class 是父组件传入的动态值，scoped style 匹配不到。 */
+.plugin-host { display: contents; }
+.plugin-host-item { min-width: 0; }
+.plugin-host-note { margin: 4px 0 0; color: var(--muted); font-size: 11px; }
+
+/* timeline 槽：沿用 .message 的居中窄栏排版。卡片外观（padding/border）由 PluginCard
+ * scoped style 提供；**间距统一由宿主层控制**（PluginCard scoped style 不写 margin ——
+ * 批次①对抗审查 D8：scoped margin 与这里的槽位 margin:0 特异性平局且后注入会失效）。 */
+.plugin-message { width: min(780px, 100%); margin: 0 auto 26px; }
+.plugin-message .plug-card { margin: 0; }
+.plugin-settings-list .plug-card { margin: 0; }
+
+/* status 槽：composer 上方的胶囊状态条，横向可换行，不抢模式菜单的定位上下文 */
+.plugin-status-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 6px; }
+.plugin-status-item { position: relative; min-width: 0; }
+.plugin-status-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 3px 9px; border: 1px solid var(--border-2); border-radius: 999px; background: var(--surface-2); color: var(--text-3); font-size: 11px; line-height: 1.5; cursor: pointer; }
+.plugin-status-chip:hover { border-color: var(--accent); color: var(--text); }
+.plugin-status-chip[data-tone="warn"] { border-color: var(--warning, #e0af68); color: var(--warning, #e0af68); }
+.plugin-status-chip[data-tone="danger"] { border-color: var(--danger, #f7768e); color: var(--danger, #f7768e); }
+.plugin-status-chip[data-tone="ok"] { border-color: var(--success, #16a34a); color: var(--success, #16a34a); }
+.plugin-status-dot { width: 6px; height: 6px; flex: none; border-radius: 50%; background: currentColor; }
+.plugin-status-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plugin-status-detail { position: absolute; left: 0; bottom: calc(100% + 6px); z-index: 40; width: min(360px, 86vw); }
+.plugin-status-detail .plug-card { margin: 0; box-shadow: 0 12px 32px rgb(0 0 0 / 30%); }
+
+/* float 槽：右下角非阻塞浮层。bottom 提到 toasts 之上；z-index 61 高于 .ext-toasts
+ * （60，批次①对抗审查 D9：此前 55 < 60，插件浮层会被扩展 toast 盖住）。 */
+.plugin-float-stack { position: fixed; right: 16px; bottom: 88px; z-index: 61; display: flex; flex-direction: column; gap: 8px; width: min(340px, 86vw); pointer-events: none; }
+.plugin-float-stack > * { pointer-events: auto; }
+.plugin-float-stack .plug-card { margin: 0; box-shadow: 0 12px 32px rgb(0 0 0 / 28%); }
+
+/* settings 槽：设置页「插件 UI」里的会话插件卡片与诊断表 */
+.plugin-settings-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.plugin-settings-list .plug-card { margin: 0; }
+.plugin-kind { margin-left: 6px; padding: 1px 6px; border: 1px solid var(--border-2); border-radius: 999px; color: var(--muted); font-size: 10px; }
+.plugin-diagnostics { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: 12px; }
 
 /* show_image 工具（1-3）：agent 主动发图到对话区 */
 .show-images { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }

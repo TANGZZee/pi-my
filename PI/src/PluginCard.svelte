@@ -11,7 +11,7 @@
     <strong>{message.title}</strong>
     <span class="plug-type">{message.customType}</span>
   </div>
-  {#if message.component === 'card' && message.fields.length}
+  {#if message.component === 'card' && (message.fields?.length ?? 0)}
     <div class="plug-fields">
       {#each message.fields as field (field.label)}
         <div class="plug-field">
@@ -28,7 +28,10 @@
 </div>
 
 <style>
-  .plug-card { margin: 10px 0; padding: 10px 12px; border: 1px solid var(--border-2); border-left: 3px solid var(--accent); border-radius: 8px; background: var(--surface-2); }
+  /* margin 一律由 app.css 宿主层控制（批次①对抗审查 D8）：
+     scoped 的 margin 与 app.css 的 .plugin-float-stack .plug-card{margin:0}
+     特异性平局且后注入，导致各槽位宿主层的 margin:0 永远不生效。 */
+  .plug-card { padding: 10px 12px; border: 1px solid var(--border-2); border-left: 3px solid var(--accent); border-radius: 8px; background: var(--surface-2); }
   .plug-card[data-tone='warn'] { border-left-color: #d97706; }
   .plug-card[data-tone='danger'] { border-left-color: #dc2626; }
   .plug-card[data-tone='ok'] { border-left-color: #16a34a; }

@@ -28,11 +28,13 @@
     models: ModelDraft[]
     builtin?: boolean
     disabled?: boolean
+    oauthRow?: OAuthInfo
     extra: Record<string, unknown>
   }
   type AuthRow = { name: string; type: string; key: string; extra: Record<string, unknown> }
   type FetchedModel = { id: string; name?: string; reasoning?: boolean; imageInput?: boolean; contextWindow?: number; maxTokens?: number }
   type TestState = { busy?: boolean; ok?: boolean; message?: string; value?: number }
+  type OAuthInfo = { id: string; configured: boolean; source: string; label: string; subscription: boolean; oauthName: string; loginLabel: string }
 
   export let open = false
   export let connected = false
@@ -53,7 +55,7 @@
     'google-generative-ai',
     'mistral-conversations'
   ]
-  const AUTH_PRESETS = ['anthropic', 'openai', 'google', 'deepseek', 'openrouter', 'groq', 'mistral', 'xai', 'together', 'moonshot', 'minimax', 'zai']
+  const AUTH_PRESETS = ['anthropic', 'openai', 'openai-codex', 'google', 'deepseek', 'openrouter', 'groq', 'mistral', 'xai', 'together', 'moonshot', 'minimax', 'zai']
   const HIDDEN_KEY = 'pdn.hidden-providers'
   const KNOWN_PROVIDER = new Set(['baseUrl', 'api', 'apiKey', 'headers', 'compat', 'models', 'balanceUrl', 'disabled'])
   const KNOWN_MODEL = new Set(['id', 'name', 'reasoning', 'contextWindow', 'maxTokens', 'thinkingLevelMap', 'input', 'cost', 'hidden'])
@@ -92,6 +94,8 @@
   let fillBusy: Record<string, boolean> = {}
   let fillError: Record<string, string> = {}
   let oauthHint = ''
+  let oauthInfo: Record<string, OAuthInfo> = {}
+  let oauthBusy = ''
 
   $: modelsDirty = JSON.stringify(providers) !== modelsSnap
   $: authDirty = JSON.stringify(authRows) !== authSnap
@@ -102,7 +106,11 @@
     ...providers,
     ...authRows
       .filter((row) => !providers.some((item) => item.name === row.name))
-      .map((row) => ({ ...emptyProvider(), name: row.name, builtin: true }))
+      .map((row) => ({ ...emptyProvider(), name: row.name, builtin: true })),
+    // OAuth 目录展示行：SDK 内置 OAuth 提供商，未配置 auth.json/models.json 时也可见可登录（纯展示，不进序列化）
+    ...Object.values(oauthInfo)
+      .filter((info) => info.oauthName && !providers.some((item) => item.name === info.id) && !authRows.some((row) => row.name === info.id))
+      .map((info) => ({ ...emptyProvider(), name: info.id, builtin: true, oauthRow: info }))
   ]
   $: managerFilter = managerQuery.trim().toLowerCase()
   $: visibleManagerProviders = managerFilter
@@ -280,6 +288,7 @@
     } catch {
       authRows = []
     }
+    await loadAuthStatus()
     try {
       const cards = await rpc('config_cards', {}) as Array<{ provider: string; models?: FetchedModel[] }>
       catalogByProvider = Object.fromEntries(cards.map((card) => [card.provider, card.models || []]))
@@ -608,15 +617,42 @@
   }
 
   async function loginOAuth(provider: string) {
+    oauthBusy = provider
     oauthHint = '正在打开登录…'
     try {
       const result = await rpc?.('oauth_login', { provider }) as { ok?: boolean; message?: string }
       oauthHint = result?.ok ? (result.message || '已登录') : `${result?.message || '登录失败'}`
-      if (result?.ok && !authRows.some((row) => row.name === provider)) {
-        authRows = [...authRows, { name: provider, type: 'oauth', key: '', extra: {} }]
-      }
+      // OAuth 凭据由 sidecar 写入 auth.json——不在这里插空行，直接刷新真实状态
+      if (result?.ok) await loadAuthStatus()
     } catch (error) {
       oauthHint = error instanceof Error ? error.message : '失败'
+    } finally {
+      oauthBusy = ''
+    }
+  }
+
+  async function logoutOAuth(provider: string) {
+    oauthBusy = provider
+    oauthHint = ''
+    try {
+      const result = await rpc?.('auth_logout', { provider }) as { ok?: boolean; message?: string }
+      oauthHint = result?.ok ? (result.message || '已登出') : `${result?.message || '登出失败'}`
+      if (result?.ok) await loadAuthStatus()
+    } catch (error) {
+      oauthHint = error instanceof Error ? error.message : '失败'
+    } finally {
+      oauthBusy = ''
+    }
+  }
+
+  async function loadAuthStatus() {
+    try {
+      const result = await rpc?.('auth_status', {}) as { providers?: OAuthInfo[] } | undefined
+      const bag: Record<string, OAuthInfo> = {}
+      for (const info of result?.providers || []) bag[info.id] = info
+      oauthInfo = bag
+    } catch {
+      oauthInfo = {}
     }
   }
 
@@ -682,7 +718,7 @@
               <div class="provider-row" class:selected={selectedManagerItem?.name === item.name}>
                 <button class="provider-row-main" on:click={() => { selectedProvider = item.name; detailTab = 'connection' }}>
                   <span class="provider-avatar">{item.name.slice(0, 1).toUpperCase()}</span>
-                  <span class="provider-copy"><strong>{item.name}</strong><small>{visibleModelCount(item)} 可见 · {item.models.length} 已配置</small></span>
+                  <span class="provider-copy"><strong>{item.name}</strong>{#if item.oauthRow}<small>OAuth 登录{item.oauthRow.configured ? ' · 已配置' : ''}</small>{:else}<small>{visibleModelCount(item)} 可见 · {item.models.length} 已配置</small>{/if}</span>
                 </button>
                 <button class="switch" type="button" role="switch" aria-checked={providerEnabled(item)} title={providerEnabled(item) ? '关闭 Provider' : '启用 Provider'} on:click={(event) => { event.stopPropagation(); toggleProviderVisible(item) }}>
                   <span></span>
@@ -699,12 +735,12 @@
             {@const item = selectedManagerItem}
             <header class="detail-head">
               <div>
-                <div class="detail-title"><h3>{item.name}</h3>{#if item.builtin}<span class="badge">SDK 内置</span>{/if}<span class="badge" class:ok={providerEnabled(item)}>{providerEnabled(item) ? '已启用' : '已关闭'}</span></div>
+                <div class="detail-title"><h3>{item.name}</h3>{#if item.builtin}<span class="badge">SDK 内置</span>{/if}{#if item.oauthRow?.subscription || oauthInfo[item.name]?.subscription}<span class="badge">订阅</span>{/if}<span class="badge" class:ok={providerEnabled(item)}>{providerEnabled(item) ? '已启用' : '已关闭'}</span></div>
                 <p>{item.baseUrl || '保留 SDK 官方连接设置'}</p>
               </div>
               <div class="detail-actions">
                 {#if !item.builtin}<button class="ghost" on:click={() => duplicateProvider(item.name)}>复制</button>{/if}
-                <button class="ghost danger" on:click={() => deleteProvider(item.name)}>删除</button>
+                {#if !item.oauthRow}<button class="ghost danger" on:click={() => deleteProvider(item.name)}>删除</button>{/if}
               </div>
             </header>
 
@@ -727,7 +763,18 @@
                     <label><input type="checkbox" checked={item.supportsReasoningEffort} on:change={(event) => patchProvider(item.name, { supportsReasoningEffort: (event.currentTarget as HTMLInputElement).checked })} /><span>关闭 reasoning_effort</span></label>
                   </div>
                 {/if}
-                <label class="field full"><span>{authRowFor(item.name)?.type === 'oauth' ? 'OAuth 凭据' : 'API Key'}</span><div class="secret"><input type={revealKey[item.name] ? 'text' : 'password'} value={apiKeyFor(item.name)} on:input={(event) => patchApiKey(item.name, (event.currentTarget as HTMLInputElement).value)} placeholder="sk-…" /><button class="ghost" on:click={() => (revealKey = { ...revealKey, [item.name]: !revealKey[item.name] })}>{revealKey[item.name] ? '隐藏' : '显示'}</button><button class="ghost" on:click={() => void copyText(apiKeyFor(item.name))}>复制</button></div></label>
+                {#if authRowFor(item.name)?.type === 'oauth' || item.oauthRow?.configured || oauthInfo[item.name]?.configured}
+                  <div class="field full"><span>OAuth 登录</span>
+                    <div class="secret">
+                      <span class="oauth-state">{oauthInfo[item.name]?.label || (authRowFor(item.name)?.type === 'oauth' ? '已通过 OAuth 登录' : '尚未登录')}</span>
+                      {#if oauthInfo[item.name]?.configured}<button class="ghost danger" disabled={oauthBusy === item.name} on:click={() => void logoutOAuth(item.name)}>{oauthBusy === item.name ? '登出中…' : '登出'}</button>{/if}
+                      <button class="save" disabled={oauthBusy === item.name} on:click={() => void loginOAuth(item.name)}>{oauthInfo[item.name]?.configured ? '重新登录' : (item.oauthRow?.loginLabel || oauthInfo[item.name]?.loginLabel || 'OAuth 登录')}</button>
+                    </div>
+                    {#if oauthHint}<p class="hint">{oauthHint}</p>{/if}
+                  </div>
+                {:else}
+                  <label class="field full"><span>API Key</span><div class="secret"><input type={revealKey[item.name] ? 'text' : 'password'} value={apiKeyFor(item.name)} on:input={(event) => patchApiKey(item.name, (event.currentTarget as HTMLInputElement).value)} placeholder="sk-…" /><button class="ghost" on:click={() => (revealKey = { ...revealKey, [item.name]: !revealKey[item.name] })}>{revealKey[item.name] ? '隐藏' : '显示'}</button><button class="ghost" on:click={() => void copyText(apiKeyFor(item.name))}>复制</button></div></label>
+                {/if}
                 {#if item.baseUrl}<label class="field full"><span>测试模型</span><div class="secret"><input value={testModel[item.name] ?? item.models.find((model) => modelVisible(model))?.id ?? ''} on:input={(event) => (testModel = { ...testModel, [item.name]: (event.currentTarget as HTMLInputElement).value })} placeholder="模型 ID" /><button class="save" disabled={tests[item.name]?.busy} on:click={() => void testCard(item)}>{tests[item.name]?.busy ? '测试中' : '测试连接'}</button><button class="ghost" disabled={probes[item.name]?.busy} on:click={() => void probeCard(item.name)}>{probes[item.name]?.busy ? '查询中' : '用量'}</button></div></label>{/if}
                 {#if tests[item.name]?.message}<p class="hint full" class:warn={tests[item.name]?.ok === false}>{tests[item.name].message}</p>{/if}
                 {#if probes[item.name]?.message}<p class="hint full">{probes[item.name].message}</p>{/if}
@@ -842,6 +889,7 @@
   .field { display: grid; grid-template-columns: 92px minmax(0, 1fr); align-items: center; gap: 10px; color: var(--text-3); font-size: 12px; }
   .field input, .field select, .toolbar input, .toolbar select { min-width: 0; width: 100%; height: 32px; padding: 0 8px; border: 1px solid var(--border); border-radius: 5px; background: var(--raised); color: var(--text); font-size: 12px; }
   .secret { display: flex; gap: 6px; min-width: 0; }
+  .oauth-state { flex: 1; display: inline-flex; align-items: center; color: var(--text); font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .secret input { flex: 1; }
   .checks { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .checks label { display: flex; align-items: center; gap: 8px; min-height: 32px; padding: 0 9px; border: 1px solid var(--border-2); border-radius: 6px; color: var(--text-2); font-size: 12px; }

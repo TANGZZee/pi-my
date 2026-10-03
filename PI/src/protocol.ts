@@ -140,6 +140,47 @@ export interface ExtEditorTextEnvelope {
   source?: string
 }
 
+/** 1-5 批次②：扩展运行错误（bindExtensions 的 onError 通道）。
+ *  语义：扩展内部抛错/注册失败等非致命事件；不等于会话失败。 */
+export interface ExtErrorEnvelope {
+  type: 'ext_error'
+  /** 出错的扩展文件路径（SDK runner emitError 原样透传） */
+  extensionPath?: string
+  /** 出错时扩展正在处理的事件名（如 session_start / register_provider） */
+  event?: string
+  /** 错误消息（Error.message 或 String(err)） */
+  error?: string
+}
+
+/** 1-5 批次②：扩展通过 ctx.setStatus 推送的状态行（status 槽渲染） */
+export interface PluginStatusEnvelope {
+  type: 'plugin_status'
+  sessionId?: string
+  /** 状态键（同一 key 覆盖旧值；text 为空 = 清除该键） */
+  key: string
+  text?: string
+  /** 发起调用的扩展名（stack 启发式，可能为空串） */
+  source?: string
+}
+
+/** 1-5 批次②：扩展通过 ctx.setTitle 推送的标题（标题栏/会话标签展示） */
+export interface PluginTitleEnvelope {
+  type: 'plugin_title'
+  sessionId?: string
+  title: string
+  source?: string
+}
+
+/** 1-5 批次③：扩展 pi-ui.json 声明的 iframe 渲染器（sidecar list_ui_renderers 应答） */
+export interface UiRendererDeclaration {
+  customType: string
+  slot: 'timeline' | 'float' | 'settings' | 'status'
+  kind: 'iframe'
+  target: string
+  title?: string
+  source: string
+}
+
 /** 事件转发信封 */
 export interface AgentEventEnvelope {
   type: 'event'
@@ -162,6 +203,9 @@ export type AgentEnvelope =
   | ExtDialogRequestEnvelope
   | ExtNotifyEnvelope
   | ExtEditorTextEnvelope
+  | ExtErrorEnvelope
+  | PluginStatusEnvelope
+  | PluginTitleEnvelope
   | DialogExpiredEnvelope
   | CompactionEventEnvelope
 

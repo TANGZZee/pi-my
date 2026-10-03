@@ -90,18 +90,43 @@ test('规范化：字段数量钳制（防一条消息撑爆 UI）', () => {
   assert.ok(long.fields[0].label.length <= 64)
 })
 
-test('HTML 清洗：危险标签整体拒绝，白名单标签剥全部属性', () => {
+test('HTML 清洗：危险标签整体拒绝，白名单标签只在「裸标签」形态下还原', () => {
   assert.equal(sanitizeHtml('<script>alert(1)</script>'), '<p>[已移除：包含不允许的标签]</p>')
   assert.equal(sanitizeHtml('<iframe src="https://x"></iframe>'), '<p>[已移除：包含不允许的标签]</p>')
   assert.equal(sanitizeHtml('<a href="javascript:alert(1)">x</a>'), '<p>[已移除：包含不允许的标签]</p>', 'a 标签（可导航）也在拒绝名单')
-  // 白名单标签剥全部属性（任何属性都可能是载荷：onclick/title/class/id）
+  // 白名单标签**带任何属性**时保持转义态（纯文本），不得保留可执行形态。
+  // 批次①对抗审查 S1 的教训：旧"白名单正则剥属性"策略被斜杠分隔标签整体绕过。
   const stripped = sanitizeHtml('<b onclick="alert(1)">bold</b>')
-  assert.equal(stripped, '<b>bold</b>', '白名单标签剥事件属性后保留')
+  assert.equal(stripped.includes('<b onclick'), false, '带属性的标签不得以可执行形态保留')
+  assert.ok(stripped.includes('&lt;b'), '带属性的标签转义为文本')
+  assert.ok(stripped.endsWith('bold</b>'), '闭标签（无属性）仍还原，内容排版不塌')
   const titled = sanitizeHtml('<p title="javascript:void(0)" class="x" id="y">t</p>')
-  assert.equal(titled, '<p>t</p>', 'title/class/id 等属性同样剥除')
+  assert.equal(titled.includes('<p title'), false, 'title/class/id 等属性同样不得保留')
+  assert.ok(titled.includes('&lt;p'))
   const img = sanitizeHtml('<img src=x onerror=alert(1)>')
-  assert.equal(img.includes('<img'), false, 'img 标签不得以可执行形式保留（应被转义）')
-  assert.ok(img.startsWith('&lt;'), '非白名单标签转义为文本')
+  assert.equal(img.includes('<img'), false, 'img 标签不得以可执行形式保留（img 在拒绝名单 → 整体替换）')
+  assert.ok(img.startsWith('<p>'), 'img 走整体拒绝路径')
+  const address = sanitizeHtml('<address>x</address>')
+  assert.ok(address.startsWith('&lt;'), '非白名单且不在拒绝名单的标签转义为文本')
+})
+
+test('HTML 清洗：真实浏览器解析向量（批次①对抗审查 S1 的三类绕过必须全部拦截）', () => {
+  // 斜杠分隔属性（旧正则要求属性前有空白 → 整条不匹配 → 原样透传执行）
+  for (const attack of [
+    '<svg/onload=alert(document.cookie)>',
+    '<img/src=x onerror=alert(1)>',
+    '<details/open ontoggle=alert(1)>',
+    '<!--><svg/onload=alert(1)>-->', // 注释闭合混淆
+    '<img alt="<"src=x onerror=alert(1)>', // 属性值内嵌 <
+    '<svg><script>alert(1)</script>',
+  ]) {
+    const out = sanitizeHtml(attack)
+    assert.equal(
+      /<\s*(svg|img|details|script|iframe|math)/i.test(out),
+      false,
+      `攻击向量不得以可执行形态存活：${attack} => ${out}`
+    )
+  }
 })
 
 test('有状态正则回归：sanitizeHtml 连续调用结果一致（g 标志 lastIndex 陷阱）', () => {
