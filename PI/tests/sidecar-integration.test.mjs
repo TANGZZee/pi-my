@@ -50,7 +50,10 @@ function startSidecar(entry = 'sidecar/index.mjs') {
   let sequence = 0
   // 超时参数化（审查 P1）：本地 init 实测 24.7s，CI windows runner 慢 2-3 倍；
   // 30s 硬编码在 CI 上会误报超时。
-  const requestTimeoutMs = process.env.CI ? 120_000 : 30_000
+  // 2026-10-01 再修：本地机器高负载（16 逻辑核 68% 占用）下 init 实测 17s、
+  // create_session（建 runtime + 绑定扩展 UI）叠加排队后 >30s —— 首个测试反复
+  // 以「create_session 超时」假失败。本地超时提高到 60s；CI 维持 120s。
+  const requestTimeoutMs = process.env.CI ? 120_000 : 60_000
   const req = (type, payload) => new Promise((resolve, reject) => {
     const id = ++sequence
     const timer = setTimeout(() => {

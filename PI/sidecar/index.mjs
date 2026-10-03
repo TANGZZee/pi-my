@@ -21,6 +21,10 @@ import * as lan from './lan.mjs'
 import { releaseAllConfirms, releaseSessionConfirm, forgetConfirm, lastConfirmOfSession } from './session-confirms.mjs'
 import { teardownSession, cancelSessionInteractions } from './session-teardown.mjs'
 import * as petServer from './pet-server.mjs'
+// T3-1: codemode + tool_search 扩展接线（能力探测，旧版 SDK 优雅降级）
+import { codemodeExtensionFactories } from './extensions-wiring.mjs'
+// T3-2: 虚拟模型（有序故障转移链）：纯路由 + 配置持久化（agentDir 下 JSON，atomicWriteJson 防 Windows 并发写损坏）
+import { VIRTUAL_PREFIX, normalizeVirtualModelConfig, resolveVirtualChain, routeChain } from './virtual-models.mjs'
 
 const sessions = new Map()
 let runtime
@@ -69,6 +73,21 @@ const loadedSdk = await loadPiSdk()
 let { createAgentSession, DefaultPackageManager, ModelRuntime, SessionManager, SettingsManager, DefaultResourceLoader } = loadedSdk.module
 let sdkVersion = String(loadedSdk.module.VERSION || loadedSdk.selectedVersion || 'unknown')
 let sdkSource = loadedSdk.source
+
+// ── T2⑥ MCP 原生化：SDK 能力面探测 ─────────────────────────────────────
+// createMcpExtension 在 SDK 0.99.x 顶层导出（dist/index.d.ts:32）；config 工具函数
+// （loadMcpConfig / updateMcpServerConfig 等）只存在于 dist/extensions/mcp/config.js
+// 子路径，不在顶层导出面 —— 深导入并用能力探测降级（用户可更换 pi-sdk 版本，
+// 旧版 SDK 没有这些导出时必须退回手写读取，而不是崩溃）。
+// 注意：路径相对于 SDK 入口 dist/，与 loadPiSdk 的动态入口对齐（支持用户自选 SDK）。
+const sdkDistDir = path.dirname(loadedSdk.entry)
+const mcpExtension = typeof loadedSdk.module.createMcpExtension === 'function' ? loadedSdk.module.createMcpExtension : null
+let mcpConfigApi = null
+try {
+  mcpConfigApi = await import(pathToFileURL(path.join(sdkDistDir, 'extensions', 'mcp', 'config.js')).href)
+} catch {
+  // 旧版 SDK：无该子路径 → mcpConfigApi 保持 null，mcp_list 走手写读取分支
+}
 
 // ask 模式确认桥：扩展 await → UI 回答
 // 工具集常量统一来自 ./policy.ts（BASE_TOOLS = 核心集 ∪ 只读集）
@@ -274,6 +293,67 @@ async function trustProject(cwd, trusted) {
   return { key, trusted: Boolean(trusted) }
 }
 
+// ── 1-5 批次③：扩展声明式 iframe 渲染器（manifest：pi-ui.json） ──────────
+// 信任模型（用户拍板）：扩展 UI 代码跑在 sandbox iframe（无同源特权），
+// sidecar 只负责「把声明交给前端」，从不注入 token/会话数据。
+// manifest 形状：{ renderers: [{ id?, customType, slot, kind:'iframe', target }] }
+//   - customType 必须且只能声明一个（前端注册表按 customType 匹配）
+//   - slot 仅允许 timeline/float/settings/status（保留槽之外直接拒）
+//   - target 走前端注册表同款白名单（sandbox: 标识或 https:// URL）
+const UI_MANIFEST_NAME = 'pi-ui.json'
+const UI_MANIFEST_SLOTS = new Set(['timeline', 'float', 'settings', 'status'])
+const UI_MANIFEST_MAX = 16
+
+function normalizeUiManifest(raw) {
+  if (!raw || typeof raw !== 'object') return []
+  const list = Array.isArray(raw.renderers) ? raw.renderers : []
+  const out = []
+  for (const item of list.slice(0, UI_MANIFEST_MAX)) {
+    if (!item || typeof item !== 'object') continue
+    // 与前端 Settings.syncRendererRegistrations 同款归一化（trim+lower）：
+    // 前端注册时会把 customType lower —— 声明若保留 'My.Chart'，消息经
+    // normalizePluginMessage 是 'my.chart'，注册表 findByCustomType 大小写敏感
+    // 不命中 → 渲染器静默回落内置 card（审查 BUG-3，fail-closed 但功能失效）。
+    const customType = typeof item.customType === 'string' ? item.customType.trim().toLowerCase() : ''
+    const slot = typeof item.slot === 'string' ? item.slot.trim() : ''
+    const kind = typeof item.kind === 'string' ? item.kind.trim() : ''
+    const target = typeof item.target === 'string' ? item.target.trim() : ''
+    const title = typeof item.title === 'string' ? item.title.trim().slice(0, 120) : ''
+    // customType 保留前缀（ui.*）由前端注册表二次拒绝 —— 这里也不放行明显的
+    if (!customType || customType.toLowerCase().startsWith('ui.')) continue
+    if (!UI_MANIFEST_SLOTS.has(slot)) continue
+    if (kind !== 'iframe') continue
+    // 与前端 ui-registry 同款白名单（双保险：sidecar 拒一次，前端注册时再拒一次）
+    const sandboxId = target.startsWith('sandbox:') ? target.slice(8) : ''
+    const isSandboxPage = sandboxId !== '' && /^[a-z0-9._-]+$/.test(sandboxId)
+    const isHttps = /^https:\/\/[a-z0-9.-]+(:\d+)?(\/|$)/.test(target)
+    if (!isSandboxPage && !isHttps) continue
+    out.push({ customType, slot, kind, target, title })
+  }
+  return out
+}
+
+/** 收集已加载扩展目录里的 pi-ui.json 渲染器声明。 */
+async function collectUiRendererManifests(extensionPaths) {
+  const renderers = []
+  for (const extPath of extensionPaths) {
+    if (typeof extPath !== 'string' || !extPath) continue
+    // 扩展 path 可能是目录或入口文件 —— 两种都归到目录找 pi-ui.json
+    const dir = path.extname(extPath) ? path.dirname(extPath) : extPath
+    const manifestPath = path.join(dir, UI_MANIFEST_NAME)
+    try {
+      const raw = JSON.parse(await readFile(manifestPath, 'utf8'))
+      for (const entry of normalizeUiManifest(raw)) {
+        renderers.push({ ...entry, source: dir })
+      }
+    } catch {
+      // 无 manifest / 坏 JSON：静默跳过（不是错误 —— 大多数扩展没有 UI 声明）
+    }
+  }
+  return renderers
+}
+
+
 // 扩展 UI 请求的记录（未实现的方法会走这里，使"插件静默失效"可诊断）
 const unsupportedUiCalls = new Map()
 function logUnsupportedUi(message, detail) {
@@ -369,6 +449,21 @@ function sessionHistory(session) {
   const history = []
   let userIndex = -1
   for (const entry of session.sessionManager.buildContextEntries()) {
+    // 1-5 批次②：插件消息（custom_message 条目）也要进历史 —— 之前被丢弃，
+    // 重开会话后时间线里所有插件卡片凭空消失（历史重放缺陷）。
+    // 时间线渲染由前端 ui-plugins 的 normalizePluginMessage 把关，这里只透传。
+    if (entry.type === 'custom_message') {
+      const display = entry.display && typeof entry.display === 'object' ? entry.display : {}
+      history.push({
+        id: entry.id,
+        role: 'plugin',
+        customType: typeof entry.customType === 'string' ? entry.customType : '',
+        text: typeof entry.content === 'string' ? entry.content : '',
+        timestamp: Date.parse(entry.timestamp) || (typeof entry.timestamp === 'number' ? entry.timestamp : Date.now()),
+        display,
+      })
+      continue
+    }
     if (entry.type !== 'message') continue
     const message = entry.message
     if (!message || (message.role !== 'user' && message.role !== 'assistant')) continue
@@ -385,9 +480,102 @@ function sessionHistory(session) {
   return history
 }
 
+/** T2⑦：汇总当前叶路径上生效的 context_edit 条目（后写覆盖先写，与 SDK buildSessionProjection 同序遍历）。
+ *  供 list_context 返回 edits 清单，UI 据此展示「该条目已被编辑/剔除」。 */
+function collectContextEdits(sessionManager) {
+  const edits = []
+  for (const item of sessionManager.buildContextEntries()) {
+    if (item.type !== 'context_edit') continue
+    const replacement = item.replacement ?? null
+    const content = replacement && typeof replacement === 'object' ? replacement.content : undefined
+    edits.push({
+      entryId: item.id,
+      targetId: typeof item.targetId === 'string' ? item.targetId : '',
+      removed: replacement === null,
+      text: typeof content === 'string' ? content : '',
+      timestamp: Date.parse(item.timestamp) || (typeof item.timestamp === 'number' ? item.timestamp : Date.now()),
+    })
+  }
+  return edits
+}
+
+// ── T3-2 虚拟模型（有序故障转移链）────────────────────────────────────────
+// 产品语义：用户把若干已配置模型排成一条链；user 请求走链首，retry（模型失败/
+// 压缩后 overflow）自动滑到下一个，continuation 保持；已到链尾则停在链尾。
+// 路由决策在 ./virtual-models.mjs（纯函数，可单测）；这里负责与 SDK 的接线：
+// 注册（registerVirtualModel 后目录立即合并虚拟模型，活更新同一 runtime 实例）。
+const virtualModelsFile = path.join(agentDir, 'pi-my-virtual-models.json')
+let virtualModelsConfig = { enabled: false, chain: [] }
+// 启动即装载（此行在 loadVirtualModelsConfig 函数声明之后，函数声明有提升，
+// 且 virtualModelsFile 已初始化——放顶部会踩 const TDZ）。
+virtualModelsConfig = loadVirtualModelsConfig()
+
+/** 读配置文件（缺文件/坏 JSON → 默认关闭，不抛错——坏配置不应阻止启动）。 */
+function loadVirtualModelsConfig() {
+  try {
+    const raw = JSON.parse(readFileSync(virtualModelsFile, 'utf8'))
+    const parsed = normalizeVirtualModelConfig(raw)
+    if (parsed.ok) return parsed.config
+  } catch {
+    // 首次使用无文件 / 用户手改坏 JSON：回落默认（禁用、空链）
+  }
+  return { enabled: false, chain: [] }
+}
+
+/**
+ * 把当前配置注册进 runtime（幂等）：先注销旧虚拟模型再注册新链。
+ * 挂靠 provider = 链首模型 provider —— 继承其凭据可用性（避免 keyless provider
+ * 被判不可用）；id 加 VIRTUAL_PREFIX 防撞物理 id（registerVirtualModel 撞 id 抛错）。
+ * 链项已在 set RPC 时经 resolveVirtualChain 目录校验，这里只做防御性过滤。
+ */
+async function applyVirtualModels(rt, config) {
+  const chain = Array.isArray(config?.chain) ? config.chain : []
+  if (rt && typeof rt.unregisterVirtualModel === 'function' && Array.isArray(rt.__piMyVirtualIds)) {
+    for (const { provider: p, id: mid } of rt.__piMyVirtualIds) {
+      try { rt.unregisterVirtualModel(p, mid) } catch (error) { log('注销旧虚拟模型失败', error) }
+    }
+    rt.__piMyVirtualIds = []
+  }
+  if (!config?.enabled || !chain.length || !rt || typeof rt.registerVirtualModel !== 'function') return
+  const registered = []
+  for (const entry of chain) {
+    // 目录防御性校验（set RPC 已校验过；配置文件手改/目录刷新后模型消失时跳过该项）
+    const physical = rt.getPhysicalModel?.(entry.provider, entry.modelId)
+    if (!physical) {
+      log(`虚拟模型链项跳过（目录未命中）: ${entry.provider}/${entry.modelId}`)
+      continue
+    }
+    try {
+      rt.registerVirtualModel({
+        provider: entry.provider,
+        id: `${VIRTUAL_PREFIX}${entry.modelId}`,
+        name: `故障转移 ${entry.modelId}`,
+        thinkingLevels: typeof entry.thinkingLevel === 'string' && entry.thinkingLevel ? [entry.thinkingLevel] : undefined,
+        contextWindow: physical.contextWindow,
+        maxTokens: physical.maxTokens,
+        route: (request) => {
+          const decision = routeChain(virtualModelsConfig, request)
+          // 决策给的是链上物理引用；SDK resolveModel 会按 provider/id 解析物理模型
+          // 并钳制 thinkingLevel。state 经 VirtualModelStateData 随分支持久化。
+          return decision
+        },
+      })
+      registered.push({ provider: entry.provider, id: `${VIRTUAL_PREFIX}${entry.modelId}` })
+    } catch (error) {
+      log(`注册虚拟模型失败 ${entry.provider}/${VIRTUAL_PREFIX}${entry.modelId}`, error)
+    }
+  }
+  rt.__piMyVirtualIds = registered
+}
+
 async function ensureRuntime(refresh = false) {
   if (refresh) runtime = undefined
-  if (!runtime) runtime = await ModelRuntime.create({ agentDir, refreshOnCreate: refresh })
+  if (!runtime) {
+    runtime = await ModelRuntime.create({ agentDir, refreshOnCreate: refresh })
+    // T3-2：目录就绪后立即挂虚拟模型（注册即活更新目录；能力探测——旧版 SDK 无
+    // registerVirtualModel 时静默跳过，get/set RPC 仍可读写配置）。
+    await applyVirtualModels(runtime, virtualModelsConfig)
+  }
   return runtime
 }
 
@@ -405,8 +593,57 @@ function uiContext(sessionId = '') {
     },
     notify: notifyFromExtension,
     setEditorText: (text, source) => send({ type: 'ext_editor_text', text, source }),
+    // 1-5 批次②：状态行/标题桥接 —— ui-context.ts 已有 setStatus/setTitle，
+    // 之前缺的只是 deps 回调。转发给前端的 status 槽（plugin_status）与标题栏（plugin_title）。
+    // 注意命名：外层 `key` = 会话 id（dialogs 归因用）；onStatus 的第一参 `statusKey`
+    // = 扩展声明的状态键（同一 key 覆盖旧值），二者语义不同，不能混用。
+    onStatus: (statusKey, text) => send({ type: 'plugin_status', sessionId: key, key: statusKey, text }),
+    onTitle: (title) => send({ type: 'plugin_title', sessionId: key, title }),
     log: logUnsupportedUi,
   })
+}
+
+/** 统一的扩展 UI 绑定（1-5 批次②核心）：每个会话创建后**恰好调用一次**。
+ *
+ * 为什么不用 createAgentSession 的 uiContext 选项：实测 SDK 0.85.x 会**静默忽略**
+ * 该选项（dist/core/agent-session.js 不读它），唯一生效的官方通道是
+ * rpc-mode 模板用的 `await session.bindExtensions({ uiContext, mode })`。
+ *
+ * 为什么不能调两次：bindExtensions 每次都会发射 session_start（实测 1×bind →
+ * sessionStarts=1，2×bind → 2），扩展的 session_start 处理器会被重复执行；
+ * reload() 内部会自动重新应用绑定（_buildRuntime），**绝不能在 reload 后再补绑**。
+ *
+ * mode:'print' 与官方 rpc-mode 模板一致——只影响 TUI 渲染分支，桌面端无感。
+ */
+async function bindUiContext(session, sessionId) {
+  await session.bindExtensions({
+    uiContext: uiContext(sessionId),
+    mode: 'print',
+    // 1-5 批次②：扩展错误对用户不可见是既有缺陷 —— sidecar 从不订阅 runner 错误，
+    // 扩展崩了用户毫无感知。这里借 bindExtensions 的官方 onError 通道把错误
+    // 推给前端（ext_error）。错误对象形状（SDK runner.js emitError）：
+    // { extensionPath, event, error, stack? }。
+    // reload 后 _applyExtensionBindings 会用存储的监听器自动重挂，无需补绑。
+    onError: (err) => send({
+      type: 'ext_error',
+      extensionPath: typeof err?.extensionPath === 'string' ? err.extensionPath : '',
+      event: typeof err?.event === 'string' ? err.event : '',
+      error: typeof err?.error === 'string' ? err.error : String(err?.error ?? ''),
+    }),
+  })
+  // 1-5 批次②：阻止插件消息污染 LLM 上下文。
+  // SDK 默认的 convertToLlm（dist/core/messages.js:89）把 role:'custom' 一律转成
+  // user 消息塞进 prompt —— 插件卡片（UI 展示数据）会被模型当成用户发言。
+  // 这里重写会话级转换器：customType 以 'ui.' 开头的插件消息直接跳过，
+  // 其余消息回落 SDK 默认实现。session.agent 跨 reload() 存活，重写一次即可。
+  const agent = session.agent
+  if (agent && typeof agent.convertToLlm !== 'function') return
+  const defaultConvertToLlm = agent.convertToLlm.bind(agent)
+  agent.convertToLlm = (messages) => defaultConvertToLlm(
+    (Array.isArray(messages) ? messages : []).filter(
+      (m) => !(m?.role === 'custom' && typeof m?.customType === 'string' && m.customType.startsWith('ui.')),
+    ),
+  )
 }
 
 /** 统一构造扩展工厂列表（三处会话创建都用它，避免参数漂移）。 */
@@ -430,6 +667,17 @@ function sessionExtensions(entry, sessionId, cwd) {
       warn: (...args) => log(...args),
     }),
     createRetryExtension(),
+    // T2⑥ MCP 原生化：SDK 内置 MCP 扩展连接 mcp.json 里的服务器，把工具注册为
+    // `mcp__<server>__<tool>`。默认读 agent 目录 mcp.json + 受信项目 .pi/mcp.json，
+    // 默认 stdio + streamable HTTP 传输 —— 与 sidecar 手写 mcp_list 同源同路径。
+    // 每次会话创建都现取工厂（extensionRunner 在 reload() 后是新对象，见 :2011 纪律；
+    // 工厂本身无状态，跨 reload 重挂安全）。
+    ...(mcpExtension ? [mcpExtension()] : []),
+    // T3-1：codemode（模型可写 JS 脚本批量编排其他工具，嵌套调用走 ctx.executeTool
+    // → 审批/权限链与直调一致）+ tool_search（deferred 工具的按需检索）。
+    // 注册时 inactive（defaultActive:false），点亮由初始激活/ set_mode 的全量基准完成。
+    // 旧版 SDK 无导出 → 空数组，优雅降级。
+    ...codemodeExtensionFactories({ module: loadedSdk.module }),
   ]
 }
 
@@ -443,27 +691,26 @@ async function createSession(id, cwd = workspace, thinking, mode = DEFAULT_MODE)
     extensionFactories: sessionExtensions(entry, id, cwd),
   })
   await loader.reload({ resolveProjectTrust })
-  // 关键（P0-2 真正修好的地方）：创建时注册**并集**（核心集 ∪ 只读集），
-  // 不按初始模式裁剪注册表。
-  //
-  // 实测：SDK 的注册表在 createAgentSession 时就被 `tools` 参数永久裁剪，
-  // getAllTools() 之后只反映裁剪结果。若按初始模式分别传（plan 传 PLAN_TOOLS），
-  // 那么在 plan 中创建的会话切到 ask/full 时基准里根本没有 bash —— 用户永远
-  // 拿不回来；反之在 ask 中创建则切到 plan 时没有 grep/find/ls。传并集即可双向恢复。
-  // plan 的只读约束由创建后的 setActiveToolsByName 施加，以及每次 set_mode 重算。
+  // 关键（P0-2 + T3-1）：创建时**不传 `tools`** —— SDK 的 allowedToolNames 会把注册表
+  // **永久裁剪**到传入集合（agent-session.js :2746-2828 实证），旧实现传 BASE_TOOLS 时
+  // mcp__*、codemode、tool_search 根本进不了注册表。不裁剪后：
+  // - 内置 8 工具全注册（相对旧集的 direct 增量只有 powershell，CONFIRM_TOOLS 已覆盖其 ask 确认）；
+  // - codemode/tool_search 以 model-only 曝光入表（defaultActive:false，不自动激活）；
+  // - MCP 服务器工具（mcp__*）随扩展注册进表；
+  // - customTools 不受影响（裁剪只作用于 allowedToolNames 集合，show_image 不在其中也不被裁）。
+  // 模式约束仍由创建后的 setActiveToolsByName + 每次 set_mode 重算施加：
+  // plan 白名单（PLAN∪CUSTOM）天然排除新工具；ask/full 全量点亮（危险工具由确认桥逐次拦截）。
   const { session } = await createAgentSession({
     cwd,
     agentDir,
     modelRuntime,
     sessionManager: SessionManager.create(cwd, path.join(agentDir, 'sessions')),
     resourceLoader: loader,
-    uiContext: uiContext(id),
-    tools: BASE_TOOLS,
     customTools: [makeShowImageTool()],
   })
-  // 初始模式立即生效（plan 收紧为只读子集）
-  session.setActiveToolsByName(toolsForModeSwitch(entryMode, BASE_TOOLS))
-  if (thinking) session.setThinkingLevel(thinking)
+  // 1-5 批次②：bindExtensions 是 uiContext 唯一生效通道（createAgentSession
+  // 会静默忽略 uiContext 选项），且每会话只能绑定一次（详见 bindUiContext 注释）。
+  await bindUiContext(session, id)
   const unsubscribe = session.subscribe((event) => {
     const summarized = summarizeEvent(event)
     lan.note(id, summarized)
@@ -471,6 +718,11 @@ async function createSession(id, cwd = workspace, thinking, mode = DEFAULT_MODE)
   })
   Object.assign(entry, { session, unsubscribe, cwd })
   sessions.set(id, entry)
+  // T3-1 时序承重：初始激活必须在 entry 挂上 session 之后 —— allToolNames 基准读
+  // entry.session.getAllTools()（全量注册表）；空壳 entry 返回 [] → toolsForModeSwitch
+  // 回落 BASE_TOOLS，codemode/tool_search/mcp__* 在首次 set_mode 前永远不被点亮。
+  session.setActiveToolsByName(toolsForModeSwitch(entryMode, allToolNames(entry)))
+  if (thinking) session.setThinkingLevel(thinking)
   return { id, sessionId: session.sessionId, cwd, file: session.sessionManager.getSessionFile(), mode: entry.mode }
 }
 
@@ -525,11 +777,10 @@ async function openSession(id, file, requestedMode) {
     modelRuntime,
     sessionManager,
     resourceLoader: loader,
-    uiContext: uiContext(id),
-    tools: BASE_TOOLS,
+    // T3-1：不传 tools（注册表不裁剪，codemode/tool_search/mcp__* 才能进表）；见 createSession 处详注。
     customTools: [makeShowImageTool()],
   })
-  session.setActiveToolsByName(toolsForModeSwitch(mode, BASE_TOOLS))
+  await bindUiContext(session, id)
   const unsubscribe = session.subscribe((event) => {
     const summarized = summarizeEvent(event)
     lan.note(id, summarized)
@@ -537,6 +788,9 @@ async function openSession(id, file, requestedMode) {
   })
   Object.assign(entry, { session, unsubscribe, cwd, file })
   sessions.set(id, entry)
+  // T3-1 时序承重：同 createSession —— 激活基准 allToolNames(entry) 读 entry.session，
+  // 必须在挂载之后（空壳 entry → 回落 BASE_TOOLS，新工具点不亮）。
+  session.setActiveToolsByName(toolsForModeSwitch(mode, allToolNames(entry)))
   return {
     id,
     sessionId: session.sessionId,
@@ -753,13 +1007,11 @@ async function forkSession(sourceId, id, userMessageIndex, position = 'before') 
     modelRuntime: await ensureRuntime(),
     sessionManager: targetManager,
     resourceLoader: loader,
-    uiContext: uiContext(id),
-    // 与 createSession 一致：注册并集，plan 的只读限制在创建后施加，
+    // 与 createSession 一致：不裁剪注册表（T3-1），plan 只读限制在创建后施加，
     // 否则分叉出来的会话会继承"只能往小里切"的缺陷。
-    tools: BASE_TOOLS,
     customTools: [makeShowImageTool()],
   })
-  session.setActiveToolsByName(toolsForModeSwitch(mode, BASE_TOOLS))
+  await bindUiContext(session, id)
   const unsubscribe = session.subscribe((event) => {
     const summarized = summarizeEvent(event)
     lan.note(id, summarized)
@@ -772,6 +1024,10 @@ async function forkSession(sourceId, id, userMessageIndex, position = 'before') 
   // 后果：从 full/plan fork 出的分支切到 ask 后，bash/edit/write **不弹确认直接执行**。
   Object.assign(entry, { session, unsubscribe, cwd, file })
   sessions.set(id, entry)
+  // T3-1：初始激活必须在 entry 挂上 session 之后（allToolNames 基准要读
+  // entry.session.getAllTools() 全量注册表；空壳时 toolsForModeSwitch 会回落 BASE_TOOLS，
+  // fork 出的会话就永远点不亮 codemode/tool_search/mcp__*）。
+  session.setActiveToolsByName(toolsForModeSwitch(mode, allToolNames(entry)))
   return {
     id,
     sessionId: session.sessionId,
@@ -867,6 +1123,9 @@ async function configuredModels() {
   const extensionProviders = new Set(runtime.getRegisteredProviderIds?.() ?? [])
   return runtime.getModels()
     .filter((model) => {
+      // T3-2：虚拟模型是路由壳，不是可直接选中的模型——不进配置目录
+      // （UI 的模型下拉/链编辑都从这份列表取选项）。
+      if (typeof model.id === 'string' && model.id.startsWith(VIRTUAL_PREFIX)) return false
       const config = providers?.[model.provider]
       const fromExtension = extensionProviders.has(model.provider)
       if (!configured.has(model.provider) && !fromExtension) return false
@@ -1015,11 +1274,10 @@ async function createWorktreeFork(payload) {
       modelRuntime: await ensureRuntime(),
       sessionManager: targetManager,
       resourceLoader: loader,
-      uiContext: uiContext(forkId),
-      tools: BASE_TOOLS,
+      // T3-1：不裁剪注册表（与 createSession/openSession/fork 一致）
       customTools: [makeShowImageTool()],
     })
-    session.setActiveToolsByName(toolsForModeSwitch(mode, BASE_TOOLS))
+    await bindUiContext(session, forkId)
     session.subscribe((event) => {
       const summarized = summarizeEvent(event)
       lan.note(forkId, summarized)
@@ -1036,6 +1294,10 @@ async function createWorktreeFork(payload) {
       worktreePath,
       running: false,
     })
+    // T3-1：初始激活必须在 sessions.set 之后 —— allToolNames 从 sessions 存的 entry
+    // 读全量注册表（entry 无 knownTools 字段时自动初始化，安全）；放在 set 之前会拿到
+    // 空基准回落 BASE_TOOLS，fork 会话永远点不亮 codemode/tool_search/mcp__*。
+    session.setActiveToolsByName(toolsForModeSwitch(mode, allToolNames(sessions.get(forkId))))
     return { id: forkId, file, cwd: worktreePath, branch, worktreePath, mode }
   } catch (error) {
     // 会话创建失败 → 回滚 worktree（不留垃圾目录）
@@ -1283,6 +1545,23 @@ async function readWorkspaceFileChunk(cwd, rawPath, offset = 0, limit = 2000) {
   }
 }
 
+/** T2⑥（对抗审查 A）：MCP 配置文件写入互斥锁 —— mcp_save（整表覆盖）与 mcp_patch
+ *  （单键编辑）都是读-改-写，并发时会互相吞掉改动（丢失更新）。按文件路径串行化：
+ *  同一文件的写操作排队执行，不同文件（global/project）互不阻塞。进程内锁即可 ——
+ *  sidecar 是唯一写入方（UI 不直写配置文件）。 */
+const mcpWriteLocks = new Map()
+async function withMcpWriteLock(file, fn) {
+  const prev = mcpWriteLocks.get(file) || Promise.resolve()
+  const run = prev.catch(() => {}).then(fn)
+  mcpWriteLocks.set(
+    file,
+    run.finally(() => {
+      if (mcpWriteLocks.get(file) === run) mcpWriteLocks.delete(file)
+    }),
+  )
+  return run
+}
+
 async function handle(request) {
   const { id, type, payload = {} } = request
   try {
@@ -1324,6 +1603,38 @@ async function handle(request) {
     if (type === 'list_models') {
       const models = await configuredModels()
       reply(id, models)
+      return
+    }
+    if (type === 'get_virtual_models') {
+      // T3-2：读虚拟模型链配置（enabled + 链项 + 逐项目录命中状态，供 UI 渲染告警）
+      const catalog = await configuredModels()
+      const resolved = resolveVirtualChain(virtualModelsConfig.chain, catalog)
+      reply(id, {
+        supported: typeof (await ensureRuntime()).registerVirtualModel === 'function',
+        config: virtualModelsConfig,
+        issues: resolved.ok ? resolved.issues : (resolved.issues ?? [{ index: -1, error: resolved.error }]),
+      })
+      return
+    }
+    if (type === 'set_virtual_models') {
+      // T3-2：写配置 = 校验 → 目录解析（链项必须命中已配置物理模型）→ 持久化 →
+      // 注册进 runtime（注销旧集，幂等）。非法输入显式报错，不静默回落。
+      const parsed = normalizeVirtualModelConfig(payload)
+      if (!parsed.ok) throw new Error(`虚拟模型配置非法: ${parsed.error}`)
+      const catalog = await configuredModels()
+      const resolved = resolveVirtualChain(parsed.config.chain, catalog)
+      if (!resolved.ok) {
+        const detail = (resolved.issues ?? []).map((issue) => `#${issue.index + 1} ${issue.provider}/${issue.modelId}: ${issue.error}`).join('；')
+        throw new Error(detail || resolved.error)
+      }
+      virtualModelsConfig = parsed.config
+      await atomicWriteJson(virtualModelsFile, virtualModelsConfig)
+      await applyVirtualModels(await ensureRuntime(), virtualModelsConfig)
+      const fresh = resolveVirtualChain(virtualModelsConfig.chain, await configuredModels())
+      reply(id, {
+        config: virtualModelsConfig,
+        issues: fresh.ok ? fresh.issues : (fresh.issues ?? []),
+      })
       return
     }
     if (type === 'check_agent_update') {
@@ -1463,6 +1774,18 @@ async function handle(request) {
       reply(id, await generateImage(payload))
       return
     }
+    if (type === 'generate_images') {
+      // T2⑧ 复合内容别名层：接受 pi-ai ImagesInputContent（TextContent|ImageContent 数组）。
+      // 仅当整个输入都可用文本表达（string 或纯 TextContent）时转发旧实现；否则按
+      // 「兼容层不做图像输入」如实报错，不静默丢内容（图像条件生成需走 SDK 原生路径）。
+      const rawInput = Array.isArray(payload?.input) ? payload.input : [{ type: 'text', text: String(payload?.prompt ?? '') }]
+      const textParts = rawInput.filter((part) => part?.type === 'text' && typeof part.text === 'string').map((part) => part.text)
+      if (textParts.length !== rawInput.length) {
+        throw new Error('generate_images 暂不支持图像输入内容（兼容层仅转发文本），请直接使用 SDK generateImages 原生路径')
+      }
+      reply(id, await generateImage({ ...payload, prompt: textParts.join('\n') }))
+      return
+    }
     if (type === 'trust_project') {
       // 2-14：显式设置项目信任（设置页/会话菜单调用）
       reply(id, await trustProject(payload.cwd, payload.trusted === true))
@@ -1499,6 +1822,91 @@ async function handle(request) {
       reply(id, { enabled: entry.session.autoCompactionEnabled })
       return
     }
+    if (type === 'get_cache_warming') {
+      // T1-① prompt cache warming（SDK 0.99.x CacheWarmer 自动接入，这里暴露会话级开关与状态）
+      const entry = sessions.get(payload.sessionId)
+      if (!entry?.session) throw new Error(`会话不存在: ${payload.sessionId}`)
+      const status = entry.session.cacheWarmingStatus
+      // P2-5：把当前模式一起回给前端（settingsManager.getCacheWarmingMode()），UI 按钮加 active 态
+      let mode = ''
+      try { mode = typeof entry.session.settingsManager?.getCacheWarmingMode === 'function' ? String(entry.session.settingsManager.getCacheWarmingMode()) : '' } catch { mode = '' }
+      reply(id, {
+        mode,
+        status: status?.state ?? 'inactive',
+        reason: typeof status?.reason === 'string' ? status.reason : '',
+        nextWarmAt: Number.isFinite(status?.nextWarmAt) ? status.nextWarmAt : null,
+        warmCost: Number.isFinite(status?.decision?.warmCost) ? status.decision.warmCost : null,
+        missCost: Number.isFinite(status?.decision?.missCost) ? status.decision.missCost : null,
+        action: status?.decision?.action ?? '',
+        expectedSavings: Number.isFinite(status?.decision?.expectedSavings) ? status.decision.expectedSavings : null,
+      })
+      return
+    }
+    if (type === 'set_cache_warming') {
+      // mode ∈ off|streaming|idle（CACHE_WARMING_MODES）。审查 P2-1：非法值必须报错而非
+      // 静默回落——回落会把用户此前的 off 覆盖成 streaming 还回显"成功"，掩盖调用方 bug。
+      const entry = sessions.get(payload.sessionId)
+      if (!entry?.session) throw new Error(`会话不存在: ${payload.sessionId}`)
+      const MODES = ['off', 'streaming', 'idle']
+      if (!MODES.includes(payload.mode)) throw new Error('mode 必须是 off|streaming|idle')
+      const mode = payload.mode
+      entry.session.setCacheWarmingMode(mode)
+      reply(id, { mode })
+      return
+    }
+    if (type === 'get_compaction_budget') {
+      // T1-② per-model compaction budgets：读全局 settings 的 compaction.modelOverrides
+      const entry = sessions.get(payload.sessionId)
+      if (!entry?.session) throw new Error(`会话不存在: ${payload.sessionId}`)
+      const overrides = entry.session.settingsManager?.globalSettings?.compaction?.modelOverrides
+      reply(id, { overrides: overrides && typeof overrides === 'object' ? overrides : {} })
+      return
+    }
+    if (type === 'set_compaction_budget') {
+      // modelKey 形如 "provider/modelId"；reserveTokens/keepRecentTokens 正整数，非法键删除该条覆盖
+      const entry = sessions.get(payload.sessionId)
+      if (!entry?.session) throw new Error(`会话不存在: ${payload.sessionId}`)
+      const modelKey = typeof payload.modelKey === 'string' ? payload.modelKey.trim() : ''
+      if (!modelKey || modelKey.length > 200) throw new Error('modelKey 必须是 1-200 字符的 "provider/modelId"')
+      const manager = entry.session.settingsManager
+      if (!manager?.globalSettings) throw new Error('settingsManager 不可用')
+      if (!manager.globalSettings.compaction || typeof manager.globalSettings.compaction !== 'object') {
+        manager.globalSettings.compaction = {}
+      }
+      const compaction = manager.globalSettings.compaction
+      if (!compaction.modelOverrides || typeof compaction.modelOverrides !== 'object') compaction.modelOverrides = {}
+      // 审查 P2-3：上界钳制（SDK 压缩预算语义，1e21 之类会架空预算）；P2-2：字段在
+      // payload 中显式出现但不是有限正数时必须报错，而不是静默略去导致"以为在写实际在删"。
+      const TOKEN_MAX = 2_000_000
+      const parseToken = (field) => {
+        if (!(field in payload)) return { present: false, value: undefined }
+        const raw = payload[field]
+        if (!Number.isFinite(raw) || raw <= 0) return { present: true, error: `${field} 必须是正数` }
+        return { present: true, value: Math.min(Math.floor(raw), TOKEN_MAX) }
+      }
+      const reserve = parseToken('reserveTokens')
+      const keep = parseToken('keepRecentTokens')
+      if (reserve.error) throw new Error(reserve.error)
+      if (keep.error) throw new Error(keep.error)
+      const override = {
+        ...(reserve.value !== undefined ? { reserveTokens: reserve.value } : {}),
+        ...(keep.value !== undefined ? { keepRecentTokens: keep.value } : {}),
+      }
+      if (override.reserveTokens === undefined && override.keepRecentTokens === undefined) {
+        delete compaction.modelOverrides[modelKey]
+      } else {
+        compaction.modelOverrides[modelKey] = override
+      }
+      // P2-4：markModified/save 在 SDK 0.99.2 的 d.ts 里是 private（运行时存在但无契约保证）。
+      // 加能力检测：SDK 未来升级若移除，这里显式报错而非静默丢改动。
+      if (typeof manager.markModified !== 'function' || typeof manager.save !== 'function') {
+        throw new Error('settingsManager 缺少 markModified/save（SDK 版本不兼容，压缩预算无法持久化）')
+      }
+      manager.markModified('compaction', 'modelOverrides')
+      manager.save()
+      reply(id, { modelKey, override: compaction.modelOverrides[modelKey] ?? null })
+      return
+    }
     if (type === 'set_auto_compaction') {
       // 1-2 上下文蒸发：会话级开关（SDK 默认已开，这里给用户关闭的自由）
       const entry = sessions.get(payload.sessionId)
@@ -1529,7 +1937,33 @@ async function handle(request) {
       return
     }
     if (type === 'mcp_list') {
-      // 2-10 MCP 服务器管理：读取全局（~/.pi/agent/mcp.json）与项目级（<cwd>/.pi/mcp.json）
+      // T2⑥ MCP 原生化：SDK loadMcpConfig 走 validateMcpServerConfig 校验 +
+      // 命名空间冲突检测，错误串（配置非法/JSON 损坏）透传给 UI 展示。
+      // projectTrusted 复用 2-14 项目信任：不可信项目的 .pi/mcp.json 不读
+      // （SDK 加载器同语义 —— 项目文件在受信后才被读取）。
+      if (mcpConfigApi && typeof mcpConfigApi.loadMcpConfig === 'function') {
+        let trusted = true
+        try { trusted = await resolveProjectTrust({}) } catch { trusted = false }
+        const loaded = mcpConfigApi.loadMcpConfig({ agentDir, cwd: workspace, projectTrusted: trusted })
+        reply(id, {
+          globalPath: globalMcpFile,
+          projectPath: path.join(workspace, '.pi', 'mcp.json'),
+          projectTrusted: trusted,
+          errors: Array.isArray(loaded?.errors) ? loaded.errors.map(String) : [],
+          servers: (Array.isArray(loaded?.servers) ? loaded.servers : []).map((s) => ({
+            name: String(s?.name ?? ''),
+            scope: s?.scope === 'global' || s?.scope === 'project' ? s.scope : 'global',
+            source: String(s?.source ?? ''),
+            enabled: s?.config?.enabled !== false,
+            exposure: String(s?.config?.exposure || 'codemode'),
+            transport: s?.config?.command ? 'stdio' : s?.config?.url ? 'http' : 'unknown',
+            command: String(s?.config?.command || s?.config?.url || ''),
+            args: Array.isArray(s?.config?.args) ? s.config.args : [],
+          })),
+        })
+        return
+      }
+      // 旧版 SDK 降级：手写读取（原 2-10 行为，语义锁定）
       const read = async (file) => {
         try {
           const parsed = JSON.parse(readFileSync(file, 'utf8'))
@@ -1540,7 +1974,9 @@ async function handle(request) {
             command: String(server?.command || server?.url || server?.baseUrl || ''),
             transport: server?.command ? 'stdio' : server?.url ? 'http' : 'unknown',
             args: Array.isArray(server?.args) ? server.args : [],
-            disabled: server?.disabled === true,
+            enabled: server?.disabled !== true && server?.enabled !== false,
+            exposure: String(server?.exposure || 'codemode'),
+            source: file,
           }))
         } catch {
           return []
@@ -1556,18 +1992,58 @@ async function handle(request) {
       return
     }
     if (type === 'mcp_save') {
-      // 2-10：保存指定 scope 的 mcpServers（整表覆盖，UI 负责合并语义）
+      // T2⑥：保存指定 scope 的 mcpServers（整表覆盖，UI 负责合并语义）。
+      // SDK 可用时走 addMcpServerConfig 逐条写入 —— 它会做 validateMcpServerConfig
+      // 之外的形状保留（保留文件内其它内容与缩进），非法条目由 UI 先行过滤。
+      // 写入侧白名单（对抗审查 B）：mcp_save 是 UI 之外的最后一个写入口，非法 exposure
+      // 在这里拒绝，防止绕过 UI 校验的值经 mcp_list 原样透传。
       const scope = payload.scope === 'project' ? 'project' : 'global'
       const file = scope === 'global' ? globalMcpFile : path.join(workspace, '.pi', 'mcp.json')
       const servers = payload.mcpServers
       if (!servers || typeof servers !== 'object' || Array.isArray(servers)) throw new Error('mcpServers 必须是对象')
-      const existing = (() => {
-        try { return JSON.parse(readFileSync(file, 'utf8')) } catch { return {} }
-      })()
-      existing.mcpServers = servers
-      await mkdir(path.dirname(file), { recursive: true })
-      await atomicWriteJson(file, existing)
+      for (const server of Object.values(servers)) {
+        const exposure = server?.exposure
+        if (exposure !== undefined && !['codemode', 'deferred', 'direct', 'hidden'].includes(exposure)) {
+          throw new Error(`非法暴露级别：${exposure}（允许 codemode/deferred/direct/hidden）`)
+        }
+      }
+      // 写入互斥（对抗审查 A）：与 mcp_patch 共用每文件写锁，串行化读-改-写，防丢失更新
+      await withMcpWriteLock(file, async () => {
+        const existing = (() => {
+          try { return JSON.parse(readFileSync(file, 'utf8')) } catch { return {} }
+        })()
+        existing.mcpServers = servers
+        await mkdir(path.dirname(file), { recursive: true })
+        await atomicWriteJson(file, existing)
+      })
       reply(id, { saved: true, scope, path: file, count: Object.keys(servers).length })
+      return
+    }
+    if (type === 'mcp_patch') {
+      // T2⑥：单个服务器的 enabled/exposure 编辑 —— SDK updateMcpServerConfig 保留
+      // 文件其余内容与缩进；enabled:true / exposure:'codemode'（默认值）会删除键，
+      // 保持配置文件最小化（与 /mcp 管理器同语义）。
+      if (!mcpConfigApi || typeof mcpConfigApi.updateMcpServerConfig !== 'function') {
+        throw new Error('当前 SDK 版本不支持 MCP 配置编辑（缺 updateMcpServerConfig）')
+      }
+      const scope = payload.scope === 'project' ? 'project' : 'global'
+      const name = String(payload.name || '').trim()
+      if (!name) throw new Error('缺少服务器名称')
+      const file = scope === 'global' ? globalMcpFile : path.join(workspace, '.pi', 'mcp.json')
+      const patch = {}
+      if (payload.enabled !== undefined) patch.enabled = payload.enabled === true
+      if (payload.exposure !== undefined) {
+        const exposure = String(payload.exposure)
+        if (!['codemode', 'deferred', 'direct', 'hidden'].includes(exposure)) {
+          throw new Error(`非法暴露级别：${exposure}（允许 codemode/deferred/direct/hidden）`)
+        }
+        patch.exposure = exposure
+      }
+      if (Object.keys(patch).length === 0) throw new Error('补丁为空：需要 enabled 或 exposure')
+      // 写入互斥（对抗审查 A）：与 mcp_save 共用每文件写锁 —— updateMcpServerConfig
+      // 内部也是读-改-写，两个并发 patch（或 patch 撞上 save 整表覆盖）会互相吞掉改动。
+      await withMcpWriteLock(file, () => mcpConfigApi.updateMcpServerConfig(file, name, patch))
+      reply(id, { patched: true, scope, name, file, patch })
       return
     }
     if (type === 'mcp_test') {      // 2-10：连接测试 —— stdio 型：起进程，等它输出任意内容或 3 秒退出码判断
@@ -1702,9 +2178,57 @@ async function handle(request) {
       })
       return
     }
+    if (type === 'list_context') {
+      // T2⑦ 上下文编辑（SDK ContextEditEntry 原生化）第一半：列出模型可见条目。
+      // 口径与 sessionHistory 一致走 buildContextEntries()（compaction 感知、沿当前叶路径）。
+      const entry = sessions.get(payload.sessionId)
+      if (!entry?.session) throw new Error(`会话不存在: ${payload.sessionId}`)
+      const items = []
+      for (const item of entry.session.sessionManager.buildContextEntries()) {
+        if (item.type === 'message') {
+          const message = item.message
+          if (!message || (message.role !== 'user' && message.role !== 'assistant' && message.role !== 'toolResult')) continue
+          items.push({ entryId: item.id, kind: 'message', role: message.role, text: contentText(message.content) })
+        } else if (item.type === 'custom_message') {
+          items.push({
+            entryId: item.id,
+            kind: 'custom_message',
+            role: 'plugin',
+            text: typeof item.content === 'string' ? item.content : '',
+            customType: typeof item.customType === 'string' ? item.customType : '',
+          })
+        }
+      }
+      const edits = collectContextEdits(entry.session.sessionManager)
+      reply(id, { items, edits })
+      return
+    }
+    if (type === 'apply_context_edit') {
+      // T2⑦ 第二半：追加分支局部编辑条目。replacement 为 null = 从模型上下文剔除目标；
+      // { content } = 仅替换内容（形状与 SDK ContextEditEntry["replacement"] 严格一致，不加工）。
+      const entry = sessions.get(payload.sessionId)
+      if (!entry?.session) throw new Error(`会话不存在: ${payload.sessionId}`)
+      if (entry.running) throw new Error('会话正在运行，无法编辑上下文')
+      const targetId = String(payload.targetId || '')
+      if (!targetId || !entry.session.sessionManager.getEntry(targetId)) throw new Error(`目标条目不存在: ${targetId || '(空)'}`)
+      const replacement = payload.replacement === null ? null : { content: payload.replacement?.content }
+      if (replacement !== null && typeof replacement.content !== 'string' && !Array.isArray(replacement.content)) {
+        throw new Error('replacement.content 必须是字符串或 TextContent/ImageContent 数组')
+      }
+      const editId = entry.session.sessionManager.appendContextEdit(targetId, replacement)
+      // 注：不回传 tokens —— SDK SessionProjection（session-manager.d.ts）没有 tokens 字段，
+      // 曾写的 `projection?.tokens ?? 0` 恒为 0（假功能），宁可不给也不谎报。
+      reply(id, { editId, targetId, replacement })
+      return
+    }
     if (type === 'set_model') {
       const entry = sessions.get(payload.sessionId)
       if (!entry) throw new Error(`会话不存在: ${payload.sessionId}`)
+      // T3-2：虚拟模型是路由壳（模型目录里存在但不出现在 configuredModels），
+      // 显式拒绝直接选中——故障转移链由设置开关控制，而不是会话级 set_model。
+      if (typeof payload.modelId === 'string' && payload.modelId.startsWith(VIRTUAL_PREFIX)) {
+        throw new Error('虚拟模型是故障转移路由壳，不能直接选中；请在设置中启用/编辑故障转移链')
+      }
       const model = (await ensureRuntime()).getModels().find((item) => item.provider === payload.provider && item.id === payload.modelId)
       if (!model) throw new Error(`模型不存在: ${payload.provider}/${payload.modelId}`)
       await entry.session.setModel(model)
@@ -1794,10 +2318,104 @@ async function handle(request) {
       return
     }
     if (type === 'ext_ui_diagnostics') {
-      // 让用户/维护者看到"哪些扩展 UI 能力在桌面端未实现"
+      // 让用户/维护者看到"哪些扩展 UI 能力在桌面端未实现" +
+      // 当前会话实际加载了哪些扩展（1-5 批次②）。
+      // 注意：extensionRunner 在 reload() 后是**新对象**，必须每次从 entry 现取。
+      const entry = sessions.get(payload.sessionId)
+      let extensions
+      try {
+        const runner = entry?.session?.extensionRunner
+        extensions = Array.isArray(runner?.extensions)
+          ? runner.extensions.map((ext) => ({
+              path: typeof ext?.path === 'string' ? ext.path : '',
+              source: ext?.sourceInfo?.source ?? '',
+            }))
+          : []
+      } catch {
+        extensions = []
+      }
       reply(id, {
         unsupported: [...unsupportedUiCalls.entries()].map(([message, count]) => ({ message, count })),
+        extensions,
       })
+      return
+    }
+    if (type === 'reload_extensions') {
+      // 1-5 批次②：运行时重载扩展（免发版加新 UI 形态）。
+      // session.reload() 在 SDK 内部走 _buildRuntime：重建 extensionRunner 并
+      // 自动重新应用 uiContext/onError 绑定（_applyExtensionBindings），所以
+      // **这里绝不能再调 bindUiContext** —— 那会二次发射 session_start。
+      // 重建后 runner 标识变化，因此诊断信息每次都从 entry 现取、绝不缓存。
+      const entry = sessions.get(payload.sessionId)
+      if (!entry?.session) {
+        reply(id, { error: `会话 ${payload.sessionId ?? ''} 不存在或未就绪` })
+        return
+      }
+      try {
+        await entry.session.reload()
+        reply(id, { reloaded: true })
+      } catch (error) {
+        reply(id, { reloaded: false, error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+    if (type === 'list_ui_renderers') {
+      // 1-5 批次③：扫描已加载扩展目录的 pi-ui.json 声明，交给前端注册表登记。
+      // 信任语义：项目信任（resolveProjectTrust）决定这些渲染器能否渲染非
+      // timeline 槽 —— 前端拿到 trusted 字段后做显式拒绝（绝不静默丢弃）。
+      const entry = sessions.get(payload.sessionId)
+      let extensionPaths = []
+      try {
+        const runner = entry?.session?.extensionRunner
+        extensionPaths = Array.isArray(runner?.extensions)
+          ? runner.extensions.map((ext) => (typeof ext?.path === 'string' ? ext.path : '')).filter(Boolean)
+          : []
+      } catch {
+        extensionPaths = []
+      }
+      const renderers = await collectUiRendererManifests(extensionPaths)
+      let trusted = true
+      try {
+        // 信任分类：项目扩展（非 agentDir 下）触发信任检查，全局扩展不问。
+        // SDK 返回的扩展路径是原生反斜杠；agentDir 归一化成同款再比较 ——
+        // 分隔符不一致会让全局扩展永远匹配不上前缀而被误判为项目扩展（审查 BUG-2）。
+        const agentPrefix = agentDir.replaceAll('\\', '/').toLowerCase()
+        const norm = (p) => p.replaceAll('\\', '/').toLowerCase()
+        const projectExts = extensionPaths.filter((p) => !norm(p).startsWith(agentPrefix))
+        trusted = resolveProjectTrust({ extensionsResult: { extensions: projectExts.map((p) => ({ path: p })) } })
+      } catch {
+        trusted = false
+      }
+      reply(id, { renderers, trusted })
+      return
+    }
+    if (type === 'read_ui_renderer_asset') {
+      // 1-5 批次③：把扩展目录内的静态资源（如 sandbox 页 HTML）读给前端。
+      // 路径安全：解析后必须落在声明来源目录内（防 ../ 逃逸读取任意文件），
+      // 且只允许文本资产（html/css/js/json/svg/txt/md）。
+      const dir = typeof payload.source === 'string' ? payload.source : ''
+      const rel = typeof payload.path === 'string' ? payload.path : ''
+      const allowedExt = new Set(['.html', '.htm', '.css', '.js', '.mjs', '.json', '.svg', '.txt', '.md'])
+      if (!dir || !rel) {
+        reply(id, { error: '缺少 source 或 path' })
+        return
+      }
+      const baseDir = path.resolve(dir)
+      const full = path.resolve(baseDir, rel)
+      if (full !== baseDir && !full.startsWith(baseDir + path.sep)) {
+        reply(id, { error: '资源路径越界（必须位于扩展目录内）' })
+        return
+      }
+      if (!allowedExt.has(path.extname(full).toLowerCase())) {
+        reply(id, { error: '不允许的资源类型（仅文本资产）' })
+        return
+      }
+      try {
+        const content = await readFile(full, 'utf8')
+        reply(id, { content, path: rel })
+      } catch (error) {
+        reply(id, { error: error instanceof Error ? error.message : String(error) })
+      }
       return
     }
     if (type === 'read_attachment') {
@@ -2080,6 +2698,41 @@ async function handle(request) {
       if (payload.cancelled) pending.reject(new Error('用户取消登录'))
       else pending.resolve(String(payload.value ?? ''))
       reply(id, { delivered: true })
+      return
+    }
+    if (type === 'auth_status') {
+      const runtime = await ensureRuntime()
+      const providers = runtime.getProviders().map((provider) => {
+        const oauth = provider.auth?.oauth || null
+        let status = { configured: false }
+        try {
+          status = runtime.getProviderAuthStatus(provider.id) || { configured: false }
+        } catch (error) {
+          log(error)
+        }
+        return {
+          id: provider.id,
+          configured: Boolean(status.configured),
+          source: status.source || '',
+          label: status.label || '',
+          subscription: Boolean(runtime.isUsingSubscription?.(provider.id)),
+          oauthName: oauth?.name || '',
+          loginLabel: oauth?.loginLabel || ''
+        }
+      })
+      reply(id, { providers })
+      return
+    }
+    if (type === 'auth_logout') {
+      const provider = String(payload.provider || '').trim()
+      if (!provider) throw new Error('缺少 provider')
+      try {
+        await (await ensureRuntime()).logout(provider)
+        reply(id, { ok: true, provider, message: `已登出 ${provider}` })
+        await ensureRuntime(true)
+      } catch (error) {
+        reply(id, { ok: false, provider, message: error.message || '登出失败' })
+      }
       return
     }
     throw new Error(`未知 sidecar 请求: ${type}`)

@@ -23,10 +23,13 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { summarizeEvent } from '../sidecar/event-slim.mjs'
 import {
   assistantErrorFrom,
+  describeProviderError,
   isCancellationText,
+  removeProviderError,
   stashProviderError,
   takeProviderError,
 } from '../src/run-slot.ts'
+import { SETTLE_FALLBACK_TEXT, SETTLE_GRACE_MS, createSettleArbiter } from '../src/run-settle.ts'
 
 // 不联网拉模型目录，避免测试受网络影响（SDK 只认这个环境变量的存在性）。
 process.env.PI_OFFLINE = '1'
@@ -189,6 +192,176 @@ test('provider 404：错误文本必须穿过 event-slim 到达前端并被归�
   // ⑤ agent_settled 是兜底：错误已在 agent_end 被消费，兜底不应重复报（否则文案闪烁）。
   assert.equal(reduced.settledText, '', 'agent_settled 重复报错')
   assert.equal(reduced.seenErrorEvent, false)
+})
+
+/**
+ * 终态事件丢失的归约复刻（F4）：把真实事件序列喂进"带兜底仲裁器"的归约器。
+ *
+ * 与 reduceLikeApp 的区别是这里接了 createSettleArbiter，完全复刻 App.svelte 的三处接线：
+ *   ① setProviderError → stash + arm；clearProviderError → cancel + remove（同一漏斗）
+ *   ② 每条事件入口先 cancel（事件链还活着），随后若带错误再被 arm 重新武装
+ *   gate 为 true 时**丢弃终态事件**，模拟 Rust 读线程 / webview 丢帧导致 agent_end 与
+ *   agent_settled 都到不了前端 —— 正是用户报障的形态。
+ * 返回 { visible, fired, arms }：visible 是用户最终看到的那条错误文案。
+ */
+function reduceWithLostTerminal(events, { dropTerminal, schedule, unschedule }) {
+  let stash = {}
+  const arms = []
+  let visible = ''
+  let running = true
+
+  const arbiter = createSettleArbiter({
+    onFire: (id, raw) => {
+      if (!running) return
+      finish(`${describeProviderError(raw)}\n${SETTLE_FALLBACK_TEXT}`)
+    },
+    schedule,
+    unschedule,
+  })
+
+  // 复刻 finishRun：真实实现里它入口处就调 clearProviderError(id)，即撤销兜底计时器。
+  // 若这里漏掉，对照组会在收尾后留下一个已无意义的计时器（会被 onFire 的 running 守卫
+  // 挡下，但 pending() 不为 0）—— 那是对真实接线的失真，必须照抄。
+  const finish = (text) => {
+    if (!running) return
+    running = false
+    arbiter.cancel('s')
+    visible = text
+  }
+
+  const setProviderError = (raw) => {
+    stash = stashProviderError(stash, 's', raw)
+    arms.push(raw)
+    arbiter.arm('s', raw)
+  }
+  const clearProviderError = () => {
+    arbiter.cancel('s')
+    stash = removeProviderError(stash, 's')
+  }
+  const consume = () => {
+    const taken = takeProviderError(stash, 's')
+    stash = taken.stash
+    return taken.message
+  }
+
+  for (const event of events) {
+    if (dropTerminal && (event.type === 'agent_end' || event.type === 'agent_settled')) continue
+    if (event.type === 'error') { clearProviderError(); finish(String(event.message || 'Agent 请求失败')); continue }
+    arbiter.cancel('s') // App.svelte:1857 事件入口先撤销
+    if (event.type === 'message_end' && event.message?.role === 'assistant') {
+      setProviderError(assistantErrorFrom(event.message))
+    }
+    if (event.type === 'turn_end') setProviderError(assistantErrorFrom(event.message))
+    if (event.type === 'auto_retry_end' && event.success === false) {
+      const finalError = String(event.finalError ?? '')
+      if (!isCancellationText(finalError)) setProviderError(finalError)
+    }
+    if (event.type === 'agent_end') {
+      setProviderError(assistantErrorFrom(event.messages))
+      if (!event.willRetry) finish(consume())
+    }
+    if (event.type === 'agent_settled') finish(consume())
+  }
+  return { visible: () => visible, fired: () => !running, arms, arbiter }
+}
+
+/** 假时钟（与 run-settle.test.mjs 同一模型，这里只需"推进"）。 */
+function createFakeClock() {
+  let now = 0
+  let handle = 0
+  const timers = new Map()
+  return {
+    schedule(callback, ms) {
+      const id = ++handle
+      timers.set(id, { at: now + ms, callback })
+      return id
+    },
+    unschedule(id) { timers.delete(id) },
+    advance(ms) {
+      const target = now + ms
+      for (;;) {
+        let pick = null
+        for (const [id, timer] of timers) {
+          if (timer.at > target) continue
+          if (!pick || timer.at < pick.timer.at) pick = { id, timer }
+        }
+        if (!pick) break
+        timers.delete(pick.id)
+        now = pick.timer.at
+        pick.timer.callback()
+      }
+      now = target
+    },
+    pending: () => timers.size,
+  }
+}
+
+test('终态事件丢失时兜底仲裁器必须把界面从永久 Thinking 里救出来（真实 SDK 复现）', async () => {
+  // 用 404 + text/plain：本地HTTP服务无法复现真机网关"把 JSON 错误体塞进 openai SDK
+  // 能解析的字段"的形态 —— 402 的 JSON body 经 openai SDK 后只剩
+  // `402 status code (no body)`（见 pi-ai/dist/utils/error-body.js：只有
+  // error.body 字符串 / error.error 纯对象 / $response.body 才算 body）。而 404
+  // text/plain 的正文会原样进入 errorMessage（用例 1 已证明），足以驱动整条
+  // "错误 → 暂存 → 终态消费 / 兜底收尾"链路，且与网关差异解耦。
+  const events = await runRealPrompt({
+    reply: (_req, res) => {
+      res.writeHead(404, { 'content-type': 'text/plain' })
+      res.end('404 page not found\n')
+    },
+  })
+
+  // 前提：真实链路里错误确实先以 message_end / turn_end 到达（否则兜底无从武装）。
+  assert.ok(
+    events.some((event) => event.type === 'message_end' && event.message?.stopReason === 'error'),
+    'assistant 错误消息未到达事件流，兜底防线的前提不成立'
+  )
+  const errored = events.find((event) => event.message?.stopReason === 'error')
+  assert.match(String(errored.message.errorMessage), /404/, '错误正文未穿过 event-slim')
+
+  // 对照组：终态事件正常到达 ⇒ 走原来的路径，兜底不开火。
+  {
+    const clock = createFakeClock()
+    const reduced = reduceWithLostTerminal(events, { dropTerminal: false, ...clock })
+    clock.advance(SETTLE_GRACE_MS * 3)
+    assert.match(reduced.visible(), /接口地址不正确/, '正常路径未报出 provider 错误')
+    assert.equal(reduced.visible().includes(SETTLE_FALLBACK_TEXT), false, '终态事件到达时不得叠加兜底文案')
+    assert.equal(reduced.arbiter.pending('s'), false, '收尾后不得留下兜底计时器')
+    assert.equal(reduced.arbiter.size(), 0, '收尾后不得留下兜底计时器')
+  }
+
+  // 实验组：丢掉 agent_end 与 agent_settled ⇒ 没有兜底就永久 Thinking。
+  {
+    const clock = createFakeClock()
+    const reduced = reduceWithLostTerminal(events, { dropTerminal: true, ...clock })
+    assert.equal(reduced.fired(), false, '宽限期未到时绝不能收尾')
+    assert.match(reduced.visible(), /^$/, '此时界面仍是 Thinking（这正是原缺陷的形态）')
+    clock.advance(SETTLE_GRACE_MS - 1)
+    assert.equal(reduced.fired(), false, '差一毫秒不能提前收尾')
+    clock.advance(1)
+    assert.equal(reduced.fired(), true, '终态事件丢失后兜底必须收尾')
+    const text = reduced.visible()
+    assert.match(text, /接口地址不正确/, '兜底文案必须带上真实 provider 错误')
+    assert.match(text, /终态事件没有到达界面/, '兜底文案必须说明是事件链中断')
+    assert.equal(text.includes(SETTLE_FALLBACK_TEXT), true)
+  }
+})
+
+test('用户主动 Stop 后迟到的取消文案不得被兜底误报（真实 SDK 复现的取消契约）', () => {
+  // 直接构造最小事件序列：正常结束的 assistant 消息（errorMessage 为空）+ 取消回执。
+  const clock = createFakeClock()
+  const reduced = reduceWithLostTerminal([
+    { type: 'agent_start' },
+    { type: 'message_end', message: { role: 'assistant', stopReason: 'aborted', errorMessage: '' } },
+    { type: 'auto_retry_end', success: false, finalError: 'Retry cancelled' },
+  ], { dropTerminal: true, ...clock })
+  // message_end 走了 setProviderError 但 errorMessage 为空串；auto_retry_end 的
+  // "Retry cancelled" 被 isCancellationText 过滤（根本不会到达 setProviderError）。
+  // 两者都不得让兜底武装：arm 内部对空文本直接返回。
+  assert.ok(reduced.arms.every((raw) => raw === ''), `取消路径不得武装兜底：${JSON.stringify(reduced.arms)}`)
+  assert.equal(reduced.arbiter.pending('s'), false, '取消路径绝不能留下兜底计时器')
+  assert.equal(reduced.arbiter.size(), 0, '取消路径绝不能留下兜底计时器')
+  clock.advance(SETTLE_GRACE_MS * 3)
+  assert.equal(reduced.fired(), false, '主动取消被误报为 provider 故障')
 })
 
 test('provider 正常回复：不得产生任何"请求失败"误报（真实 SDK 复现）', async () => {
