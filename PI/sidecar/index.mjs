@@ -1446,7 +1446,29 @@ async function generateImage(payload) {
   throw new Error('生图服务未返回图片')
 }
 
-async function readWorkspaceFile(cwd, file) {  const root = path.resolve(cwd)
+// T2⑧（SDK 1.0.0 跟进）：runtime.generateImages 原生路径 —— 只服务物理目录里的
+// image 模型（getAvailableOfType('image')；虚拟模型 route 只能回 chat 模型）。
+// SDK 不为无效输入 throw（捕获为 stopReason:'error' 的 AssistantImages），因此
+// 这里必须检查 stopReason；成功输出归一为旧返回形状 {data,mimeType}。
+async function generateImagesViaSdk(payload, input) {
+  const runtime = await ensureRuntime()
+  if (typeof runtime.generateImages !== 'function') {
+    throw new Error('当前 SDK 版本不支持图像输入生图（缺 runtime.generateImages，需 1.0.0+）')
+  }
+  const candidates = await runtime.getAvailableOfType('image')
+  const wanted = String(payload?.model || '').trim()
+  const model = (wanted && candidates.find((item) => item.id === wanted)) || candidates[0]
+  if (!model) throw new Error('没有可用的图像模型（SDK 路径需要 models.json 注册 type:"image" 模型并配置凭据）；纯文本生图请使用 generate_image')
+  const result = await runtime.generateImages(model, { input })
+  if (result?.stopReason === 'error' || result?.stopReason === 'aborted') {
+    throw new Error(result.errorMessage || `SDK 生图失败（stopReason=${result?.stopReason}）`)
+  }
+  const first = (Array.isArray(result?.output) ? result.output : []).find((part) => part?.type === 'image' && typeof part.data === 'string')
+  if (!first) throw new Error('生图服务未返回图片')
+  return { data: first.data, mimeType: first.mimeType || 'image/png' }
+}
+
+async function readWorkspaceFile(cwd, file) { const root = path.resolve(cwd)
   const absolute = path.resolve(root, file)
   if (absolute !== root && !absolute.startsWith(`${root}${path.sep}`)) throw new Error('禁止读取工作区外的文件')
   const info = await stat(absolute)
@@ -1553,12 +1575,12 @@ const mcpWriteLocks = new Map()
 async function withMcpWriteLock(file, fn) {
   const prev = mcpWriteLocks.get(file) || Promise.resolve()
   const run = prev.catch(() => {}).then(fn)
-  mcpWriteLocks.set(
-    file,
-    run.finally(() => {
-      if (mcpWriteLocks.get(file) === run) mcpWriteLocks.delete(file)
-    }),
-  )
+  // 对抗审查（1.0.0 跟进轮）修复：入图与清理守卫必须比较同一对象 —— 旧代码存入
+  // finally 链生成的新 promise（tail），守卫却与 run 比较，恒 false，条目永不清理。
+  const tail = run.finally(() => {
+    if (mcpWriteLocks.get(file) === tail) mcpWriteLocks.delete(file)
+  })
+  mcpWriteLocks.set(file, tail)
   return run
 }
 
@@ -1775,13 +1797,15 @@ async function handle(request) {
       return
     }
     if (type === 'generate_images') {
-      // T2⑧ 复合内容别名层：接受 pi-ai ImagesInputContent（TextContent|ImageContent 数组）。
-      // 仅当整个输入都可用文本表达（string 或纯 TextContent）时转发旧实现；否则按
-      // 「兼容层不做图像输入」如实报错，不静默丢内容（图像条件生成需走 SDK 原生路径）。
+      // T2⑧ 复合内容别名层（SDK 1.0.0 跟进后支持图像输入）：接受 pi-ai ImagesInputContent
+      // （TextContent|ImageContent 数组）。纯文本输入归一为 prompt 转发旧直连实现
+      // （覆盖任意 OpenAI 兼容 baseUrl 形态）；含图像输入走 SDK 原生 generateImages
+      // （物理目录 image 模型）。两条路径都不静默丢内容。
       const rawInput = Array.isArray(payload?.input) ? payload.input : [{ type: 'text', text: String(payload?.prompt ?? '') }]
       const textParts = rawInput.filter((part) => part?.type === 'text' && typeof part.text === 'string').map((part) => part.text)
       if (textParts.length !== rawInput.length) {
-        throw new Error('generate_images 暂不支持图像输入内容（兼容层仅转发文本），请直接使用 SDK generateImages 原生路径')
+        reply(id, await generateImagesViaSdk(payload, rawInput))
+        return
       }
       reply(id, await generateImage({ ...payload, prompt: textParts.join('\n') }))
       return
@@ -1959,6 +1983,9 @@ async function handle(request) {
             transport: s?.config?.command ? 'stdio' : s?.config?.url ? 'http' : 'unknown',
             command: String(s?.config?.command || s?.config?.url || ''),
             args: Array.isArray(s?.config?.args) ? s.config.args : [],
+            // T2⑧ MCP OAuth 加固跟进：透出 oauth 配置供 UI 回读合并
+            // （SDK McpServerConfigPatch 只收 enabled/exposure，oauth 编辑走 mcp_oauth_patch 整组写入）。
+            oauth: s?.config?.oauth && typeof s.config.oauth === 'object' ? s.config.oauth : null,
           })),
         })
         return
@@ -1976,6 +2003,7 @@ async function handle(request) {
             args: Array.isArray(server?.args) ? server.args : [],
             enabled: server?.disabled !== true && server?.enabled !== false,
             exposure: String(server?.exposure || 'codemode'),
+            oauth: server?.oauth && typeof server.oauth === 'object' ? server.oauth : null,
             source: file,
           }))
         } catch {
@@ -2074,6 +2102,56 @@ async function handle(request) {
       } catch (error) {
         reply(id, { ok: false, message: error.message || '启动失败' })
       }
+      return
+    }
+    if (type === 'mcp_oauth_patch') {
+      // T2⑧ MCP OAuth 加固跟进：SDK updateMcpServerConfig 的 McpServerConfigPatch
+      // 只收 {enabled,exposure}，oauth 字段无法经 mcp_patch 写入 —— 这里直接编辑
+      // 配置文件整组替换 oauth。与 mcp_save/mcp_patch 共用写锁，串行化读-改-写。
+      const scope = payload.scope === 'project' ? 'project' : 'global'
+      const file = scope === 'global' ? globalMcpFile : path.join(workspace, '.pi', 'mcp.json')
+      const name = String(payload.name || '').trim()
+      if (!name) throw new Error('mcp_oauth_patch 缺少服务器名')
+      const oauthIn = payload.oauth
+      // 空对象/空串视为清除（保持「传什么存什么」的整组替换语义）
+      const oauth = oauthIn && typeof oauthIn === 'object' && !Array.isArray(oauthIn)
+        ? Object.fromEntries(Object.entries(oauthIn).filter(([, v]) => v !== undefined))
+        : null
+      if (oauth) {
+        const allowed = ['clientId', 'clientSecret', 'callbackPort', 'callbackUrl', 'scope', 'clientName', 'authServerMetadataUrl']
+        for (const key of Object.keys(oauth)) {
+          if (!allowed.includes(key)) throw new Error(`非法 oauth 字段：${key}（允许 ${allowed.join('/')}）`)
+        }
+        const stringKeys = ['clientId', 'clientSecret', 'callbackUrl', 'scope', 'clientName', 'authServerMetadataUrl']
+        for (const key of stringKeys) {
+          if (oauth[key] !== undefined && (typeof oauth[key] !== 'string' || !oauth[key].trim())) {
+            throw new Error(`oauth.${key} 必须是非空字符串`)
+          }
+        }
+        if (oauth.callbackPort !== undefined) {
+          const port = Number(oauth.callbackPort)
+          if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error('oauth.callbackPort 必须是 1-65535 的整数')
+          oauth.callbackPort = port
+        }
+        if (oauth.clientId !== undefined && oauth.clientSecret === undefined) {
+          throw new Error('静态客户端注册需要同时提供 clientSecret（或先清除整组重配）')
+        }
+      }
+      await withMcpWriteLock(file, async () => {
+        let existing = {}
+        try { existing = JSON.parse(readFileSync(file, 'utf8')) } catch { /* 文件不存在或损坏 → 视为空表 */ }
+        const servers = existing.mcpServers && typeof existing.mcpServers === 'object' && !Array.isArray(existing.mcpServers)
+          ? existing.mcpServers
+          : {}
+        const server = servers[name]
+        if (!server || typeof server !== 'object' || Array.isArray(server)) throw new Error(`未找到 MCP 服务器：${name}（scope=${scope}）`)
+        if (oauth === null) delete server.oauth
+        else server.oauth = oauth
+        existing.mcpServers = servers
+        await mkdir(path.dirname(file), { recursive: true })
+        await atomicWriteJson(file, existing)
+      })
+      reply(id, { patched: true, scope, name, file, oauth })
       return
     }
     if (type === 'get_project_trust') {

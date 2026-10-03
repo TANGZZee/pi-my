@@ -110,7 +110,7 @@
   let trayMinimize = true
   let trayMinimizeBusy = false
   // 2-10 MCP 服务器管理状态；T2⑥ 原生化：SDK 校验结果（servers/errors）+ 启停/暴露级别编辑
-  type McpServer = { name: string; scope: string; command: string; transport: string; args: string[]; enabled: boolean; exposure: string; source?: string }
+  type McpServer = { name: string; scope: string; command: string; transport: string; args: string[]; enabled: boolean; exposure: string; oauth?: Record<string, unknown> | null; source?: string }
   type McpListResult = { servers?: McpServer[]; errors?: string[]; projectTrusted?: boolean; globalPath?: string; projectPath?: string; global?: McpServer[]; project?: McpServer[] }
   let mcpServers: McpServer[] = []
   let mcpErrors: string[] = []
@@ -409,6 +409,65 @@
     }
     await loadMcpServers()
     void key
+  }
+
+  // T2⑧ MCP OAuth 跟进：每服务器 OAuth 编辑态（仅 http 型服务器展示）。
+  // 保存走 mcp_oauth_patch 整组替换；字段留空即不下发，全空 = 清除 oauth 组。
+  // 回读合并在 loadMcpServers：只为尚无草稿的键初始化，不覆盖未保存的编辑。
+  type McpOauthDraft = { clientId: string; clientSecret: string; callbackPort: string; callbackUrl: string; scope: string; clientName: string; authServerMetadataUrl: string }
+  let mcpOauth: Record<string, McpOauthDraft> = {}
+  let mcpOauthBusy: Record<string, boolean> = {}
+  const EMPTY_MCP_OAUTH: McpOauthDraft = { clientId: '', clientSecret: '', callbackPort: '', callbackUrl: '', scope: '', clientName: '', authServerMetadataUrl: '' }
+
+  function mcpOauthDraftOf(server: McpServer): McpOauthDraft {
+    const key = server.scope + ':' + server.name
+    const existing = mcpOauth[key]
+    if (existing) return existing
+    const o = server.oauth && typeof server.oauth === 'object' ? (server.oauth as Record<string, unknown>) : {}
+    const draft: McpOauthDraft = {
+      clientId: typeof o.clientId === 'string' ? o.clientId : '',
+      clientSecret: typeof o.clientSecret === 'string' ? o.clientSecret : '',
+      callbackPort: o.callbackPort !== undefined && o.callbackPort !== null ? String(o.callbackPort) : '',
+      callbackUrl: typeof o.callbackUrl === 'string' ? o.callbackUrl : '',
+      scope: typeof o.scope === 'string' ? o.scope : '',
+      clientName: typeof o.clientName === 'string' ? o.clientName : '',
+      authServerMetadataUrl: typeof o.authServerMetadataUrl === 'string' ? o.authServerMetadataUrl : '',
+    }
+    mcpOauth = { ...mcpOauth, [key]: draft }
+    return draft
+  }
+
+  async function saveMcpOAuth(server: McpServer) {
+    if (!rpc) return
+    const key = server.scope + ':' + server.name
+    if (mcpOauthBusy[key]) return
+    const draft = mcpOauthDraftOf(server)
+    mcpOauthBusy = { ...mcpOauthBusy, [key]: true }
+    try {
+      const clientId = draft.clientId.trim()
+      const clientSecret = draft.clientSecret.trim()
+      if (clientId && !clientSecret) throw new Error('静态客户端注册需要同时提供 clientSecret')
+      const oauth: Record<string, string | number> = {}
+      if (clientId) oauth.clientId = clientId
+      if (clientSecret) oauth.clientSecret = clientSecret
+      const portText = draft.callbackPort.trim()
+      if (portText) {
+        const port = Number(portText)
+        if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error('callbackPort 必须是 1-65535 的整数')
+        oauth.callbackPort = port
+      }
+      for (const field of ['callbackUrl', 'scope', 'clientName', 'authServerMetadataUrl'] as const) {
+        const value = draft[field].trim()
+        if (value) oauth[field] = value
+      }
+      await rpc('mcp_oauth_patch', { scope: server.scope, name: server.name, oauth: Object.keys(oauth).length ? oauth : null })
+      mcpNotice = ''
+    } catch (error) {
+      mcpNotice = error instanceof Error ? error.message : 'MCP OAuth 配置写入失败'
+    } finally {
+      mcpOauthBusy = { ...mcpOauthBusy, [key]: false }
+    }
+    await loadMcpServers()
   }
 
   async function testMcpServer(server: McpServer) {
@@ -1415,6 +1474,22 @@
                       <button class="choice" class:on={server.exposure === exposure} disabled={!server.enabled} on:click={() => void patchMcpServer(server, { exposure })}>{label}</button>
                     {/each}
                   </div>
+                  {#if server.transport === 'http'}
+                    {@const oauthDraft = mcpOauthDraftOf(server)}
+                    <div class="mcp-oauth">
+                      <p class="desc">OAuth（可选，用于不支持动态客户端注册的服务器；全部留空 = 清除配置）</p>
+                      <div class="mcp-oauth-grid">
+                        <label>clientId<input bind:value={oauthDraft.clientId} placeholder="预注册客户端 ID" /></label>
+                        <label>clientSecret<input bind:value={oauthDraft.clientSecret} placeholder={'支持 ${NAME} / !cmd 形式'} /></label>
+                        <label>callbackPort<input bind:value={oauthDraft.callbackPort} placeholder="1-65535" /></label>
+                        <label>callbackUrl<input bind:value={oauthDraft.callbackUrl} placeholder="http://127.0.0.1:port" /></label>
+                        <label>scope<input bind:value={oauthDraft.scope} placeholder="空格分隔" /></label>
+                        <label>clientName<input bind:value={oauthDraft.clientName} placeholder="默认 pi" /></label>
+                        <label class="span2">authServerMetadataUrl<input bind:value={oauthDraft.authServerMetadataUrl} placeholder="https://…/.well-known/oauth-authorization-server" /></label>
+                      </div>
+                      <button class="choice" disabled={mcpOauthBusy[server.scope + ':' + server.name]} on:click={() => void saveMcpOAuth(server)}>{mcpOauthBusy[server.scope + ':' + server.name] ? '保存中…' : (server.oauth ? '保存 OAuth（已配置）' : '保存 OAuth')}</button>
+                    </div>
+                  {/if}
                   <p class="desc">状态：{server.enabled ? '已启用' : '已禁用'} · 暴露级别：{server.exposure}{mcpTestStatus[server.name]?.message ? ` · ${mcpTestStatus[server.name].message}` : ''}</p>
                   {#if mcpTestStatus[server.name]?.message}<p class="desc" class:error={!mcpTestStatus[server.name]?.ok}>{mcpTestStatus[server.name].message}</p>{/if}
                 </div>
@@ -1747,6 +1822,14 @@
   .choice-row { display: flex; flex-wrap: wrap; gap: 6px; }
   .choice { min-width: 88px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 4px; background: var(--raised); color: var(--text-3); font-size: 11px; }
   .choice.on { border-color: var(--accent); color: var(--text); font-weight: 650; background: var(--surface-3); }
+  /* T2⑧ MCP OAuth 编辑表单：仅 http 型服务器展示 */
+  .mcp-oauth { margin-top: 10px; padding: 10px; border: 1px solid var(--border-2); border-radius: 8px; background: var(--surface-2, transparent); }
+  .mcp-oauth-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; margin: 8px 0; }
+  .mcp-oauth-grid label { display: flex; flex-direction: column; gap: 3px; color: var(--text-3); font-size: 11px; }
+  .mcp-oauth-grid label.span2 { grid-column: 1 / 3; }
+  .mcp-oauth-grid input { padding: 5px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--raised); color: var(--text); font-size: 12px; }
+  .mcp-oauth-grid input::placeholder { color: var(--muted); }
+  .mcp-oauth .choice { min-width: 0; }
   .skin-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
   .skin-card { display: flex; flex-direction: column; align-items: stretch; gap: 4px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--raised); text-align: left; }
   .skin-card.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }

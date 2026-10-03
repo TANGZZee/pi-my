@@ -82,10 +82,13 @@ export const TIMEOUT_BY_TYPE: Readonly<Record<string, number>> = Object.freeze({
   mcp_test: 30_000,
   // T2⑥ MCP 原生化：单服务器 enabled/exposure 编辑（SDK updateMcpServerConfig，本地 JSON）
   mcp_patch: 15_000,
+  // T2⑧ MCP OAuth 跟进：单服务器 oauth 整组替换（本地 JSON 读改写，与 mcp_patch 同档）
+  mcp_oauth_patch: 15_000,
   // T2⑦ 上下文编辑：buildContextEntries 全量列举（大会话可能几千条目）与追加 context_edit（append-only JSONL 写）
   list_context: 60_000,
   apply_context_edit: 30_000,
-  // T2⑧ 生图别名层：与 generate_image 同档（转发旧实现，sidecar 侧 180s HTTP 超时）
+  // T2⑧ 生图别名层：与 generate_image 同档（纯文本转发旧直连实现，sidecar 侧 180s HTTP 超时；
+  // 含图像输入走 SDK runtime.generateImages 原生路径）
   generate_images: 240_000,
   create_session: 120_000,
   open_session: 120_000,
