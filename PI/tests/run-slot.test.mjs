@@ -17,9 +17,13 @@ import {
   lastAssistantReply,
   liveLabel,
   mergeHistoryIntoTimeline,
+  pluginReplayPayload,
   processSummary,
   removeProviderError,
   sentFromTimeline,
+  settleStepsForFinish,
+  shouldSurfaceProviderError,
+  splitPluginHistory,
   stashProviderError,
   takeProviderError,
 } from '../src/run-slot.ts'
@@ -71,6 +75,32 @@ test('ensureThinkingStep：已有未完成思考时幂等', () => {
   assert.equal(ensureThinkingStep(steps, 9), steps, '已存在就不新开')
   assert.deepEqual(ensureThinkingStep([], 1).length, 1, '空时新开')
   assert.deepEqual(ensureThinkingStep([step({ done: true })], 1).length, 2, '已完成则新开')
+})
+
+test('settleStepsForFinish：失败终态把"等待思考"占位收束为明确结束语', () => {
+  // 占位与 App.svelte dispatchTurn 插入的形状一致（id/body 都要命中才会被替换）
+  const placeholder = [{ id: 'waiting-think', kind: 'think', title: '思考', body: '正在等待模型返回思考内容…', done: false }]
+  const next = settleStepsForFinish(placeholder)
+  assert.equal(next[0].done, true, '占位应标记完成')
+  assert.equal(next[0].body, '本回合未产生思考内容。')
+  assert.notEqual(next[0], placeholder[0], '应生成新对象')
+})
+
+test('settleStepsForFinish：真实思考步骤只标完成，文案原样保留', () => {
+  // 真实思考已到来（appendThinkToSteps 已替换占位）→ 收尾只标 done，不改写内容
+  const real = [
+    { id: 'waiting-think', kind: 'think', title: '思考', body: '真实的思考内容', done: false },
+    step({ id: 'tool-1', done: true }),
+    step({ id: 'tool-2', done: false }),
+  ]
+  const next = settleStepsForFinish(real)
+  assert.equal(next[0].done, true, '未完成的真实思考同样要标完成')
+  assert.equal(next[0].body, '真实的思考内容', '真实思考文案不得被改写')
+  assert.equal(next[2].done, true, '未完成的工具步骤仍要收束')
+  // 收尾后再收尾：已完成步骤引用不变 → 幂等
+  const settled = settleStepsForFinish(next)
+  assert.equal(settled[0], next[0], '重复收尾不产生新对象')
+  assert.equal(settled[0].body, '真实的思考内容')
 })
 
 test('endToolStep：按 toolCallId 精确匹配，附加结果摘要', () => {
@@ -442,7 +472,8 @@ test('describeProviderError：正则无全局标志（避免 lastIndex 串位）
 test('isCancellationText：识别 SDK 的主动取消文案（误报修复的承重点）', () => {
   // 真实事故：503 退避期间点 Stop，SDK 发 auto_retry_end{finalError:"Retry cancelled"}，
   // 此前无条件暂存 → 收尾时弹出"请求失败：Retry cancelled"。
-  // 源码：pi-coding-agent/dist/core/agent-session.js:2315-2326。
+  // 源码：pi-coding-agent/dist/core/agent-session.js:2942（_finishCancelledRetry，
+  // 唯一触发点是 _prepareRetry 的 catch，见 :2975-2979）；0.85.1 的同段在 :2315-2326。
   assert.equal(isCancellationText('Retry cancelled'), true)
   assert.equal(isCancellationText('retry canceled'), true, '美式拼写也要认')
   assert.equal(isCancellationText('  Retry Cancelled.  '), true, '空白与句点应被容忍')
@@ -517,4 +548,115 @@ test('takeProviderError：连续两次取，第二次必须为空（不得重复
   assert.match(first.message, /服务端临时故障/)
   const second = takeProviderError(first.stash, 's1')
   assert.equal(second.message, '', '同一错误只能被消费一次')
+})
+
+// ── shouldSurfaceProviderError：D1 双闸门的**语义**防线 ────────────────────
+// 为什么不靠 App.svelte 的源码断言守这条：第五/六/九轮对抗审查用 9 条写法实测，
+// 原来的正则（/!runEpoch\.isAborted\(id\)(?![^()]*\|\|)/）**漏 8 条、误杀 3 条** ——
+//   - 漏：`&& (!x, true)`（逗号取右值）、`&& (!x ? true : true)`、`&& (void !x, true)`、
+//     `&& (String(!x), true)`、以及块内插一行 `const __d = '!runEpoch.isAborted(id)'`
+//     字面量诱饵后无条件执行 —— 闸门实际失效，26/26 却全绿；
+//   - 误杀：`isAborted(id) === false`、`&& (!x || false)`、`!(isAborted(id) === true)`
+//     这三个语义**完全正确**的等价改写被判死，逼人删断言。
+// 结论：用语法特征判语义走不通。判据搬进这个纯函数，语义在这里逐格锁死，
+// App.svelte 侧只留"接线还在、且传了 isAborted(id) 当实参"的形状断言。
+
+test('shouldSurfaceProviderError：aborted 一律不展示（用户主动 Stop 绝不能被报成故障）', () => {
+  assert.equal(shouldSurfaceProviderError('404 page not found', true), false)
+  assert.equal(shouldSurfaceProviderError('503 Service Unavailable', true), false)
+  assert.equal(shouldSurfaceProviderError('', true), false)
+  assert.equal(shouldSurfaceProviderError(null, true), false)
+  assert.equal(shouldSurfaceProviderError(undefined, true), false)
+})
+
+test('shouldSurfaceProviderError：只有非空错误文本才展示（空文本表示"没有错误"）', () => {
+  assert.equal(shouldSurfaceProviderError('404 page not found', false), true)
+  assert.equal(shouldSurfaceProviderError(' 402 INSUFFICIENT_BALANCE ', false), true, 'trim 后非空即展示')
+  assert.equal(shouldSurfaceProviderError('', false), false, '空串不得弹出任何"请求失败"')
+  assert.equal(shouldSurfaceProviderError('   ', false), false, '纯空白不得弹出')
+  assert.equal(shouldSurfaceProviderError(null, false), false)
+  assert.equal(shouldSurfaceProviderError(undefined, false), false)
+  // 非字符串输入不应抛错，而应被 String() 归一化后判断
+  assert.equal(shouldSurfaceProviderError(0, false), true, '数字 0 经 String() 是 "0"，属非空文本')
+  assert.equal(shouldSurfaceProviderError({}, false), true, '对象经 String() 是 "[object Object]"，非空')
+})
+
+test('shouldSurfaceProviderError：aborted 的优先级高于错误文本（双闸门不得互相短路）', () => {
+  // 语义等价改写必须全部得到同样的结果——上面两个测试的交叉乘积已验证，
+  // 这里单独钉住"aborted === true 时任何文本都不展示"这一条顺序无关性。
+  const samples = ['', '   ', '403 Forbidden', '402 INSUFFICIENT_BALANCE', null, undefined, 0]
+  for (const sample of samples) {
+    assert.equal(
+      shouldSurfaceProviderError(sample, true),
+      false,
+      `aborted=true 时 ${JSON.stringify(sample)} 也必须不展示`,
+    )
+  }
+})
+
+// ── 1-5 批次②对抗审查缺口 #1/#3/#8 的行为级防线 ─────────────────────────
+// 形状断言可被德摩根等价重构逃逸（审查实测：chatHistory 谓词反转 !==→=== 存活，
+// 普通聊天历史被清空而 plugin-bridge 9/9 + session-wiring 全绿）。
+// 这三个纯函数 + 行为测试是唯一杀得住那条变异的防线。
+
+test('splitPluginHistory：分流方向必须正确（缺口 #8 谓词反转变异的终结防线）', () => {
+  const history = [
+    { id: 'h1', role: 'user', text: '你好' },
+    { id: 'h2', role: 'plugin', text: '卡片', pluginCustomType: 'ui.plugin', pluginDisplay: { slot: 'status', title: 'k' } },
+    { id: 'h3', role: 'assistant', text: '回复' },
+    { id: 'h4', role: 'plugin', text: '卡片2' },
+  ]
+  const { plugin, chat } = splitPluginHistory(history)
+  assert.deepEqual(plugin.map((x) => x.id), ['h2', 'h4'], 'plugin 只收 role===plugin 条目（反转变异会让 chat 变成空、聊天历史清空）')
+  assert.deepEqual(chat.map((x) => x.id), ['h1', 'h3'], 'chat 必须保留全部非 plugin 条目（普通聊天历史不得被过滤掉）')
+  // 顺序在各自桶内保持原始顺序
+  assert.deepEqual(splitPluginHistory([{ role: 'user', text: 'a' }, { role: 'assistant', text: 'b' }]).plugin, [], '无插件条目时 plugin 为空')
+  assert.equal(splitPluginHistory().chat.length, 0, '缺省参数不抛错')
+  assert.equal(splitPluginHistory(null).chat.length, 0, 'null 输入不抛错')
+})
+
+test('pluginReplayPayload：display/customType/text 透传契约（缺口 #1 静默退化的终结防线）', () => {
+  const item = {
+    id: 'ext-1', role: 'plugin', text: '正文',
+    pluginCustomType: 'my.chart', pluginDisplay: { slot: 'status', component: 'text', title: 'k', body: 'ok' },
+    timestamp: 12345,
+  }
+  const p = pluginReplayPayload(item)
+  assert.equal(p.customType, 'my.chart', 'pluginCustomType 优先')
+  assert.equal(p.content, '正文')
+  assert.deepEqual(p.display, { slot: 'status', component: 'text', title: 'k', body: 'ok' }, 'display 必须原样透传 —— 丢 display 的变异曾让重放卡片静默退化')
+  assert.equal(p.entryId, 'ext-1', 'entryId 优先 item.entryId||item.id')
+  assert.equal(p.timestamp, 12345)
+})
+
+test('pluginReplayPayload：降级路径（缺 plugin 字段回落 customType/display；timestamp 负值丢弃）', () => {
+  // 未带 pluginCustomType/pluginDisplay 的旧条目（timeline 形态或历史数据）
+  const legacy = pluginReplayPayload({ id: 'x', role: 'plugin', text: 't', customType: 'legacy.type', display: { slot: 'float' } })
+  assert.equal(legacy.customType, 'legacy.type')
+  assert.deepEqual(legacy.display, { slot: 'float' }, 'HistoryEntry.display 作为回落')
+  // 全缺 → ui.plugin + {}
+  const bare = pluginReplayPayload({ id: 'y', role: 'plugin', text: 't' })
+  assert.equal(bare.customType, 'ui.plugin')
+  assert.deepEqual(bare.display, {})
+  // timestamp 校验：负值/NaN/字符串数字 不得进入重放（对抗审查：Date.parse('123') 为负 → 1970 年）
+  assert.equal(pluginReplayPayload({ role: 'plugin', text: 't', timestamp: -58285726602000 }).timestamp, undefined, '负值 timestamp 丢弃')
+  assert.equal(pluginReplayPayload({ role: 'plugin', text: 't', timestamp: NaN }).timestamp, undefined)
+  assert.equal(pluginReplayPayload({ role: 'plugin', text: 't', timestamp: 0 }).timestamp, undefined)
+  assert.equal(pluginReplayPayload({ role: 'plugin', text: 't', timestamp: 5000 }).timestamp, 5000)
+})
+
+test('historyToTimeline：plugin 分支透传 pluginCustomType/pluginDisplay（缺口 #3）+ timestamp 正数校验', () => {
+  const timeline = historyToTimeline([
+    { id: 'p1', role: 'plugin', text: '卡片', customType: 'ui.plugin', display: { slot: 'status', title: 'k' } },
+    { id: 'u1', role: 'user', text: '问' },
+  ])
+  assert.equal(timeline.length, 2, 'plugin 条目不得被 historyToTimeline 丢弃')
+  const plug = timeline.find((m) => m.role === 'plugin')
+  assert.equal(plug.pluginCustomType, 'ui.plugin', 'pluginCustomType 透传')
+  assert.deepEqual(plug.pluginDisplay, { slot: 'status', title: 'k' }, 'display 透传（spread 改 {} 的变异曾存活）')
+  const user = timeline.find((m) => m.role === 'user')
+  assert.equal(user.pluginCustomType, undefined, '非 plugin 条目不带插件字段')
+  // 负 timestamp（Date.parse 误解析）回落当前时间而非 1970
+  const bad = historyToTimeline([{ role: 'user', text: 'x', timestamp: -58285726602000 }])
+  assert.ok(bad[0].timestamp > 1_000_000_000_000, '负值 timestamp 必须回落 Date.now（不得显示 1970 年）')
 })

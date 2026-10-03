@@ -8,6 +8,9 @@
 
 export type RunPhase = 'idle' | 'thinking' | 'working' | 'writing' | 'waiting'
 
+/** 0-5 批次 B：子代理运行条目（此前内嵌在 App.svelte，多个面板组件共用） */
+export type SubRun = { id: string; agent: string; task: string; status: 'running' | 'done' | 'error'; reply: string }
+
 export interface ProcessStep {
   id: string
   kind: 'think' | 'tool'
@@ -18,12 +21,16 @@ export interface ProcessStep {
 
 export interface TimelineMessage {
   id: string
-  role: 'user' | 'assistant'
+  role: 'user' | 'assistant' | 'plugin'
   text: string
   at: string
   timestamp: number
   userIndex: number
   entryId?: string
+  /** 1-5 批次②：role==='plugin' 时的扩展 customType（App.svelte 规范化成 PluginMessage 用） */
+  pluginCustomType?: string
+  /** 1-5 批次②：role==='plugin' 时的原始 display（slot/component/title/fields/body/tone） */
+  pluginDisplay?: Record<string, unknown>
 }
 
 /** 把任意值缩略为 ≤maxLen 的展示文本（工具步骤预览用）。 */
@@ -33,9 +40,57 @@ export function brief(value: unknown, maxLen = 220): string {
   return text.length > maxLen ? `${text.slice(0, maxLen)}…` : text
 }
 
+/**
+ * 工具结果摘要（T1-③，SDK 0.99.x bash/powershell 结构化结果对接）：
+ * 优先读 structuredContent（output/truncated/full_output_path/exit_code），
+ * 截断时给出明确提示而不是把 1MiB JSON 塞进 220 字符预览；非结构化结果回落 brief。
+ */
+export function toolResultBrief(result: unknown, toolName = '', maxLen = 220): string {
+  if (result != null && typeof result === 'object') {
+    const structured = (result as { structuredContent?: Record<string, unknown> }).structuredContent
+    if (structured && typeof structured === 'object') {
+      const exit = Number.isFinite(structured.exit_code) ? Number(structured.exit_code) : null
+      const parts: string[] = []
+      if (exit !== null) parts.push(`退出码 ${exit}`)
+      if (structured.truncated === true) {
+        parts.push('输出已截断')
+        if (typeof structured.full_output_path === 'string' && structured.full_output_path) {
+          parts.push(`完整输出：${structured.full_output_path}`)
+        }
+      }
+      if (parts.length) {
+        const preview = typeof structured.output === 'string' ? brief(structured.output, maxLen) : ''
+        return [parts.join(' · '), preview].filter(Boolean).join('\n')
+      }
+    }
+  }
+  // show_image 等自定义工具保留原有 details 预览；其余回落旧行为
+  return brief(result, maxLen)
+}
+
 /** 把所有未完成的步骤标记为完成（新事件到来时收束前一步）。 */
 export function closeOpenSteps(steps: ProcessStep[]): ProcessStep[] {
   return steps.map((step) => (step.done ? step : { ...step, done: true }))
+}
+
+/**
+ * 运行终态（正常收尾/失败/侧车中止）时的过程步骤收束。
+ *
+ * 与 closeOpenSteps 的差别：把"等待思考"占位（id=waiting-think）的未定文案换成
+ * 明确的结束语。占位在 dispatchTurn 里创建，正文要等第一段真实思考文本到来才会
+ * 被替换（appendThinkToSteps）；当本轮以失败告终（402/404、侧车崩溃、超时），
+ * 思考内容永远不会来 —— 只 closeOpenSteps 的话，占位挂着"正在等待模型返回思考
+ * 内容…"并标成已完成，看起来像"还在思考"或"思考被吃掉了"。
+ *
+ * 正常收尾也走这里：占位若已被真实内容替换（id 变为 think-N）则原样保留；
+ * 若真的一个字都没思考就结束了（罕见），显示"未产生思考内容"也比"正在等待"准确。
+ */
+export function settleStepsForFinish(steps: ProcessStep[]): ProcessStep[] {
+  return closeOpenSteps(steps).map((step) =>
+    step.id === 'waiting-think' && step.body === '正在等待模型返回思考内容…'
+      ? { ...step, body: '本回合未产生思考内容。' }
+      : step,
+  )
 }
 
 /**
@@ -93,24 +148,39 @@ export function formatReplyTime(timestamp?: number): string {
 
 export interface HistoryEntry {
   id?: string
-  role: 'user' | 'assistant'
+  role: 'user' | 'assistant' | 'plugin'
   text: string
   timestamp?: number
   userIndex?: number
   entryId?: string
+  /** 1-5 批次②：role==='plugin' 时的扩展自定义类型（透传给前端规范化） */
+  customType?: string
+  /** 1-5 批次②：role==='plugin' 时的 display（slot/component/title/fields/body/tone） */
+  display?: Record<string, unknown>
+}
+
+/** 时间线消息形态的历史条目（splitPluginHistory 的消费方 → historyToTimeline 之间传递）。 */
+export interface TimelineHistoryEntry extends HistoryEntry {
+  /** 1-5 批次②：role==='plugin' 时的扩展 customType（透传给规范化方） */
+  pluginCustomType?: string
+  /** 1-5 批次②：role==='plugin' 时的原始 display（透传给规范化方） */
+  pluginDisplay?: Record<string, unknown>
 }
 
 /**
  * sidecar 历史条目 → 时间线消息。
- * - 过滤空文本与非 user/assistant 角色
+ * - 过滤空文本与非 user/assistant/plugin 角色
  * - id 优先 entryId，其次 id，最后用时间戳+序号兜底
  * - userIndex 用于"撤回重发"定位，缺失时钳到 0
  */
-export function historyToTimeline(history: HistoryEntry[] = []): TimelineMessage[] {
+export function historyToTimeline(history: Array<HistoryEntry | TimelineHistoryEntry> = []): TimelineMessage[] {
   return (history || [])
-    .filter((item) => item && (item.role === 'user' || item.role === 'assistant') && String(item.text || '').trim())
+    .filter((item) => item && (item.role === 'user' || item.role === 'assistant' || item.role === 'plugin') && String(item.text || '').trim())
     .map((item, index) => {
-      const timestamp = Number(item.timestamp) || Date.now()
+      // timestamp 正数校验（对抗审查语义攻击 #3）：负值/0 一律回落当前时间，
+      // 避免被 Date.parse 误解析的数值字符串显示成 1970 年。
+      const parsed = Number(item.timestamp)
+      const timestamp = Number.isFinite(parsed) && parsed > 0 ? parsed : Date.now()
       return {
         id: item.entryId || item.id || `history-${timestamp}-${index}`,
         role: item.role,
@@ -119,6 +189,11 @@ export function historyToTimeline(history: HistoryEntry[] = []): TimelineMessage
         at: formatReplyTime(timestamp),
         userIndex: Math.max(0, Number(item.userIndex) || 0),
         entryId: item.entryId || item.id,
+        // 插件历史：透传 customType/display，由消费方（App.svelte）规范化成
+        // PluginMessage 后进插件时间线，而不是变成一条普通文本气泡。
+        ...(item.role === 'plugin'
+          ? { pluginCustomType: item.customType || 'ui.plugin', pluginDisplay: item.display ?? {} }
+          : {}),
       }
     })
 }
@@ -126,6 +201,52 @@ export function historyToTimeline(history: HistoryEntry[] = []): TimelineMessage
 /** 从时间线提取"已发送消息"列表（撤回重发面板用）。 */
 export function sentFromTimeline(timeline: TimelineMessage[]): Array<{ text: string; at: string }> {
   return timeline.filter((item) => item.role === 'user').map((item) => ({ text: item.text, at: item.at }))
+}
+
+/**
+ * 1-5 批次②（对抗审查缺口 #1/#3/#8 根治）：把磁盘历史分流成插件重放与聊天两条。
+ *
+ * 为什么抽成纯函数：applySessionHistory 的分流原先内嵌在组件里，对抗审查实测
+ * 「chatHistory 过滤谓词反转（!== → ===，普通聊天历史被清空）」变异存活——
+ * session-wiring 的接线 10 断言只锚变量名形状，不看 filter 谓词方向。
+ * 纯函数 + 行为测试是唯一杀得住这条变异的防线（形状断言可被德摩根等价重构逃逸）。
+ *
+ * 契约：
+ *   - plugin = role === 'plugin' 的条目（顺序保留，透传 customType/display 原样给规范化方）
+ *   - chat   = 其余条目（user/assistant；未知角色也落这里，由 historyToTimeline 的
+ *              filter 再拦一道 —— 与批次②之前的语义一致）
+ */
+export function splitPluginHistory(history: HistoryEntry[] = []): { plugin: HistoryEntry[]; chat: HistoryEntry[] } {
+  const plugin: HistoryEntry[] = []
+  const chat: HistoryEntry[] = []
+  for (const item of history || []) {
+    if (item?.role === 'plugin') plugin.push(item)
+    else chat.push(item)
+  }
+  return { plugin, chat }
+}
+
+/**
+ * 1-5 批次②（对抗审查缺口 #1）：插件历史条目 → 待规范化载荷。
+ * 缺口 #1 实测「display 透传改 display:{}」变异存活（历史重放后卡片丢
+ * slot/component/title/fields，UI 静默退化）——本函数 + 行为测试锁定透传契约：
+ * pluginCustomType / pluginDisplay / text / timestamp / entryId 全部到达规范化方。
+ * timestamp 带正数校验（对抗审查语义攻击 #3：Date.parse('123') 为负值 → 显示 1970 年）。
+ */
+export function pluginReplayPayload(item: TimelineHistoryEntry): {
+  customType: string
+  content: string
+  display: Record<string, unknown>
+  entryId?: string
+  timestamp?: number
+} {
+  return {
+    customType: item.pluginCustomType || item.customType || 'ui.plugin',
+    content: item.text,
+    display: item.pluginDisplay ?? (item as TimelineHistoryEntry & { display?: Record<string, unknown> }).display ?? {},
+    entryId: item.entryId || item.id,
+    timestamp: typeof item.timestamp === 'number' && item.timestamp > 0 ? item.timestamp : undefined,
+  }
 }
 
 /**
@@ -195,8 +316,9 @@ export function lastAssistantReply(timeline: TimelineMessage[]): TimelineMessage
  *
  * 为什么需要它（真实事故）：模型提供商返回 404 时，SDK **不抛异常、也不发
  * `type:'error'` 事件**，而是产出一条 `stopReason:'error'` + `errorMessage` 的
- * assistant 消息，随后照常发 `agent_end` / `agent_settled`（源码：
- * pi-coding-agent/dist/core/agent-session.js:386,772 与 dist/agent-loop.js）。
+ * assistant 消息，随后照常发 `agent_end` / `agent_settled`（0.99.1 的 `agent_settled`
+ * 由 `_runAgentPrompt` 的 finally 调用 `_emitAgentSettled()` 发出：定义在
+ * pi-coding-agent/dist/core/agent-session.js:662-672，调用点在 :1344）。
  * 前端此前只读 `agent_end.willRetry`、只处理 `type:'error'`，于是错误文本被整条丢弃
  * ——用户看到的是"没有任何反馈"，甚至（sidecar 死掉时）永久停在 Thinking。
  *
@@ -240,7 +362,8 @@ export function describeProviderError(raw: string): string {
  *
  * 真实误报事故：模型返回可重试错误（如 503）后 SDK 进入退避 sleep，此时用户点 Stop
  * → SDK 发 `auto_retry_end{success:false, finalError:"Retry cancelled"}`
- * （源码 pi-coding-agent/dist/core/agent-session.js:2315-2326）→ 若前端无条件把它
+ * （源码 pi-coding-agent/dist/core/agent-session.js:2942 的硬编码字面量，触发点
+ *  :2977 `_prepareRetry` 的 catch → `_finishCancelledRetry()`）→ 若前端无条件把它
  * 当成 provider 故障暂存，收尾时就会弹出"请求失败 / Retry cancelled"红条 ——
  * 用户明明是自己按的停止，却被告知请求失败。
  *
@@ -249,6 +372,28 @@ export function describeProviderError(raw: string): string {
  */
 export function isCancellationText(raw: string): boolean {
   return /^retry\s+cancel?led\.?$/i.test(String(raw ?? '').trim())
+}
+
+/**
+ * 错误展示闸门：这一轮的 provider 错误文本是否应当**展示给用户**。
+ *
+ * 为什么抽成纯函数（第五/六/九轮对抗性审查的结论）：这条闸门原先在 App.svelte 里写作
+ * `if (errorMessage && !runEpoch.isAborted(id))`，测试只能用子串正则去匹配源码文本。
+ * 审查者用 9 条写法实测那条正则**既漏又误杀**：
+ *  - 漏（语义已反转却放行）：`!!isAborted(id)`、`(false || !isAborted(id))`；
+ *  - 误杀（语义完全正确却判死）：`isAborted(id) === false`、`!(isAborted(id) === true)`。
+ * 结论是"用语法特征去判定语义"这条路走不通，故把判据搬进纯函数，语义由
+ * tests/run-slot.test.mjs 的真值表逐格锁定，接线测试只负责断言调用点传了 aborted。
+ *
+ * 两个入参的含义与"绝不误报"的承重点：
+ *  - `errorMessage` 为空表示这一轮没有 provider 错误（用户按 Stop 时 SDK 发的终态
+ *    消息 stopReason 是 aborted、errorMessage 为空），必须返回 false；
+ *  - `aborted` 为真表示当前世代就是被用户中止的那一代（runEpoch.isAborted），
+ *    即便上游塞了一条错误文案也不能把它说成"请求失败"。
+ */
+export function shouldSurfaceProviderError(errorMessage: unknown, aborted: boolean): boolean {
+  if (aborted === true) return false
+  return String(errorMessage ?? '').trim().length > 0
 }
 
 /**

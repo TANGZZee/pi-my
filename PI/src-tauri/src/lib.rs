@@ -1,7 +1,7 @@
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -208,6 +208,107 @@ fn pathdiff_from(base: &Path, target: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// sidecar stdout 单行的分类结果（纯函数输出，便于单测，不需要真的起进程）。
+#[derive(Debug)]
+enum SidecarLine {
+    /// 空行 / 纯空白：NDJSON 流里合法的噪声，**不算**解析失败
+    Empty,
+    /// 合法 JSON 消息
+    Parsed(Value),
+    /// 不是 JSON（含被丢弃的非法 UTF-8 之后的残行）：跳过并记账，但绝不终止读取
+    NotJson(String),
+}
+
+/// 纯函数：判定一行是空行、合法 JSON 还是垃圾。
+///
+/// 旧实现（`lines().map_while(Result::ok)`）在这一步静默丢弃失败的行：既没有诊断，
+/// 也无从知道"界面为什么没反应"。这里把判定与副作用分开，判定可单测。
+fn classify_sidecar_line(raw: &str) -> SidecarLine {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return SidecarLine::Empty;
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(message) => SidecarLine::Parsed(message),
+        Err(_) => SidecarLine::NotJson(trimmed.to_string()),
+    }
+}
+
+/// 读取线程的**会话无关**诊断消息：读线程结束时用来告诉界面"事件流为什么断了"。
+///
+/// 为什么要显式带上 `sessionId`：前端事件入口是 `const id = payload.sessionId ||
+/// activeSessionId; if (!id) return`。这两条诊断原先不带 sessionId，于是
+/// - 在 `activeSessionId === ''`（刚启动、或用户把会话全删了）时被**静默丢弃**，
+///   用户既看不到"输出流结束"也看不到"sidecar 已退出"；
+/// - 在用户切到别的会话时会把 A 会话的读线程崩溃记到 B 头上（张冠李戴）。
+/// 读线程自己不知道"当前会话"，但它在转发的每条消息里都看得到 `sessionId`，
+/// 记住最后见过的那个即可覆盖绝大多数场景；从没见过就退回全局提示（前端兜底）。
+fn reader_diagnostic(session_id: &Option<String>, message: String) -> Value {
+    let mut payload = serde_json::json!({
+        "type": "event",
+        "event": { "type": "error", "message": message }
+    });
+    if let Some(id) = session_id {
+        payload["sessionId"] = Value::String(id.clone());
+    }
+    payload
+}
+
+/// sidecar stdout 单行（未遇到换行前）的安全上限。正常 NDJSON 行只有几 KB；
+/// 一旦有人往 stdout 灌二进制且永不带换行，缓冲不应无界增长。
+const SIDECAR_PENDING_LIMIT: usize = 8 << 20; // 8 MiB
+
+/// 读取线程每次最多从 stdout 取多少字节。
+///
+/// 这不是性能调参，而是护栏的**可达性前提**：只有把读取切成有界的小块、每块之后
+/// 都回到循环体检查 `SIDECAR_PENDING_LIMIT`，护栏才可能执行到（见下方 reader 线程）。
+const READ_CHUNK: usize = 64 << 10; // 64 KiB
+
+/// 从字节缓冲里切出所有**已完整**的行（以 `\n` 结尾），未完成的尾部留在缓冲里等下一批。
+///
+/// 为什么按字节切、而不是 `lines()`：
+/// - `lines()` 遇到第一个非法 UTF-8 字节就返回 `Err`，旧代码的 `map_while(Result::ok)`
+///   会因此**整条读取线程退出**——进程还活着、还在写，前端却永远收不到后续事件（转圈）。
+/// - 按 `b'\n'` 切分天然免疫跨块拆字符：换行是 ASCII，只要换行到了，它前面的字节必然
+///   已经完整；没有换行的尾巴一律留到下一块，半行 JSON 不会被误解析。
+/// - 非法字节交给 `take_valid_utf8` 丢弃（不产出 U+FFFD），绝不 panic、绝不中断。
+/// 返回 `(行内容, 该行字节是否含非法 UTF-8)`。第二个字段单独记账，是因为
+/// `take_valid_utf8` 会把非法字节**静默丢弃**（不产出 U+FFFD），解出来的字符串
+/// 看不出它曾经受损；只有在字节层面才能判定。
+fn take_complete_lines(pending: &mut Vec<u8>) -> Vec<(String, bool)> {
+    let mut lines = Vec::new();
+    while let Some(index) = pending.iter().position(|byte| *byte == b'\n') {
+        let mut raw: Vec<u8> = pending.drain(..=index).collect();
+        raw.pop(); // 去掉 \n
+        if raw.last() == Some(&b'\r') {
+            raw.pop(); // 兼容 CRLF
+        }
+        let invalid_utf8 = std::str::from_utf8(&raw).is_err();
+        lines.push((take_valid_utf8(&mut raw), invalid_utf8));
+    }
+    lines
+}
+
+/// 把读取线程的诊断追加到 `app_log_dir()/sidecar-reader.log`。
+///
+/// 用独立文件而不是复用子进程 stderr 的 `sidecar.log`：那个文件被 node 长期持有，
+/// 两边同时写容易互相影响。
+/// 任何失败都必须静默——诊断自身不能把读取线程拖死。
+fn append_reader_log(app: &tauri::AppHandle, line: &str) {
+    let dir = match app.path().app_log_dir() {
+        Ok(dir) => dir,
+        Err(_) => return,
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("sidecar-reader.log"))
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 fn spawn_sidecar(app: &tauri::AppHandle) -> Result<Sidecar, String> {
     let script = resolve_sidecar_script(app)?;
     let node = resolve_node(&script);
@@ -250,18 +351,137 @@ fn spawn_sidecar(app: &tauri::AppHandle) -> Result<Sidecar, String> {
     let last_output = std::sync::Arc::new(Mutex::new(Instant::now()));
     let reader_clock = last_output.clone();
     thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        let mut reader = BufReader::new(stdout);
+        // 跨 read 的字节缓冲：块读取往这里追加，只把"已经见到换行"的
+        // 完整行取走，半行留在这里等下一批。
+        let mut pending: Vec<u8> = Vec::new();
+        // 单块读取的目标缓冲。大小即"护栏最长可被拖延的距离"：一次 read 最多把
+        // pending 推过上限 READ_CHUNK 字节，随即在循环体末尾被判定并丢弃。
+        let mut chunk = vec![0u8; READ_CHUNK];
+        // 记账：让最终诊断能说出"共跳过 N 行"，而不是一句无从追查的"已退出"。
+        let mut skipped: u64 = 0;
+        let mut non_utf8_lines: u64 = 0;
+        // 记住最后见过的会话号，供会话无关的诊断消息归属（见 reader_diagnostic）。
+        let mut last_session: Option<String> = None;
+        // 退出原因（EOF 是正常收尾，I/O 错误才是异常）。
+        let mut exit_reason: String = "stdout 已到达结束（EOF）".to_string();
+
+        loop {
+            // 必须用**有界单块读取**（read）而不是 read_until：read_until 会在内部循环到
+            // 遇到 \n / EOF / 错误才返回，于是"活着、持续输出但永不带换行"的流会让它
+            // 永远不返回 —— 下面的内存护栏一次都执行不到，pending 无界增长（第六轮审查
+            // 探针实测：3 秒内灌入 41 MB，护栏命中的 pending 峰值始终是 0 字节）。
+            // 每次最多读 CHUNK 字节再回到护栏，护栏才有机会生效。
+            let read = match reader.read(&mut chunk) {
+                Ok(0) => break, // EOF
+                Ok(n) => n,
+                Err(error) => {
+                    // 单块读取失败（Windows 上管道被关、句柄失效等）不是"没有数据了"。
+                    // 旧实现把它当成正常结束；这里明确记录原因后再退出。
+                    exit_reason = format!("读取 stdout 失败：{error}");
+                    break;
+                }
+            };
+            pending.extend_from_slice(&chunk[..read]);
             if let Ok(mut stamp) = reader_clock.lock() {
                 *stamp = Instant::now();
             }
-            if let Ok(message) = serde_json::from_str::<Value>(&line) {
-                let _ = handle.emit("agent-message", message);
+            for (raw, invalid_utf8) in take_complete_lines(&mut pending) {
+                if invalid_utf8 {
+                    non_utf8_lines += 1;
+                }
+                match classify_sidecar_line(&raw) {
+                    SidecarLine::Empty => {}
+                    SidecarLine::Parsed(message) => {
+                        if let Some(id) = message.get("sessionId").and_then(Value::as_str) {
+                            last_session = Some(id.to_string());
+                        }
+                        let _ = handle.emit("agent-message", message);
+                    }
+                    SidecarLine::NotJson(garbage) => {
+                        // 关键：跳过并记账，**不 break**。旧实现让一行坏 JSON
+                        // （或一个非法字节）永久掐断整条事件流，前端就永久转圈。
+                        skipped += 1;
+                        if skipped <= 20 {
+                            append_reader_log(
+                                &handle,
+                                &format!(
+                                    "[reader] 跳过无法解析的一行（共 {skipped} 行）：{}",
+                                    garbage.chars().take(300).collect::<String>()
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            // 内存护栏：永不带换行的输出（如被当成文本读的二进制）不应把缓冲撑爆。
+            // 放在 take_complete_lines 之后：同一批已经收全的行绝不会被丢弃。
+            if pending.len() > SIDECAR_PENDING_LIMIT {
+                skipped += 1;
+                pending.clear();
+                append_reader_log(
+                    &handle,
+                    &format!("[reader] 未换行缓冲超过 {SIDECAR_PENDING_LIMIT} 字节，已丢弃"),
+                );
             }
         }
-        let _ = handle.emit("agent-message", serde_json::json!({
-            "type": "event",
-            "event": { "type": "error", "message": "Pi Agent sidecar 已退出" }
-        }));
+
+        // EOF 时兜底：最后一行可能没有换行符。
+        if !pending.is_empty() {
+            let invalid_utf8 = std::str::from_utf8(&pending).is_err();
+            if invalid_utf8 {
+                non_utf8_lines += 1;
+            }
+            let tail = flush_pending_lossy(&mut pending);
+            match classify_sidecar_line(&tail) {
+                SidecarLine::Empty => {}
+                SidecarLine::Parsed(message) => {
+                    if let Some(id) = message.get("sessionId").and_then(Value::as_str) {
+                        last_session = Some(id.to_string());
+                    }
+                    let _ = handle.emit("agent-message", message);
+                }
+                SidecarLine::NotJson(garbage) => {
+                    skipped += 1;
+                    append_reader_log(
+                        &handle,
+                        &format!(
+                            "[reader] 跳过无法解析的末行：{}",
+                            garbage.chars().take(300).collect::<String>()
+                        ),
+                    );
+                }
+            }
+        }
+
+        // 可见诊断：追加到 app_log_dir()/sidecar-reader.log，用户能在日志里看到原因。
+        append_reader_log(
+            &handle,
+            &format!(
+                "[reader] 读取线程结束：{exit_reason}；跳过 {skipped} 行（其中含非 UTF-8 {non_utf8_lines} 行）"
+            ),
+        );
+        // 用前端**已经理解**的事件类型（`event.type === 'error'` → finishRun）；
+        // 全新的事件类型会被静默忽略，因此不发明新类型。
+        // 这条在下面的"已退出"事件之前发出，让原因先于笼统提示到达界面。
+        // 两条都带 sessionId（reader_diagnostic），否则 activeSessionId 为空时会被
+        // 前端入口 `if (!id) return` 直接丢掉。
+        if skipped > 0 || non_utf8_lines > 0 {
+            let _ = handle.emit(
+                "agent-message",
+                reader_diagnostic(
+                    &last_session,
+                    format!(
+                        "Pi Agent 输出流结束：{exit_reason}；期间 {skipped} 行无法解析（含非 UTF-8 的 {non_utf8_lines} 行）。详情见 sidecar-reader.log。"
+                    ),
+                ),
+            );
+        }
+        // 保持既有形状/type 不变，兼容前端的 sidecar 退出处理链。
+        let _ = handle.emit(
+            "agent-message",
+            reader_diagnostic(&last_session, "Pi Agent sidecar 已退出".to_string()),
+        );
     });
     Ok(Sidecar { child, stdin, next_id: 1, last_output, outstanding: 0 })
 }
@@ -836,6 +1056,197 @@ mod tests {
         let mut pending = vec![0xE4]; // "中" 的首字节
         assert_eq!(take_valid_utf8(&mut pending), "");
         assert_eq!(pending, vec![0xE4], "半个字符应留在缓冲里等下一块");
+    }
+}
+
+#[cfg(test)]
+mod sidecar_line_tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_pending_limit_never_shrinks() {
+        // 承重常量契约（第四轮对抗性审查 R3 存活变异）：有人把这里改成与
+        // PTY_PENDING_LIMIT（1 MiB）看齐，会让"单个未换行的大 JSON 事件"被
+        // pending.clear() 静默丢弃 —— 含 base64 图片的 show_image、超长工具输出
+        // 都会凭空消失，与本次修复要解决的"事件链中断"是同一类故障。
+        // 纯常量断言即可，无需真的构造 8 MiB 数据。
+        assert!(
+            SIDECAR_PENDING_LIMIT >= 8 << 20,
+            "sidecar 事件可能远大于 1 MiB，上限不得缩水（当前 {SIDECAR_PENDING_LIMIT}）"
+        );
+    }
+
+    #[test]
+    fn valid_json_line_is_parsed() {
+        match classify_sidecar_line(r#"{"type":"response","id":7}"#) {
+            SidecarLine::Parsed(value) => {
+                assert_eq!(value.get("id").and_then(Value::as_u64), Some(7));
+            }
+            other => panic!("合法 JSON 应被解析，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blank_and_whitespace_lines_are_empty_not_failures() {
+        // NDJSON 流里空行/纯空白是合法噪声：旧实现会静默丢掉，这里必须分类为 Empty，
+        // 不能被算进"解析失败"（否则诊断会长期误报）。
+        for raw in ["", "   ", "\t", "\r"] {
+            match classify_sidecar_line(raw) {
+                SidecarLine::Empty => {}
+                other => panic!("{raw:?} 应归为 Empty，实际 {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn garbage_line_is_not_json_and_loop_continues() {
+        // 读取循环遇到 NotJson 必须跳过并继续——这里用"后续仍能解析"来固化该语义。
+        assert!(matches!(classify_sidecar_line("node:internal/modules/cjs/loader"), SidecarLine::NotJson(_)));
+        assert!(matches!(classify_sidecar_line("{不是 JSON"), SidecarLine::NotJson(_)));
+        assert!(matches!(
+            classify_sidecar_line(r#"{"type":"response","id":1}"#),
+            SidecarLine::Parsed(_)
+        ));
+    }
+
+    #[test]
+    fn invalid_utf8_bytes_do_not_panic_and_still_yield_lines() {
+        // 一个非法字节不能让整条流停摆：它所在的行仍要被切出来（非法字节被丢弃）。
+        let mut pending: Vec<u8> = Vec::new();
+        pending.extend_from_slice(b"{\"a\":1}\n");
+        pending.extend_from_slice(&[0xFF, 0xFE]);
+        pending.extend_from_slice(b"garbage\n");
+        pending.extend_from_slice(&[0x80]);
+        pending.extend_from_slice(b"{\"b\":2}\n");
+        let lines = take_complete_lines(&mut pending);
+        assert_eq!(lines.len(), 3, "三个换行 = 三行，非法字节不得吞掉后面的行");
+        assert_eq!(lines[0].1, false, "第 1 行是干净的 UTF-8");
+        assert_eq!(lines[1].1, true, "第 2 行含非法字节，应被标记");
+        assert_eq!(lines[2].1, true, "第 3 行含非法字节，应被标记");
+        assert!(matches!(classify_sidecar_line(&lines[0].0), SidecarLine::Parsed(_)));
+        assert!(matches!(classify_sidecar_line(&lines[1].0), SidecarLine::NotJson(_)));
+        assert!(matches!(classify_sidecar_line(&lines[2].0), SidecarLine::Parsed(_)));
+        assert!(pending.is_empty(), "完整行必须全部取走，不残留");
+    }
+
+    #[test]
+    fn multibyte_char_split_across_reads_is_reassembled() {
+        // "中" = E4 B8 AD，跨两次读。按字节切行 + take_valid_utf8 拼回。
+        let mut pending: Vec<u8> = Vec::new();
+        pending.extend_from_slice(b"{\"t\":\"");
+        pending.extend_from_slice(&[0xE4, 0xB8]);
+        assert!(take_complete_lines(&mut pending).is_empty(), "没有换行 → 不产出任何行");
+        pending.extend_from_slice(&[0xAD]);
+        pending.extend_from_slice(b"\"}\n");
+        let lines = take_complete_lines(&mut pending);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, "{\"t\":\"中\"}");
+        assert_eq!(lines[0].1, false, "跨块字符是合法的，不该被记为非法");
+        assert!(!lines[0].0.contains('\u{FFFD}'), "跨块字符不应被替换");
+    }
+
+    #[test]
+    fn partial_final_line_is_held_then_completed() {
+        let mut pending: Vec<u8> = Vec::new();
+        pending.extend_from_slice(b"{\"type\":\"res");
+        assert!(take_complete_lines(&mut pending).is_empty(), "半行必须扣住，不能当成一行解析");
+        assert_eq!(pending.len(), b"{\"type\":\"res".len(), "半行应原样留在缓冲里");
+        pending.extend_from_slice(b"ponse\"}\n");
+        let lines = take_complete_lines(&mut pending);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, "{\"type\":\"response\"}");
+        assert!(matches!(classify_sidecar_line(&lines[0].0), SidecarLine::Parsed(_)));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn crlf_line_endings_are_stripped() {
+        // Windows 上若有人重定向文本模式输出，行尾会带 \r，不能让它污染 JSON。
+        let mut pending: Vec<u8> = b"{\"a\":1}\r\n".to_vec();
+        let lines = take_complete_lines(&mut pending);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, "{\"a\":1}");
+        assert!(matches!(classify_sidecar_line(&lines[0].0), SidecarLine::Parsed(_)));
+    }
+
+    #[test]
+    fn many_lines_in_one_chunk_all_yield() {
+        // 回归保护：旧实现一旦遇到坏行就整条流掐断，后面所有事件永久丢失。
+        let mut pending: Vec<u8> = Vec::new();
+        for index in 0..50 {
+            pending.extend_from_slice(format!("{{\"id\":{index}}}\n").as_bytes());
+        }
+        let lines = take_complete_lines(&mut pending);
+        assert_eq!(lines.len(), 50, "同一批里的每一行都必须产出");
+        let parsed = lines
+            .iter()
+            .filter(|(line, _)| matches!(classify_sidecar_line(line), SidecarLine::Parsed(_)))
+            .count();
+        assert_eq!(parsed, 50);
+    }
+
+    #[test]
+    fn read_chunk_shrinking_would_break_the_pending_guard() {
+        // 承重契约（第六轮对抗性审查 D1）：内存护栏**只有在读取被切成有界小块时**
+        // 才可达。read_until 会在内部循环到 \n/EOF/错误才返回，于是"活着但永不带
+        // 换行"的流让护栏一次都执行不到；READ_CHUNK 必须存在且远小于上限。
+        assert!(READ_CHUNK > 0, "块读取大小必须为正");
+        assert!(
+            READ_CHUNK <= SIDECAR_PENDING_LIMIT / 4,
+            "一次 read 最多把 pending 推过上限 {READ_CHUNK} 字节，块大小必须显著小于上限（{SIDECAR_PENDING_LIMIT}）"
+        );
+    }
+
+    #[test]
+    fn reader_diagnostic_carries_session_id_when_known() {
+        // D2 回归：两条读线程诊断原先不带 sessionId，前端 `payload.sessionId ||
+        // activeSessionId; if (!id) return` 在 activeSessionId 为空时把它们整条丢掉，
+        // 用户既看不到"输出流结束"也看不到"sidecar 已退出"。
+        let payload = reader_diagnostic(&Some("s-1".to_string()), "断了".to_string());
+        assert_eq!(payload.get("sessionId").and_then(Value::as_str), Some("s-1"));
+        assert_eq!(payload.get("type").and_then(Value::as_str), Some("event"));
+        assert_eq!(
+            payload.get("event").and_then(|event| event.get("type")).and_then(Value::as_str),
+            Some("error"),
+            "必须沿用前端已理解的 event.type==='error' 形状"
+        );
+        assert_eq!(
+            payload.get("event").and_then(|event| event.get("message")).and_then(Value::as_str),
+            Some("断了")
+        );
+    }
+
+    #[test]
+    fn reader_diagnostic_omits_session_id_when_never_seen() {
+        // 从未见过 sessionId（刚启动就崩）时不能凭空编造：字段必须缺省，让前端的
+        // 兜底分支去处理（console.warn），而不是把诊断张冠李戴到某个会话头上。
+        let payload = reader_diagnostic(&None, "sidecar 已退出".to_string());
+        assert!(payload.get("sessionId").is_none(), "无会话归属时不得带 sessionId");
+        assert_eq!(
+            payload.get("event").and_then(|event| event.get("message")).and_then(Value::as_str),
+            Some("sidecar 已退出")
+        );
+    }
+
+    #[test]
+    fn session_id_is_tracked_from_forwarded_messages() {
+        // 读者通过 `message.get("sessionId")` 记住归属；这条固化判定本身，
+        // 避免有人把它改成只看 `id`（响应消息用的是 id，事件才用 sessionId）。
+        let mut last_session: Option<String> = None;
+        for raw in [
+            r#"{"type":"response","id":1}"#,
+            r#"{"type":"event","sessionId":"s-9","event":{"type":"agent_start"}}"#,
+        ] {
+            match classify_sidecar_line(raw) {
+                SidecarLine::Parsed(message) => {
+                    if let Some(id) = message.get("sessionId").and_then(Value::as_str) {
+                        last_session = Some(id.to_string());
+                    }
+                }
+                other => panic!("{raw} 应解析为 JSON，实际 {other:?}"),
+            }
+        }
+        assert_eq!(last_session.as_deref(), Some("s-9"));
     }
 }
 
