@@ -10,8 +10,8 @@
 | 阶段 | 状态 | 备注 |
 |---|---|---|
 | **P0 止血（6 项）** | ✅ **已完成** | 经 5 位独立审查员审查 |
-| **第 0 批扩展修复（9 项）** | 🔶 **5/9** | 0-1、0-2、0-3、0-4、0-8 已完成；剩 0-5、0-6（部分）、0-7、0-9 |
-| **P1 地基** | 🔶 部分完成 | 测试地基已建（108 条：含 6 条 sidecar 集成）；**typecheck 已引入**（0-2）；App.svelte 未拆（0-5） |
+| **第 0 批扩展修复（9 项）** | ✅ **9/9** | 0-1～0-9 全部完成（0-5 拆分经批次 A/B/C 落地，见下方明细） |
+| **P1 地基** | ✅ 完成 | 测试地基（655 条，`npm run verify` 全绿）；**typecheck 已引入**（0-2）；**App.svelte 已拆**（0-5：3668→3094 行） |
 | **P2 正确性（权限引擎）** | ✅ **0-3 已完成** | `sidecar/permissions/` 五模块 + 门控扩展；28 条测试 |
 | **P3 / P4** | ⏸ 待排期 | 见 `04-feature-menu.md` |
 
@@ -23,7 +23,7 @@
 | 0-2 typecheck | ✅ | `typescript@5` + `svelte-check@4` + `tsconfig.json` + `npm run verify`；**首跑抓到 4 个真实潜伏错误**（含 `AgentEnvelope` 未声明——与 `abandoned` 同类）；变异验证能抓到未定义变量 |
 | 0-3 权限引擎 | ✅ | `sidecar/permissions/` 五模块；28 条测试；`cd x && rm -rf y`、`echo $(…)`、`sh -c`、`curl \| sh` 全部拦住；临时区 fail-safe 豁免 |
 | 0-4 uiContext | ✅ | 真实 `Theme` 实例（percho #28 的教训）；未实现方法记日志去重；通用对话框桥 + 前端 UI；13 条测试 |
-| 0-5 拆 App.svelte | ⏸ | 2700+ 行 |
+| 0-5 拆 App.svelte | ✅ | **批次 A/B/C 三轮拆分**：纯逻辑（app-models.ts/app-files.ts）→ 五面板组件（GitPanel/TodoPanel/SubRunsPanel/SplitDialog/SubRunOverlay/FilePanel）→ Composer（Composer.svelte + composer-logic.ts）；3668→3094 行；每批 655 条 verify 全绿 + 对抗审查变异重放 |
 | 0-6 打包/CI | ✅ | `prepare-resources.mjs` 自动发现 .ts + 自检收紧；**GitHub Actions CI**（前端 check/test/自检/build + Rust 测试，含 timeout-minutes 与 permissions:read）；Rust job 干净克隆 P0 已修（tauri-build resources glob 0 匹配 panic）；承重断言改为**行为验证**（真实启动打包产物，替代可被绕过的源码 grep，审查证实 6/11 逃逸） |
 
 ### 第 1 批进度（percho 特性）
@@ -33,7 +33,7 @@
 | 1-1 权限规则引擎 | ✅ | 与 0-3 同源完成（`sidecar/permissions/` 五模块 + 门控扩展 + 项目级记忆） |
 | 1-2 上下文蒸发 | ✅ | **SDK 原生 auto-compaction 默认开启**（`compaction?.enabled ?? true` 已核实）——"蒸发"核心能力天然具备；本轮补齐可见性与控制权：`compaction_start/end` 事件接 UI（"正在压缩上下文"状态行，此前透传被忽略用户只见卡住）+ `get/set_auto_compaction` RPC + finishRun 清理 |
 | 1-3 show_image | ✅ | `sidecar/tools/show-image.ts`：图片只走 `details` 不进模型上下文；9 条测试；前端对话区渲染 + 点击放大 |
-| 1-4 子代理体系 | 🔶 | 已有 `/scout` + 并行拆分；只读检视/per-agent 模型档位待补（对应 U5） |
+| 1-4 子代理体系 | ✅ | `/scout` + 并行拆分；只读检视（事件按 sessionId 路由到子运行槽，SubRunsPanel/SubRunOverlay 实时浮层）+ per-agent 模型/思考档位（AgentDef.model/thinking spawn 下发）均已随 U5 落地 |
 | 1-5 UI 插件系统 | ✅ | 声明式插件协议（`ui-plugins.ts`：slot/component/tone/fields，数据非代码，前端永不 eval 插件 JS）；HTML 白名单清洗（剥全部属性，a/script/iframe 整体拒绝）；`PluginCard.svelte` 渲染 + timeline 槽位接线；E2E 实测扩展 `pi.sendMessage(customType: "ui.plugin", triggerTurn:false)` → 事件流 → 前端数据完整；10 条协议测试；开发指南 `docs/audit/05-ui-plugins.md` |
 | 1-6 局域网可写 | ✅ | **安全修复先行**：token 从 URL query 改为 `x-pi-token` header（API 不再接受 query token，退出浏览器历史；引导页保留 query 进入）；`lan.mjs` 新增可写模式（默认关闭）：`/api/prompt|steer|stop|confirm` 四接口 + 待决权限确认枚举（`pendingConfirmsBySession`，与主界面同语义）；设置页"允许远程写入"开关（切换重新生成 token）；页面升级为遥控界面（选中会话/发消息/停止/确认权限卡）；**5 条 E2E**（只读 403/鉴权/状态语义/请求体校验/确认回答） |
 | 1-7 统一报错系统 | ✅ | 错误卡 + 一键重试桥（已有）；**新增自动重试状态行**（`auto_retry_start/end` 事件 → 显示"自动重试（第 N 次）· 原因"，此前用户只看到卡住） |
