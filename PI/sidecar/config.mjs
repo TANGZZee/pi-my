@@ -118,13 +118,17 @@ export function providerCards(providers, auth, catalog) {
   return [...names].sort().map((name) => {
     const config = providers[name] || {}
     const models = Array.isArray(config.models) ? config.models : catalog.filter((item) => item.provider === name)
-    const key = config.apiKey || auth?.[name]?.key || ''
+    const cred = auth?.[name]
+    // OAuth 凭据（refresh/access 结构或显式 type:'oauth'）不含 key 字段——不能以 key 判定配置态
+    const oauth = Boolean(cred && (cred.type === 'oauth' || (typeof cred === 'object' && typeof cred.refresh === 'string' && cred.refresh)))
+    const key = config.apiKey || cred?.key || ''
     return {
       provider: name,
       baseUrl: config.baseUrl || '',
       api: config.api || '',
-      configured: Boolean(key),
-      keyHint: maskKey(key),
+      oauth,
+      configured: Boolean(key) || oauth,
+      keyHint: key ? maskKey(key) : oauth ? 'OAuth' : '',
       modelCount: models.length,
       models: models.map((model) => ({
         id: model.id || model.name,

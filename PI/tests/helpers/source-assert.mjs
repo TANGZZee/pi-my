@@ -176,8 +176,11 @@ export function shapeWithLiteralMask(rawSource) {
  * 这是"存在某串"断言的最小修补：形状仍可包含字面量（事件名、请求名），
  * 但整段形状被搬进字符串里冒充的诱饵一律不算命中。
  */
-export function indexOfCode(shape, literal, needle) {
-  let from = 0
+export function indexOfCode(shape, literal, needle, start = 0) {
+  // start 是可选形参，必须**显式**声明：早期版本漏了它，调用方多传的第 4 个实参被
+  // JS 静默丢弃，于是"从事件入口往后找"变成了"全文件找"——命中的是文件早段的同名
+  // 调用（例如 clearProviderError 里的 cancel），断言恒真，删掉真正那一处的变异全部存活。
+  let from = start
   for (;;) {
     const at = shape.indexOf(needle, from)
     if (at < 0) return -1

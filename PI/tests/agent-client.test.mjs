@@ -81,9 +81,17 @@ test('agent 客户端：全量能力抽查（记忆/导出/文件分块）', asy
       fs.rmSync(bigFile, { force: true })
     }
 
-    // MCP 列表（2-10）
+    // MCP 列表（2-10）：T2⑥ 后响应升级为 servers 数组（SDK 校验路径），
+    // 旧版 sidecar 响应（global/project）仍是合法降级形状
     const mcp = await client.request('mcp_list', {})
-    assert.ok(Array.isArray(mcp.global))
+    assert.ok(Array.isArray(mcp.servers) || Array.isArray(mcp.global), 'mcp_list 返回 servers（新）或 global（旧降级）')
+    if (Array.isArray(mcp.servers)) {
+      assert.ok(Array.isArray(mcp.errors), 'SDK 路径必须透传 errors')
+      for (const server of mcp.servers) {
+        assert.equal(typeof server.enabled, 'boolean')
+        assert.ok(typeof server.exposure === 'string' && server.exposure.length > 0)
+      }
+    }
 
     // 导出（2-5）
     await client.createSession('hermes-export')
