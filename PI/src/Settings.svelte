@@ -16,7 +16,7 @@
   type ImageGenConfig = { baseUrl: string; apiKey: string; model: string; size: string }
   type SettingsInfo = { node: string; sdk: string; agentDir: string; sessionDir: string; authProviders: string[]; providers?: ProviderInfo[] }
   type ArchivedSession = { id: string; title: string; file?: string; cwd?: string; modifiedAt?: number; archived?: boolean }
-  type Tab = 'general' | 'appearance' | 'notify' | 'keys' | 'proxy' | 'agents' | 'imagegen' | 'git' | 'skills' | 'extensions' | 'plugins' | 'mcp' | 'context' | 'failover' | 'store' | 'vision' | 'usage' | 'archived' | 'storage' | 'lan' | 'pet' | 'logs' | 'about'
+  type Tab = 'general' | 'appearance' | 'notify' | 'keys' | 'proxy' | 'agents' | 'imagegen' | 'git' | 'skills' | 'extensions' | 'plugins' | 'mcp' | 'context' | 'failover' | 'memory' | 'store' | 'vision' | 'usage' | 'archived' | 'storage' | 'lan' | 'pet' | 'logs' | 'about'
   type AgentUpdateInfo = { current: string; latest: string; installedVersion?: string; updateAvailable: boolean; url: string; repoUrl?: string; source?: string; sourceLabel?: string; updated?: boolean; restartRequired?: boolean; message?: string; checkedAt?: number }
 
   export let open = false
@@ -50,7 +50,7 @@
 
   const NAV: Array<{ group: string; items: Array<[Tab, string]> }> = [
     { group: '基础', items: [['general', '通用'], ['appearance', '外观'], ['notify', '通知'], ['keys', '快捷键'], ['proxy', '代理']] },
-    { group: '能力', items: [['agents', '子代理'], ['imagegen', '生图'], ['context', '上下文'], ['failover', '故障转移'], ['git', 'Git']] },
+    { group: '能力', items: [['agents', '子代理'], ['imagegen', '生图'], ['context', '上下文'], ['failover', '故障转移'], ['memory', '记忆'], ['git', 'Git']] },
     { group: '生态', items: [['skills', '技能'], ['extensions', '扩展'], ['plugins', '插件 UI'], ['mcp', 'MCP'], ['store', '商店'], ['vision', '视觉桥'], ['pet', '桌宠'], ['lan', '局域网']] },
     { group: '维护', items: [['usage', '用量'], ['archived', '已归档的聊天'], ['storage', '存储'], ['logs', '日志'], ['about', '关于']] }
   ]
@@ -110,7 +110,7 @@
   let trayMinimize = true
   let trayMinimizeBusy = false
   // 2-10 MCP 服务器管理状态；T2⑥ 原生化：SDK 校验结果（servers/errors）+ 启停/暴露级别编辑
-  type McpServer = { name: string; scope: string; command: string; transport: string; args: string[]; enabled: boolean; exposure: string; oauth?: Record<string, unknown> | null; source?: string }
+  type McpServer = { name: string; scope: string; command: string; transport: string; args: string[]; enabled: boolean; exposure: string; oauth?: Record<string, unknown> | null; source?: string; override?: string | null }
   type McpListResult = { servers?: McpServer[]; errors?: string[]; projectTrusted?: boolean; globalPath?: string; projectPath?: string; global?: McpServer[]; project?: McpServer[] }
   let mcpServers: McpServer[] = []
   let mcpErrors: string[] = []
@@ -119,6 +119,17 @@
   let mcpBusy = false
   let mcpNotice = ''
   let mcpTestStatus: Record<string, { busy?: boolean; ok?: boolean; message?: string }> = {}
+  // 记忆页（内置 LTM 记忆库，memory_* RPC）：列表 + 搜索 + 新增 + 删除
+  type MemoryEntry = { id: number; content: string; tags: string[]; createdAt: number; updatedAt: number; supersededBy?: number | null }
+  let memories: MemoryEntry[] = []
+  let memoryQuery = ''
+  let memoryDraft = ''
+  let memoryTagsDraft = ''
+  let memoryBusy = false
+  let memoryNotice = ''
+  let memoryMode: 'browse' | 'search' = 'browse'
+  // 长记忆展开状态（keyed by entry.id；超过 400 字符默认折叠）
+  let memoryExpanded: Record<number, boolean> = {}
   // T2⑥ 暴露级别选项（与 SDK McpExposure 一致；codemode 为默认）
   const MCP_EXPOSURES: Array<['codemode' | 'deferred' | 'direct' | 'hidden', string]> = [
     ['codemode', 'codemode（脚本调用）'],
@@ -414,10 +425,10 @@
   // T2⑧ MCP OAuth 跟进：每服务器 OAuth 编辑态（仅 http 型服务器展示）。
   // 保存走 mcp_oauth_patch 整组替换；字段留空即不下发，全空 = 清除 oauth 组。
   // 回读合并在 loadMcpServers：只为尚无草稿的键初始化，不覆盖未保存的编辑。
-  type McpOauthDraft = { clientId: string; clientSecret: string; callbackPort: string; callbackUrl: string; scope: string; clientName: string; authServerMetadataUrl: string }
+  type McpOauthDraft = { clientId: string; clientSecret: string; callbackPort: string; callbackUrl: string; scope: string; clientName: string; authServerMetadataUrl: string; clientRegistration: string }
   let mcpOauth: Record<string, McpOauthDraft> = {}
   let mcpOauthBusy: Record<string, boolean> = {}
-  const EMPTY_MCP_OAUTH: McpOauthDraft = { clientId: '', clientSecret: '', callbackPort: '', callbackUrl: '', scope: '', clientName: '', authServerMetadataUrl: '' }
+  const EMPTY_MCP_OAUTH: McpOauthDraft = { clientId: '', clientSecret: '', callbackPort: '', callbackUrl: '', scope: '', clientName: '', authServerMetadataUrl: '', clientRegistration: '' }
 
   function mcpOauthDraftOf(server: McpServer): McpOauthDraft {
     const key = server.scope + ':' + server.name
@@ -432,6 +443,7 @@
       scope: typeof o.scope === 'string' ? o.scope : '',
       clientName: typeof o.clientName === 'string' ? o.clientName : '',
       authServerMetadataUrl: typeof o.authServerMetadataUrl === 'string' ? o.authServerMetadataUrl : '',
+      clientRegistration: o.clientRegistration === 'dcr' || o.clientRegistration === 'cimd' ? o.clientRegistration : '',
     }
     mcpOauth = { ...mcpOauth, [key]: draft }
     return draft
@@ -460,6 +472,12 @@
         const value = draft[field].trim()
         if (value) oauth[field] = value
       }
+      // SDK 1.0.1 跟进：clientRegistration 枚举（dcr=动态注册 / cimd=元数据文档）；留空不下发
+      const registration = draft.clientRegistration.trim()
+      if (registration) {
+        if (registration !== 'dcr' && registration !== 'cimd') throw new Error('clientRegistration 必须是 dcr 或 cimd')
+        oauth.clientRegistration = registration
+      }
       await rpc('mcp_oauth_patch', { scope: server.scope, name: server.name, oauth: Object.keys(oauth).length ? oauth : null })
       mcpNotice = ''
     } catch (error) {
@@ -486,6 +504,70 @@
     // open_dir 期望目录：传 mcp.json 的父目录
     const dir = file.replace(/[\\/][^\\/]+$/, '')
     try { await rpc('open_dir', { path: dir }) } catch { /* ignore */ }
+  }
+
+  // 记忆页：内置 LTM 库（SQLite FTS5，sidecar memory_* RPC）。列表与搜索共用
+  // memoryBusy 门闩；空查询 = 全量浏览（memory_list），有查询 = FTS5 检索（memory_search）。
+  async function loadMemories() {
+    if (!rpc || memoryBusy) return
+    memoryBusy = true
+    try {
+      const q = memoryQuery.trim()
+      if (q) {
+        const result = await rpc('memory_search', { query: q, limit: 100 }) as { memories?: MemoryEntry[] } | null
+        memories = result?.memories ?? []
+        memoryMode = 'search'
+      } else {
+        const result = await rpc('memory_list', { limit: 200 }) as { memories?: MemoryEntry[] } | null
+        memories = result?.memories ?? []
+        memoryMode = 'browse'
+      }
+      memoryNotice = ''
+    } catch (error) {
+      memoryNotice = error instanceof Error ? error.message : '记忆读取失败'
+    } finally {
+      memoryBusy = false
+    }
+  }
+
+  async function addMemory() {
+    if (!rpc) return
+    const content = memoryDraft.trim()
+    if (!content) { memoryNotice = '记忆内容不能为空'; return }
+    if (memoryBusy) return
+    memoryBusy = true
+    try {
+      const tags = memoryTagsDraft.split(/[,，\s]+/).map((t) => t.trim()).filter(Boolean)
+      await rpc('memory_remember', { content, tags })
+      memoryDraft = ''
+      memoryTagsDraft = ''
+      memoryNotice = ''
+      memoryQuery = ''
+      memoryMode = 'browse' // 已清空查询，列表回到浏览态（计数行与数据同步）
+      await loadMemories()
+    } catch (error) {
+      memoryNotice = error instanceof Error ? error.message : '记忆写入失败'
+    } finally {
+      memoryBusy = false
+    }
+  }
+
+  async function deleteMemoryEntry(entry: MemoryEntry) {
+    if (!rpc || memoryBusy) return
+    memoryBusy = true
+    try {
+      await rpc('memory_delete', { id: entry.id })
+      memoryNotice = ''
+      await loadMemories()
+    } catch (error) {
+      memoryNotice = error instanceof Error ? error.message : '记忆删除失败'
+    } finally {
+      memoryBusy = false
+    }
+  }
+
+  function fmtMemoryTime(ts: number): string {
+    try { return new Date(ts).toLocaleString() } catch { return String(ts) }
   }
 
   onMount(() => {
@@ -534,6 +616,7 @@
   $: if (open && tab === 'proxy') void loadProxy()
   $: if (open && (tab === 'skills' || tab === 'extensions')) void loadEco()
   $: if (open && tab === 'mcp') void loadMcpServers()
+  $: if (open && tab === 'memory') void loadMemories()
   $: if (open && tab === 'vision') void loadVision()
   $: if (open && tab === 'lan') void loadLan()
   $: if (open && tab === 'logs') void loadLogs()
@@ -1486,11 +1569,18 @@
                         <label>scope<input bind:value={oauthDraft.scope} placeholder="空格分隔" /></label>
                         <label>clientName<input bind:value={oauthDraft.clientName} placeholder="默认 pi" /></label>
                         <label class="span2">authServerMetadataUrl<input bind:value={oauthDraft.authServerMetadataUrl} placeholder="https://…/.well-known/oauth-authorization-server" /></label>
+                        <label class="span2">clientRegistration
+                          <select bind:value={oauthDraft.clientRegistration}>
+                            <option value="">默认（dcr 动态注册）</option>
+                            <option value="dcr">dcr（动态客户端注册）</option>
+                            <option value="cimd">cimd（Client ID Metadata Document）</option>
+                          </select>
+                        </label>
                       </div>
                       <button class="choice" disabled={mcpOauthBusy[server.scope + ':' + server.name]} on:click={() => void saveMcpOAuth(server)}>{mcpOauthBusy[server.scope + ':' + server.name] ? '保存中…' : (server.oauth ? '保存 OAuth（已配置）' : '保存 OAuth')}</button>
                     </div>
                   {/if}
-                  <p class="desc">状态：{server.enabled ? '已启用' : '已禁用'} · 暴露级别：{server.exposure}{mcpTestStatus[server.name]?.message ? ` · ${mcpTestStatus[server.name].message}` : ''}</p>
+                  <p class="desc">状态：{server.enabled ? '已启用' : '已禁用'} · 暴露级别：{server.exposure}{server.override ? ' · 项目级覆盖' : ''}{mcpTestStatus[server.name]?.message ? ` · ${mcpTestStatus[server.name].message}` : ''}</p>
                   {#if mcpTestStatus[server.name]?.message}<p class="desc" class:error={!mcpTestStatus[server.name]?.ok}>{mcpTestStatus[server.name].message}</p>{/if}
                 </div>
               {:else}
@@ -1500,6 +1590,53 @@
                 <button class="choice" on:click={() => void loadMcpServers()}>刷新</button>
                 <button class="choice" on:click={() => void openMcpFile(mcpGlobalPath)}>打开配置文件</button>
               </div>
+            </section>
+          {:else if tab === 'memory'}
+            <!-- 内置长期记忆库管理（2-2 memory_* RPC）：浏览/搜索/新增/删除 -->
+            <section class="group">
+              <h3>长期记忆</h3>
+              <p class="desc">内置记忆库（SQLite FTS5，按项目隔离），模型可通过 memory 工具读写。存储于 <code>~/.pi/agent/memory/ltm.db</code>；删除为真删，取代链中的旧条目会标注「已被取代」。</p>
+              {#if memoryBusy}<p class="desc">处理中…</p>{/if}
+              {#if memoryNotice}<p class="desc error">{memoryNotice}</p>{/if}
+              <div class="todo-add store-search-row" style="padding:12px 0 0">
+                <input bind:value={memoryQuery} placeholder="搜索记忆（留空 = 全部）" on:keydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void loadMemories() } }} />
+                <button class="ghost" on:click={() => void loadMemories()}>{memoryQuery.trim() ? '搜索' : '刷新'}</button>
+                {#if memoryQuery.trim()}<button class="ghost" on:click={() => { memoryQuery = ''; void loadMemories() }}>清空</button>{/if}
+              </div>
+              <div class="todo-add" style="padding:10px 0">
+                <input bind:value={memoryDraft} placeholder="新增记忆内容…" on:keydown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void addMemory() } }} />
+                <input bind:value={memoryTagsDraft} placeholder="标签（逗号分隔，可空）" style="max-width:220px" on:keydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void addMemory() } }} />
+                <button class="ghost" on:click={() => void addMemory()}>添加</button>
+              </div>
+              {#if memoryMode === 'search'}
+                <p class="desc">搜索「{memoryQuery}」命中 {memories.length} 条</p>
+              {:else if memories.length}
+                <p class="desc">共 {memories.length} 条（按更新时间排序，最多 200 条）</p>
+              {/if}
+              {#each memories as entry (entry.id)}
+                <div class="p-card">
+                  <div class="p-head">
+                    <span class="p-name">#{entry.id}</span>
+                    {#if entry.supersededBy}<span class="badge">已被 #{entry.supersededBy} 取代</span>{/if}
+                    {#each entry.tags as tag (tag)}<span class="badge">{tag}</span>{/each}
+                    <button class="ghost" on:click={() => void deleteMemoryEntry(entry)}>删除</button>
+                  </div>
+                  <!-- 记忆内容全文：超过 6 行折叠，点击展开 -->
+                  {#if entry.content.length > 400}
+                    <p class="memory-content" class:collapsed={memoryExpanded[entry.id] !== true}>{entry.content}</p>
+                    <button class="ghost memory-toggle" on:click={() => { memoryExpanded[entry.id] = memoryExpanded[entry.id] !== true }}>
+                      {memoryExpanded[entry.id] === true ? '收起' : '展开全文'}
+                    </button>
+                  {:else}
+                    <p class="memory-content">{entry.content}</p>
+                  {/if}
+                  <p class="desc">更新于 {fmtMemoryTime(entry.updatedAt)}</p>
+                </div>
+              {:else}
+                <p class="muted">{memoryQuery.trim() ? '没有命中的记忆。' : '记忆库为空。'}</p>
+              {/each}
+              <h4>关于 pi-memory 扩展</h4>
+              <p class="desc">设置 → 扩展里的 <code>pi-memory</code>（npm 包）是**另一套**面向模型的 Markdown 记忆（<code>~/.pi/agent/memory/MEMORY.md</code>、SCRATCHPAD.md、daily 日志，可选 qmd 语义搜索），与本页的内置 SQLite 记忆库相互独立、并行工作，卸载不影响本页数据。</p>
             </section>
           {:else if tab === 'store'}
             <section class="group">
@@ -1830,6 +1967,9 @@
   .mcp-oauth-grid input { padding: 5px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--raised); color: var(--text); font-size: 12px; }
   .mcp-oauth-grid input::placeholder { color: var(--muted); }
   .mcp-oauth .choice { min-width: 0; }
+  .memory-content { white-space: pre-wrap; word-break: break-word; font-size: 12px; color: var(--text); background: var(--surface-2, transparent); border: 1px solid var(--border-2); border-radius: 6px; padding: 8px 10px; margin: 8px 0 6px; max-height: 400px; overflow-y: auto; }
+  .memory-content.collapsed { max-height: 132px; overflow: hidden; }
+  .memory-toggle { margin: 0 0 6px; }
   .skin-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
   .skin-card { display: flex; flex-direction: column; align-items: stretch; gap: 4px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--raised); text-align: left; }
   .skin-card.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
