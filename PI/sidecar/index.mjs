@@ -1983,6 +1983,8 @@ async function handle(request) {
             transport: s?.config?.command ? 'stdio' : s?.config?.url ? 'http' : 'unknown',
             command: String(s?.config?.command || s?.config?.url || ''),
             args: Array.isArray(s?.config?.args) ? s.config.args : [],
+            // SDK 1.0.1 项目级覆盖：该全局服务器被项目 .pi/mcp.json 覆盖时的项目文件路径
+            override: typeof s?.override === 'string' && s.override ? s.override : null,
             // T2⑧ MCP OAuth 加固跟进：透出 oauth 配置供 UI 回读合并
             // （SDK McpServerConfigPatch 只收 enabled/exposure，oauth 编辑走 mcp_oauth_patch 整组写入）。
             oauth: s?.config?.oauth && typeof s.config.oauth === 'object' ? s.config.oauth : null,
@@ -2005,6 +2007,8 @@ async function handle(request) {
             exposure: String(server?.exposure || 'codemode'),
             oauth: server?.oauth && typeof server.oauth === 'object' ? server.oauth : null,
             source: file,
+            // SDK 1.0.1 项目级覆盖：无 command/url/type 的项目条目是纯覆盖（enabled/exposure/toolExposure）
+            override: file !== globalMcpFile && !server?.command && !server?.url && !server?.type && !server?.baseUrl ? globalMcpFile : null,
           }))
         } catch {
           return []
@@ -2077,7 +2081,12 @@ async function handle(request) {
     if (type === 'mcp_test') {      // 2-10：连接测试 —— stdio 型：起进程，等它输出任意内容或 3 秒退出码判断
       const server = payload.server || {}
       const command = String(server.command || '').trim()
-      if (!command) { reply(id, { ok: false, message: '缺少 command' }); return }
+      // SDK 1.0.1 项目级覆盖：无 command/url/type 的纯覆盖条目不定义进程，冒烟测试无从谈起 ——
+      // 如实返回「覆盖条目」而不是伪报「缺少 command」失败。
+      if (!command) {
+        if (server.override) { reply(id, { ok: true, message: `项目级覆盖条目（覆盖 ${server.override} 定义的全局服务器），无本地进程可测` }); return }
+        reply(id, { ok: false, message: '缺少 command' }); return
+      }
       const started = Date.now()
       try {
         // 只做"进程能否启动"的冒烟测试：不实现完整 MCP 握手（协议由 adapter 负责）
@@ -2118,7 +2127,8 @@ async function handle(request) {
         ? Object.fromEntries(Object.entries(oauthIn).filter(([, v]) => v !== undefined))
         : null
       if (oauth) {
-        const allowed = ['clientId', 'clientSecret', 'callbackPort', 'callbackUrl', 'scope', 'clientName', 'authServerMetadataUrl']
+        // SDK 1.0.1 跟进：clientRegistration 枚举（dcr=动态客户端注册，cimd=Client ID Metadata Document）
+        const allowed = ['clientId', 'clientSecret', 'callbackPort', 'callbackUrl', 'scope', 'clientName', 'authServerMetadataUrl', 'clientRegistration']
         for (const key of Object.keys(oauth)) {
           if (!allowed.includes(key)) throw new Error(`非法 oauth 字段：${key}（允许 ${allowed.join('/')}）`)
         }
@@ -2127,6 +2137,9 @@ async function handle(request) {
           if (oauth[key] !== undefined && (typeof oauth[key] !== 'string' || !oauth[key].trim())) {
             throw new Error(`oauth.${key} 必须是非空字符串`)
           }
+        }
+        if (oauth.clientRegistration !== undefined && oauth.clientRegistration !== 'dcr' && oauth.clientRegistration !== 'cimd') {
+          throw new Error('oauth.clientRegistration 必须是 dcr 或 cimd')
         }
         if (oauth.callbackPort !== undefined) {
           const port = Number(oauth.callbackPort)

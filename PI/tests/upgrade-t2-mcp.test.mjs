@@ -79,6 +79,8 @@ test('mcp_list：SDK 路径走 loadMcpConfig 且 projectTrusted 透传 + errors 
   // T2⑧：oauth 必须透出 UI（SDK McpServerConfigPatch 写不了 oauth，编辑走 mcp_oauth_patch）
   // M19 修补：字面量保留视图可被字符串诱饵顶替 —— 用防诱饵计数锁真实代码区的完整三元式。
   assert.equal(countCodeHits(sidecarRaw, "oauth:s?.config?.oauth&&typeofs.config.oauth==='object'?s.config.oauth:null"), 1, 'SDK 路径必须透出 oauth 字段（真实代码区恰好一处）')
+  // SDK 1.0.1 项目级覆盖：McpServerEntry.override（项目 .pi/mcp.json 路径）必须透出 UI
+  assert.ok(section.includes("override:typeofs?.override==='string'&&s.override?s.override:null"), 'SDK 路径必须透出 override（项目级覆盖标识）')
 })
 
 test('mcp_list：保留旧版降级分支（语义锁定）——mcpConfigApi 为 null 时手写读取', () => {
@@ -87,6 +89,23 @@ test('mcp_list：保留旧版降级分支（语义锁定）——mcpConfigApi �
   assert.ok(section.includes('global:awaitread(globalMcpFile)'), '降级响应必须保留 global/project 兼容字段')
   // M20 修补：needle 必须含判别值与 null 尾（截断前缀时 'object' 换成 'string' 测试仍绿）
   assert.equal(countCodeHits(sidecarRaw, "oauth:server?.oauth&&typeofserver.oauth==='object'?server.oauth:null"), 1, '降级路径同样必须透出 oauth 字段（完整三元式）')
+  // SDK 1.0.1 项目级覆盖（降级路径）：项目文件中无 command/url/type 的条目 = 纯覆盖，透出标识
+  assert.equal(countCodeHits(sidecarRaw, "override:file!==globalMcpFile&&!server?.command&&!server?.url&&!server?.type&&!server?.baseUrl?globalMcpFile:null"), 1, '降级路径必须识别纯覆盖条目（真实代码区恰好一处）')
+})
+
+test('mcp_test：SDK 1.0.1 覆盖条目跳过进程冒烟（无 command 时如实报「覆盖」而非失败）', () => {
+  assert.equal(countCodeHits(sidecarRaw, "type==='mcp_test'"), 1, 'mcp_test 分支缺失或被诱饵污染')
+  const section = sectionOf("type==='mcp_test'", "type==='mcp_oauth_patch'")
+  // 项目级覆盖条目：无本地进程可测 —— 如实回 ok + 说明，不伪报「缺少 command」失败
+  assert.ok(section.includes('if(server.override)'), '覆盖条目分支缺失')
+  assert.ok(section.includes('项目级覆盖条目'), '覆盖条目回包说明缺失')
+  // M-I 修补：覆盖条目必须回 ok:true（翻转成 ok:false 会把「无进程可测」误报成连接失败）
+  assert.ok(section.includes('if(server.override){reply(id,{ok:true,'), '覆盖条目必须回 ok:true（如实报告「无需冒烟」而非失败）')
+  assert.ok(section.includes("message:'缺少command'") || section.includes("'缺少command'"), '原「缺少 command」失败路径必须保留（非覆盖条目仍报失败）')
+  // 覆盖分支必须在缺 command 守卫之内（有 command 的正常条目照旧冒烟）
+  const guardAt = section.indexOf('if(!command){')
+  const overrideAt = section.indexOf('if(server.override)')
+  assert.ok(guardAt >= 0 && overrideAt > guardAt, '覆盖分支必须在 if(!command) 守卫之内（有进程条目照旧冒烟）')
 })
 
 // ---------- sidecar：mcp_patch 白名单与守卫 ----------
@@ -146,9 +165,11 @@ test('mcp_oauth_patch：缺名/非法字段/坏端口/凭据配对全部 throw�
   assert.equal(countCodeHits(sidecarRaw, "type==='mcp_oauth_patch'"), 1, 'mcp_oauth_patch 分支缺失或被诱饵污染')
   const section = sectionOf("type==='mcp_oauth_patch'", "type==='get_project_trust'")
   assert.ok(section.includes('!name)throw'), '缺服务器名必须 throw')
-  // 字段白名单：七个 SDK McpOAuthConfig 字段之外一律拒绝
-  assert.ok(section.includes("['clientId','clientSecret','callbackPort','callbackUrl','scope','clientName','authServerMetadataUrl']"), 'oauth 字段白名单缺失')
+  // 字段白名单：SDK McpOAuthConfig 字段之外一律拒绝（1.0.1 起含 clientRegistration）
+  assert.ok(section.includes("['clientId','clientSecret','callbackPort','callbackUrl','scope','clientName','authServerMetadataUrl','clientRegistration']"), 'oauth 字段白名单缺失（须含 SDK 1.0.1 clientRegistration）')
   assert.ok(section.includes('非法oauth字段'), '非法 oauth 字段必须报错')
+  // SDK 1.0.1 跟进：clientRegistration 枚举校验（dcr=动态注册 / cimd=元数据文档，其他值拒绝）
+  assert.ok(section.includes("oauth.clientRegistration!=='dcr'&&oauth.clientRegistration!=='cimd'"), 'clientRegistration 枚举校验缺失（dcr|cimd 之外必须 throw）')
   // 端口：1-65535 整数
   assert.ok(section.includes('!Number.isInteger(port)||port<=0||port>65535'), 'callbackPort 校验缺失')
   // 凭据配对：静态客户端注册必须 clientId/clientSecret 成对
@@ -267,6 +288,15 @@ test('Settings MCP 页：T2⑧ OAuth 表单 —— http 型服务器展示 + 草
   // M18 修补：disabled 必须断言完整 keyed 形态（裸 mcpOauthBusy[key] 会被门闩行恒真满足）
   assert.ok(settingsA.includes('disabled={mcpOauthBusy[server.scope+\':\'+server.name]}'), '保存按钮 disabled 必须用 scope+name 复合键（裸键恒真断言无效）')
   assert.ok(settingsA.includes('保存中…'), '保存按钮缺 busy 文案')
+  // SDK 1.0.1 跟进：clientRegistration 枚举表单（dcr/cimd）+ 前端校验 + 草稿回读
+  assert.ok(settingsA.includes('clientRegistration'), 'Settings 缺 clientRegistration 表单')
+  assert.ok(settingsA.includes("o.clientRegistration==='dcr'||o.clientRegistration==='cimd'"), '草稿回读必须校验枚举（dcr|cimd 之外的存量值落入默认空）')
+  assert.ok(settingsA.includes("registration!=='dcr'&&registration!=='cimd'"), '前端必须拦截非法 clientRegistration')
+  assert.ok(settingsA.includes('oauth.clientRegistration=registration'), '合法值必须下发 oauth.clientRegistration')
+  assert.ok(settingsA.includes('<optionvalue="cimd">'), '缺 cimd 选项')
+  // SDK 1.0.1 项目级覆盖：McpServer 类型加 override + 状态行展示「项目级覆盖」
+  assert.ok(settingsA.includes('override?:string|null'), 'McpServer 类型缺 override 字段')
+  assert.ok(settingsA.includes('项目级覆盖'), '状态行缺覆盖标识展示')
 })
 
 // ---------- 字面量诱饵防线自检 ----------
