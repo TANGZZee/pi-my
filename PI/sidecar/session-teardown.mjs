@@ -2,12 +2,12 @@
 //
 // 为什么必须抽出来（审查 D1 + T1）：
 //   SDK 的 `session.abort()` 末尾是 `await this.waitForIdle()`
-//   （pi-coding-agent/dist/core/agent-session.js:1222-1234），而 waitForIdle 只在
-//   `_emitAgentSettled()` 的 finally 里被 resolve（同文件 :347-356）。
+//   （agent-session.js 的 abort()），而 waitForIdle 只在
+//   `_emitAgentSettled()` 收尾时才 resolve（SDK 1.4.0 起经 `_resolveIdleWaitIfIdle()`）。
 //   `_emitAgentSettled()` 只在 agent 运行结束时执行；若此刻有一个 `beforeToolCall`
 //   正 await 用户的权限确认，`_isAgentRunActive` 始终为 true ⇒ **abort() 永不返回**。
 //   abort 信号救不了它：agent-loop 只在 `await config.beforeToolCall(...)` 返回
-//   **之后**才检查 `signal?.aborted`（pi-agent-core/dist/agent-loop.js:412-419），
+//   **之后**才检查 `signal?.aborted`（pi-agent-core/dist/agent-loop.js，beforeToolCall 返回后），
 //   而扩展那行是无 signal 的 `await options.confirm(...)`
 //   （sidecar/permissions/extension.ts:138）。
 //   ⇒ 放行待决确认**必须发生在 abort() 之前**：写在前面的放行正好解开那个 await，
